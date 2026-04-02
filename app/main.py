@@ -1,8 +1,15 @@
 """AssForge — ASS subtitle authoring tool. Application entry point."""
 from __future__ import annotations
 
+import os
 import sys
 import logging
+
+# Add project root to DLL search path so python-mpv can find libmpv-2.dll
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.environ["PATH"] = _root + os.pathsep + os.environ.get("PATH", "")
+if hasattr(os, "add_dll_directory"):
+    os.add_dll_directory(_root)
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt
