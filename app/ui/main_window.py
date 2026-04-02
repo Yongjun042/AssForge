@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QSettings, QSize, Qt, QTimer
+from PySide6.QtCore import QObject, QSettings, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QLabel, QMainWindow, QMenu,
@@ -33,6 +33,40 @@ from media.ffmpeg_utils import extract_audio, extract_keyframes
 from media.waveform import generate_peaks, save_peaks, load_peaks
 
 log = logging.getLogger(__name__)
+
+
+class _VideoLoadWorker(QObject):
+    """Background worker for audio extraction, waveform generation, and keyframe extraction."""
+    finished = Signal(object, list)  # (peaks_or_None, keyframes)
+    progress = Signal(str)           # status message
+
+    def __init__(self, video_path: str, wav_path: str, peaks_path: str) -> None:
+        super().__init__()
+        self._video_path = video_path
+        self._wav_path = wav_path
+        self._peaks_path = peaks_path
+
+    def run(self) -> None:
+        peaks = None
+        keyframes = []
+        try:
+            # Waveform
+            if os.path.exists(self._peaks_path):
+                self.progress.emit("파형 로딩 중...")
+                peaks = load_peaks(self._peaks_path)
+            else:
+                self.progress.emit("오디오 추출 중...")
+                if extract_audio(self._video_path, self._wav_path):
+                    self.progress.emit("파형 생성 중...")
+                    peaks = generate_peaks(self._wav_path)
+                    save_peaks(peaks, self._peaks_path)
+
+            # Keyframes
+            self.progress.emit("키프레임 추출 중...")
+            keyframes = extract_keyframes(self._video_path)
+        except Exception:
+            log.exception("Video load worker failed")
+        self.finished.emit(peaks, keyframes)
 
 
 class MainWindow(QMainWindow):
@@ -222,7 +256,7 @@ class MainWindow(QMainWindow):
     def _on_open_video(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "영상 파일 열기", self._last_dir(),
-            "영상 파일 (*.mp4 *.mkv *.avi *.webm *.mov *.flv *.ts);;모든 파일 (*)",
+            "영상 파일 (*.mp4 *.mkv *.avi *.webm *.mov *.flv *.ts *.m2ts *.mts);;모든 파일 (*)",
         )
         if path:
             self._open_video(path)
@@ -243,33 +277,37 @@ class MainWindow(QMainWindow):
         self.video_player.load_video(path)
         self._update_title()
 
-        # Extract audio for waveform
+        # Extract audio/waveform/keyframes in background thread
         cache_dir = os.path.join(tempfile.gettempdir(), "assforge_cache")
         os.makedirs(cache_dir, exist_ok=True)
         wav_path = os.path.join(cache_dir, f"{Path(path).stem}_audio.wav")
         peaks_path = os.path.join(cache_dir, f"{Path(path).stem}_peaks.bin")
 
-        if os.path.exists(peaks_path):
-            self._waveform_peaks = load_peaks(peaks_path)
-            self.timeline.set_waveform(self._waveform_peaks)
-        else:
-            # Extract in background would be better, but for now synchronous
-            self.statusBar().showMessage("파형 생성 중...", 0)
-            QApplication.processEvents()
-            if extract_audio(path, wav_path):
-                self._waveform_peaks = generate_peaks(wav_path)
-                save_peaks(self._waveform_peaks, peaks_path)
-                self.timeline.set_waveform(self._waveform_peaks)
-            self.statusBar().clearMessage()
+        self._load_thread = QThread()
+        self._load_worker = _VideoLoadWorker(path, wav_path, peaks_path)
+        self._load_worker.moveToThread(self._load_thread)
 
-        # Extract keyframes
-        self._keyframes = extract_keyframes(path)
+        self._load_thread.started.connect(self._load_worker.run)
+        self._load_worker.progress.connect(lambda msg: self.statusBar().showMessage(msg, 0))
+        self._load_worker.finished.connect(self._on_video_load_finished)
+        self._load_worker.finished.connect(self._load_thread.quit)
+
+        self.statusBar().showMessage("영상 로딩 중...", 0)
+        self._load_thread.start()
+
+    def _on_video_load_finished(self, peaks, keyframes: list) -> None:
+        if peaks is not None:
+            self._waveform_peaks = peaks
+            self.timeline.set_waveform(self._waveform_peaks)
+        self._keyframes = keyframes
         self.timeline.set_keyframes(self._keyframes)
+        self.statusBar().showMessage("로딩 완료", 3000)
 
         # Auto-load associated .ass
-        ass_path = Path(path).with_suffix(".ass")
-        if ass_path.exists():
-            self._open_subtitle(str(ass_path), confirm_discard=False)
+        if self._video_path:
+            ass_path = Path(self._video_path).with_suffix(".ass")
+            if ass_path.exists():
+                self._open_subtitle(str(ass_path), confirm_discard=False)
 
     def _open_subtitle(self, path: str, confirm_discard: bool = True) -> None:
         if confirm_discard and not self._confirm_discard():
@@ -340,6 +378,9 @@ class MainWindow(QMainWindow):
             self.cmd_bus.clear()
             self._refresh_all()
             self._update_title()
+
+            # Render subtitles on video
+            self.video_player.load_subtitle(path)
 
         except Exception as exc:
             QMessageBox.critical(self, "열기 실패", str(exc))
@@ -673,7 +714,7 @@ class MainWindow(QMainWindow):
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             ext = Path(path).suffix.lower()
-            if ext in {".mp4", ".mkv", ".avi", ".webm", ".mov", ".flv", ".ts"}:
+            if ext in {".mp4", ".mkv", ".avi", ".webm", ".mov", ".flv", ".ts", ".m2ts", ".mts"}:
                 if not self._confirm_discard():
                     return
                 self._open_video(path, confirm_discard=False)

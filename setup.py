@@ -23,6 +23,14 @@ import urllib.request
 import zipfile
 
 # ---------------------------------------------------------------------------
+# Ensure UTF-8 output on Windows (fixes cp949 / cp932 UnicodeEncodeError)
+# ---------------------------------------------------------------------------
+if sys.platform == "win32":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -123,14 +131,34 @@ def _extract_7z(archive: str, dest_dir: str) -> bool:
             if r.returncode == 0:
                 return True
 
-    # Try py7zr (pure Python)
+    # Try Bandizip CLI (common on Korean Windows)
+    for path_bz in [
+        shutil.which("bz"),
+        r"C:\Program Files\Bandizip\bz.exe",
+        r"C:\Program Files (x86)\Bandizip\bz.exe",
+    ]:
+        if path_bz and os.path.exists(path_bz):
+            _print_info("Bandizip CLI로 압축 해제 중...")
+            r = subprocess.run([path_bz, "x", f"-o:{dest_dir}", archive],
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                return True
+
+    # Try py7zr as last resort (may fail on BCJ2 filtered archives)
     try:
         import py7zr  # type: ignore
         with py7zr.SevenZipFile(archive, "r") as z:
             z.extractall(dest_dir)
-        return True
+        # Verify extraction produced non-empty files
+        for root, dirs, files in os.walk(dest_dir):
+            for f in files:
+                if os.path.getsize(os.path.join(root, f)) > 0:
+                    return True
+        _print_warn("py7zr 추출 결과가 비어있습니다 (BCJ2 필터 미지원 가능성)")
     except ImportError:
         pass
+    except Exception as e:
+        _print_warn(f"py7zr 압축 해제 실패: {e}")
 
     # Install py7zr and retry
     _print_info("py7zr 설치 중 (7z 압축 해제용)...")
@@ -140,7 +168,12 @@ def _extract_7z(archive: str, dest_dir: str) -> bool:
         py7zr = importlib.import_module("py7zr")
         with py7zr.SevenZipFile(archive, "r") as z:
             z.extractall(dest_dir)
-        return True
+        for root, dirs, files in os.walk(dest_dir):
+            for f in files:
+                if os.path.getsize(os.path.join(root, f)) > 0:
+                    return True
+        _print_warn("py7zr 추출 결과가 비어있습니다")
+        return False
     except Exception as e:
         _print_warn(f"7z 압축 해제 실패: {e}")
         return False
@@ -165,13 +198,19 @@ def install_python_packages() -> bool:
         _print_warn(f"pip install 실패:\n{r.stderr}")
         return False
 
-    # Verify imports
+    # Verify imports (skip mpv here — it needs libmpv-2.dll which is installed in Step 2)
     failures = []
-    for mod in ["PySide6", "mpv", "numpy"]:
+    for mod in ["PySide6", "numpy"]:
         try:
             __import__(mod)
         except ImportError:
             failures.append(mod)
+
+    # For python-mpv, only check that the pip package is importable at module-file level
+    # (the actual DLL loading is verified in the final verification step)
+    import importlib.util
+    if importlib.util.find_spec("mpv") is None:
+        failures.append("mpv")
 
     if failures:
         _print_warn(f"import 실패: {', '.join(failures)}")

@@ -14,8 +14,8 @@ _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 def _run(args: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(
-        args, capture_output=True, text=True,
-        creationflags=_CREATE_NO_WINDOW, **kwargs
+        args, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", creationflags=_CREATE_NO_WINDOW, **kwargs
     )
 
 

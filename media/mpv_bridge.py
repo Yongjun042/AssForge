@@ -11,7 +11,7 @@ from typing import Optional
 
 from PySide6.QtCore import QTimer, Qt, Signal, Slot, QMetaObject, Q_ARG, Qt as QtNS
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QSlider, QPushButton,
+    QHBoxLayout, QLabel, QSlider, QPushButton, QStyleOptionSlider, QStyle,
     QVBoxLayout, QWidget, QComboBox, QSizePolicy,
 )
 
@@ -23,6 +23,34 @@ try:
 except Exception:
     MPV_AVAILABLE = False
     _mpv = None
+
+
+class _ClickSlider(QSlider):
+    """QSlider that jumps directly to the clicked position."""
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            groove = self.style().subControlRect(
+                QStyle.ComplexControl.CC_Slider, opt,
+                QStyle.SubControl.SC_SliderGroove, self,
+            )
+            if self.orientation() == Qt.Orientation.Horizontal:
+                val = QStyle.sliderValueFromPosition(
+                    self.minimum(), self.maximum(),
+                    event.position().toPoint().x() - groove.x(), groove.width(),
+                )
+            else:
+                val = QStyle.sliderValueFromPosition(
+                    self.minimum(), self.maximum(),
+                    event.position().toPoint().y() - groove.y(), groove.height(),
+                    upsideDown=True,
+                )
+            self.setValue(val)
+            self.sliderMoved.emit(val)
+            event.accept()
+        super().mousePressEvent(event)
 
 
 class MpvPlayer(QWidget):
@@ -75,9 +103,9 @@ class MpvPlayer(QWidget):
         self._container.setMinimumHeight(120)
         root.addWidget(self._container, stretch=1)
 
-        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider = _ClickSlider(Qt.Orientation.Horizontal)
         self._slider.setRange(0, 1000)
-        self._slider.sliderPressed.connect(lambda: setattr(self, '_seeking', True))
+        self._slider.sliderPressed.connect(self._on_slider_pressed)
         self._slider.sliderReleased.connect(self._on_slider_released)
         root.addWidget(self._slider)
 
@@ -228,6 +256,20 @@ class MpvPlayer(QWidget):
         # Force an initial position poll after a short delay
         QTimer.singleShot(200, self._poll_position)
 
+    def load_subtitle(self, path: str) -> None:
+        """Load (or reload) a subtitle file into mpv."""
+        if self._mpv is None:
+            return
+        try:
+            # Remove existing subtitle tracks first
+            self._mpv.command("sub-remove")
+        except Exception:
+            pass
+        try:
+            self._mpv.command("sub-add", str(path), "select")
+        except Exception:
+            log.exception("Failed to load subtitle: %s", path)
+
     def toggle_play(self) -> None:
         if self._mpv:
             try:
@@ -253,6 +295,11 @@ class MpvPlayer(QWidget):
 
     def get_position_ms(self) -> int:
         return self._position_ms
+
+    def _on_slider_pressed(self) -> None:
+        self._seeking = True
+        ms = int(self._slider.value() / 1000 * self._duration_ms)
+        self.seek(ms)
 
     def _on_slider_released(self) -> None:
         self._seeking = False
