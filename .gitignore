@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+dist/
+build/
+*.egg-info/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+venv/
+.venv/
+*.assproj/
+cache/
+autosave/
