@@ -19,26 +19,62 @@ def _run(args: list[str], **kwargs) -> subprocess.CompletedProcess:
     )
 
 
-def find_ffmpeg() -> str | None:
-    for name in ("ffmpeg", "ffmpeg.exe"):
+def _find_binary(names: list[str]) -> str | None:
+    """Search PATH, project folder, and common install locations."""
+    import glob
+    import os
+    import shutil
+
+    # 1. PATH
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+
+    # 2. Project folder
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name in names:
+        local = os.path.join(project_root, name)
+        if os.path.isfile(local):
+            return local
+
+    # 3. Common Windows install locations
+    if sys.platform == "win32":
+        search_dirs = [
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links"),
+            r"C:\ffmpeg\bin",
+            r"C:\Program Files\FFmpeg\bin",
+        ]
+        # Also check winget package dirs
+        winget_pkgs = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages")
+        if os.path.isdir(winget_pkgs):
+            for pattern in glob.glob(os.path.join(winget_pkgs, "Gyan*", "**", "bin"), recursive=True):
+                search_dirs.append(pattern)
+
+        for d in search_dirs:
+            for name in names:
+                candidate = os.path.join(d, name)
+                if os.path.isfile(candidate):
+                    return candidate
+
+    # 4. Try running directly (handles aliases)
+    for name in names:
         try:
             r = _run([name, "-version"])
             if r.returncode == 0:
                 return name
         except FileNotFoundError:
             continue
+
     return None
+
+
+def find_ffmpeg() -> str | None:
+    return _find_binary(["ffmpeg", "ffmpeg.exe"])
 
 
 def find_ffprobe() -> str | None:
-    for name in ("ffprobe", "ffprobe.exe"):
-        try:
-            r = _run([name, "-version"])
-            if r.returncode == 0:
-                return name
-        except FileNotFoundError:
-            continue
-    return None
+    return _find_binary(["ffprobe", "ffprobe.exe"])
 
 
 def get_video_info(video_path: str) -> dict:
