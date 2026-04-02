@@ -216,7 +216,10 @@ class MainWindow(QMainWindow):
         if path:
             self._open_subtitle(path)
 
-    def _open_video(self, path: str) -> None:
+    def _open_video(self, path: str, confirm_discard: bool = True) -> None:
+        if confirm_discard and not self._confirm_discard():
+            return
+
         self._video_path = path
         self.video_player.load_video(path)
         self._update_title()
@@ -243,9 +246,12 @@ class MainWindow(QMainWindow):
         # Auto-load associated .ass
         ass_path = Path(path).with_suffix(".ass")
         if ass_path.exists():
-            self._open_subtitle(str(ass_path))
+            self._open_subtitle(str(ass_path), confirm_discard=False)
 
-    def _open_subtitle(self, path: str) -> None:
+    def _open_subtitle(self, path: str, confirm_discard: bool = True) -> None:
+        if confirm_discard and not self._confirm_discard():
+            return
+
         self._subtitle_path = path
         self._modified = False
 
@@ -569,10 +575,14 @@ class MainWindow(QMainWindow):
             path = url.toLocalFile()
             ext = Path(path).suffix.lower()
             if ext in {".mp4", ".mkv", ".avi", ".webm", ".mov", ".flv", ".ts"}:
-                self._open_video(path)
+                if not self._confirm_discard():
+                    return
+                self._open_video(path, confirm_discard=False)
                 return
             if ext in {".ass", ".ssa"}:
-                self._open_subtitle(path)
+                if not self._confirm_discard():
+                    return
+                self._open_subtitle(path, confirm_discard=False)
                 return
 
 

@@ -33,12 +33,12 @@ class RawLine:
 class ShadowDocument:
     """Stores the complete original file for lossless round-trip."""
 
-    __slots__ = ("_lines", "_encoding", "_bom", "_line_ending", "_extra_info")
+    __slots__ = ("_lines", "_encoding", "_has_bom", "_line_ending", "_extra_info")
 
     def __init__(self) -> None:
         self._lines: list[RawLine] = []
-        self._encoding: str = "utf-8-sig"
-        self._bom: bool = True
+        self._encoding: str = "utf-8"
+        self._has_bom: bool = False
         self._line_ending: str = "\r\n"
         self._extra_info: dict = {}
 
@@ -51,25 +51,33 @@ class ShadowDocument:
         return self._encoding
 
     @property
+    def has_bom(self) -> bool:
+        return self._has_bom
+
+    @property
     def line_ending(self) -> str:
         return self._line_ending
 
     def load_from_file(self, filepath: str) -> None:
         """Read a .ass file and classify each line."""
-        # Detect encoding
+        # Detect BOM from raw bytes first so BOM-less UTF-8 stays BOM-less on save.
         raw = open(filepath, "rb").read()
-        self._bom = raw[:3] == b"\xef\xbb\xbf"
+        self._has_bom = raw.startswith(b"\xef\xbb\xbf")
 
-        for enc in ("utf-8-sig", "utf-8", "latin-1"):
-            try:
-                text = raw.decode(enc)
-                self._encoding = enc
-                break
-            except (UnicodeDecodeError, UnicodeError):
-                continue
-        else:
-            text = raw.decode("utf-8", errors="replace")
+        if self._has_bom:
+            text = raw[3:].decode("utf-8")
             self._encoding = "utf-8"
+        else:
+            for enc in ("utf-8", "latin-1"):
+                try:
+                    text = raw.decode(enc)
+                    self._encoding = enc
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            else:
+                text = raw.decode("utf-8", errors="replace")
+                self._encoding = "utf-8"
 
         # Detect line ending
         if "\r\n" in text:
@@ -136,7 +144,7 @@ class ShadowDocument:
         """Parse from string (for testing)."""
         import tempfile, os
         tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".ass",
-                                          encoding="utf-8-sig", delete=False, newline="")
+                                          encoding="utf-8", delete=False, newline="")
         try:
             tmp.write(content)
             tmp.close()
@@ -159,16 +167,19 @@ class ShadowDocument:
                 return
 
     def export(self, overrides: dict[int, str] | None = None,
-               inserts: dict[int, list[str]] | None = None) -> str:
+               inserts: dict[int, list[str]] | None = None,
+               deleted_indices: set[int] | None = None) -> str:
         """Export the document back to string.
 
         Args:
             overrides: {shadow_line_index: new_text} for modified lines
             inserts: {after_shadow_line_index: [new_lines]} for new lines
                      Use -1 to insert before the first line
+            deleted_indices: shadow line indices to omit for this export only
         """
         overrides = overrides or {}
         inserts = inserts or {}
+        deleted_indices = deleted_indices or set()
 
         result_lines: list[str] = []
 
@@ -177,7 +188,7 @@ class ShadowDocument:
             result_lines.extend(inserts[-1])
 
         for rl in self._lines:
-            if rl.deleted:
+            if rl.deleted or rl.index in deleted_indices:
                 continue
             if rl.index in overrides:
                 result_lines.append(overrides[rl.index])

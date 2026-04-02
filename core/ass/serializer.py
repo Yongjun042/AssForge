@@ -23,6 +23,7 @@ def export_ass(
     """
     overrides: dict[int, str] = {}
     inserts: dict[int, list[str]] = {}
+    deleted_event_idxs: set[int] = set()
 
     # Get format fields from shadow
     style_format_lines = shadow.get_lines_by_type(LineType.STYLE_FORMAT)
@@ -77,11 +78,11 @@ def export_ass(
             serialize_event_line(e, event_fmt) for e in new_events
         )
 
-    # Handle deleted events
+    # Handle deleted events for this export only. Do not mutate the shadow.
     existing_shadow_idxs = {e.shadow_line_idx for e in events if e.shadow_line_idx >= 0}
     for rl in shadow_event_lines:
         if rl.index not in existing_shadow_idxs and rl.index not in overrides:
-            shadow.mark_deleted(rl.index)
+            deleted_event_idxs.add(rl.index)
 
     # Override script info if changed
     if script_info:
@@ -95,7 +96,7 @@ def export_ass(
                     if rl.text.strip() != expected:
                         overrides[rl.index] = expected
 
-    return shadow.export(overrides, inserts)
+    return shadow.export(overrides, inserts, deleted_indices=deleted_event_idxs)
 
 
 def save_ass_file(
@@ -107,7 +108,7 @@ def save_ass_file(
 ) -> None:
     """Write .ass file preserving original encoding and BOM."""
     content = export_ass(shadow, styles, events, script_info)
-    encoding = shadow.encoding if shadow.encoding != "utf-8-sig" else "utf-8-sig"
+    encoding = "utf-8-sig" if shadow.has_bom else shadow.encoding
     with open(filepath, "w", encoding=encoding, newline="") as f:
         f.write(content)
 
