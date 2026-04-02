@@ -119,6 +119,20 @@ class GridPanel(QWidget):
                 self._model.dataChanged.emit(tl, br)
                 return
 
+    def select_by_id(self, event_id: str) -> None:
+        """Select a row by event ID."""
+        for i, ev in enumerate(self._model._events):
+            if ev.id == event_id:
+                idx = self._model.index(i, 0)
+                self._table.selectionModel().clearSelection()
+                self._table.selectionModel().select(
+                    idx,
+                    self._table.selectionModel().SelectionFlag.Select
+                    | self._table.selectionModel().SelectionFlag.Rows,
+                )
+                self._table.scrollTo(idx)
+                return
+
     def selected_event_ids(self) -> list[str]:
         indices = self._table.selectionModel().selectedRows()
         ids = []

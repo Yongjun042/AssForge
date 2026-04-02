@@ -29,7 +29,7 @@ from core.ass.parser import (
 from core.ass.serializer import save_ass_file
 from core.project.project_db import ProjectDB, TrackRole, EventRow, LockState
 from core.track.track_manager import TrackManager
-from media.ffmpeg_utils import extract_audio
+from media.ffmpeg_utils import extract_audio, extract_keyframes
 from media.waveform import generate_peaks, save_peaks, load_peaks
 
 log = logging.getLogger(__name__)
@@ -54,6 +54,16 @@ class MainWindow(QMainWindow):
         self._styles: list[ParsedStyle] = []
         self._modified = False
         self._waveform_peaks = None
+        self._keyframes: list[int] = []
+
+        # Keyboard timing state
+        self._timing_mode = False  # True when marking start/end via keyboard
+        self._timing_start_ms: int | None = None
+
+        # Autosave
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(60_000)  # 60 seconds
+        self._autosave_timer.timeout.connect(self._do_autosave)
 
         # Command bus
         self.cmd_bus = CommandBus()
@@ -69,6 +79,7 @@ class MainWindow(QMainWindow):
 
         # Start with an empty project
         self._init_empty_project()
+        self._autosave_timer.start()
 
     # ============================================================
     # UI Layout
@@ -131,6 +142,14 @@ class MainWindow(QMainWindow):
         self._add_action(sm, "삭제", "Delete", self._on_delete)
         sm.addSeparator()
         self._add_action(sm, "시간 이동...", "Ctrl+Shift+T", self._on_shift_times)
+
+        # 타이밍
+        tm = mb.addMenu("타이밍(&T)")
+        self._act_timing_mode = self._add_action(tm, "키보드 타이밍 모드(&K)", "Ctrl+T", self._toggle_timing_mode)
+        self._act_timing_mode.setCheckable(True)
+        tm.addSeparator()
+        self._add_action(tm, "시작점 마킹", "F3", self._mark_start)
+        self._add_action(tm, "종료점 마킹 + 다음줄", "F4", self._mark_end_and_next)
 
         # 도움말
         hm = mb.addMenu("도움말(&H)")
@@ -242,6 +261,10 @@ class MainWindow(QMainWindow):
                 save_peaks(self._waveform_peaks, peaks_path)
                 self.timeline.set_waveform(self._waveform_peaks)
             self.statusBar().clearMessage()
+
+        # Extract keyframes
+        self._keyframes = extract_keyframes(path)
+        self.timeline.set_keyframes(self._keyframes)
 
         # Auto-load associated .ass
         ass_path = Path(path).with_suffix(".ass")
@@ -511,6 +534,82 @@ class MainWindow(QMainWindow):
     def _on_history_changed(self) -> None:
         self._act_undo.setEnabled(self.cmd_bus.can_undo)
         self._act_redo.setEnabled(self.cmd_bus.can_redo)
+
+    # ============================================================
+    # Keyboard Timing
+    # ============================================================
+
+    def _toggle_timing_mode(self) -> None:
+        self._timing_mode = not self._timing_mode
+        self._act_timing_mode.setChecked(self._timing_mode)
+        if self._timing_mode:
+            self.statusBar().showMessage("키보드 타이밍 모드: F3=시작, F4=종료+다음줄", 0)
+        else:
+            self.statusBar().clearMessage()
+            self._timing_start_ms = None
+
+    def _mark_start(self) -> None:
+        """Mark current playback position as start time for selected event."""
+        if not self._db or not self._main_track_id:
+            return
+        pos = self.video_player.get_position_ms()
+        selected = self.grid.selected_event_ids()
+        if selected:
+            from app.commands.edit_commands import UpdateEventCommand
+            self.cmd_bus.execute(UpdateEventCommand(self._db, selected[0], {"start_ms": pos}))
+            self._mark_modified()
+            self._refresh_all()
+        self._timing_start_ms = pos
+
+    def _mark_end_and_next(self) -> None:
+        """Mark current position as end time, then select the next line."""
+        if not self._db or not self._main_track_id:
+            return
+        pos = self.video_player.get_position_ms()
+        selected = self.grid.selected_event_ids()
+        events = self._db.get_events(self._main_track_id)
+        if not events:
+            return
+
+        if selected:
+            from app.commands.edit_commands import UpdateEventCommand
+            self.cmd_bus.execute(UpdateEventCommand(self._db, selected[0], {"end_ms": pos}))
+            self._mark_modified()
+
+            # Find next event and set its start + select it
+            cur_idx = None
+            for i, ev in enumerate(events):
+                if ev.id == selected[0]:
+                    cur_idx = i
+                    break
+            if cur_idx is not None and cur_idx + 1 < len(events):
+                next_ev = events[cur_idx + 1]
+                self.cmd_bus.execute(UpdateEventCommand(self._db, next_ev.id, {"start_ms": pos}))
+                self._refresh_all()
+                self.grid.select_by_id(next_ev.id)
+                return
+
+        self._refresh_all()
+
+    # ============================================================
+    # Autosave
+    # ============================================================
+
+    def _do_autosave(self) -> None:
+        """Periodically save a backup if there are unsaved changes."""
+        if not self._modified or not self._shadow or not self._track_mgr or not self._main_track_id:
+            return
+        try:
+            autosave_dir = os.path.join(tempfile.gettempdir(), "assforge_autosave")
+            os.makedirs(autosave_dir, exist_ok=True)
+            name = Path(self._subtitle_path).stem if self._subtitle_path else "untitled"
+            autosave_path = os.path.join(autosave_dir, f"{name}_autosave.ass")
+            events = self._track_mgr.export_events_for_ass(self._main_track_id)
+            script_info = self._db.get_script_info() if self._db else None
+            save_ass_file(autosave_path, self._shadow, self._styles, events, script_info)
+            log.info("Autosave: %s", autosave_path)
+        except Exception:
+            log.exception("Autosave failed")
 
     # ============================================================
     # Helpers

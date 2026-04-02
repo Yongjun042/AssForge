@@ -44,6 +44,7 @@ class TimelinePanel(QWidget):
         self._duration_ms = 10_000
         self._position_ms = 0
         self._selected: set[str] = set()
+        self._keyframes: list[int] = []
 
         self._pps: float = 50.0  # pixels per second
         self._scroll_off: float = 0.0
@@ -84,6 +85,10 @@ class TimelinePanel(QWidget):
 
     def set_selected(self, ids: set[str]) -> None:
         self._selected = ids
+        self.update()
+
+    def set_keyframes(self, keyframes: list[int]) -> None:
+        self._keyframes = keyframes
         self.update()
 
     # -- Coordinates --
@@ -129,6 +134,16 @@ class TimelinePanel(QWidget):
         wave_top = self._RULER_H
         wave_h = self._WAVE_H
         self._draw_waveform(p, w, wave_top, wave_h)
+
+        # Keyframe markers
+        if self._keyframes:
+            p.setPen(QPen(QColor(255, 200, 50, 80), 1))
+            kf_y_top = self._RULER_H
+            kf_y_bot = self._RULER_H + self._WAVE_H
+            for kf_ms in self._keyframes:
+                kx = self._ms_to_x(kf_ms)
+                if 0 <= kx <= w:
+                    p.drawLine(QPointF(kx, kf_y_top), QPointF(kx, kf_y_bot))
 
         # Event blocks
         block_top = wave_top + wave_h + self._BLOCK_Y_OFFSET

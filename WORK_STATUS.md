@@ -21,9 +21,10 @@ AI 워크플로를 위한 ASS 자막 저작 도구. Python + PySide6 + mpv + FFm
 - [x] 인스펙터 패널
 - [x] 메인 윈도우 (전체 연결)
 - [x] Round-trip 테스트 통과
-- [ ] 키보드 타이밍 (재생 중 키로 시작/종료 마킹)
-- [ ] 키프레임 표시 및 snap
-- [ ] 자동 저장 (autosave)
+- [x] 키보드 타이밍 (F3=시작 마킹, F4=종료+다음줄, Ctrl+T 모드 전환)
+- [x] 키프레임 표시 (타임라인에 노란색 마커)
+- [x] 자동 저장 (60초 간격, autosave 폴더)
+- [x] Adversarial review 3건 수정 (BOM, export mutation, discard guard)
 - [ ] 실제 사용자 테스트
 - [ ] 패키징
 
@@ -48,4 +49,4 @@ AI 워크플로를 위한 ASS 자막 저작 도구. Python + PySide6 + mpv + FFm
 
 ## 마지막 업데이트
 - **날짜**: 2026-04-02
-- **상태**: Stage 1 핵심 모듈 구현 완료. Round-trip 통과, 파형 생성 동작 확인.
+- **상태**: Stage 1 기능 구현 거의 완료. 키보드 타이밍, 키프레임, 자동 저장 추가. 실사용 테스트 및 패키징 남음.
