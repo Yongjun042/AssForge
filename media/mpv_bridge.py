@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtCore import QTimer, Qt, Signal, Slot, QMetaObject, Q_ARG, Qt as QtNS
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QSlider, QPushButton,
     QVBoxLayout, QWidget, QComboBox, QSizePolicy,
@@ -38,6 +38,10 @@ class MpvPlayer(QWidget):
     duration_changed = Signal(int)
     state_changed = Signal(str)
 
+    # Internal cross-thread signals (mpv thread → Qt main thread)
+    _sig_duration = Signal(int)
+    _sig_pause_state = Signal(str)
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._mpv = None
@@ -46,6 +50,10 @@ class MpvPlayer(QWidget):
         self._seeking = False
 
         self._build_ui()
+
+        # Connect internal cross-thread signals to slots
+        self._sig_duration.connect(self._handle_duration)
+        self._sig_pause_state.connect(self._apply_state)
 
         if MPV_AVAILABLE:
             QTimer.singleShot(0, self._init_mpv)
@@ -76,18 +84,21 @@ class MpvPlayer(QWidget):
         transport = QHBoxLayout()
         transport.setContentsMargins(4, 0, 4, 2)
 
-        self._btn_play = QPushButton("\u25b6")
+        self._btn_play = QPushButton("▶")
         self._btn_play.setFixedWidth(36)
+        self._btn_play.setToolTip("재생/일시정지")
         self._btn_play.clicked.connect(self.toggle_play)
         transport.addWidget(self._btn_play)
 
-        btn_prev = QPushButton("\u23ee")
+        btn_prev = QPushButton("⏮")
         btn_prev.setFixedWidth(30)
+        btn_prev.setToolTip("이전 프레임")
         btn_prev.clicked.connect(self.frame_back)
         transport.addWidget(btn_prev)
 
-        btn_next = QPushButton("\u23ed")
+        btn_next = QPushButton("⏭")
         btn_next.setFixedWidth(30)
+        btn_next.setToolTip("다음 프레임")
         btn_next.clicked.connect(self.frame_step)
         transport.addWidget(btn_next)
 
@@ -97,7 +108,7 @@ class MpvPlayer(QWidget):
 
         transport.addStretch()
 
-        transport.addWidget(QLabel("\uc74c\ub7c9"))
+        transport.addWidget(QLabel("음량"))
         self._vol = QSlider(Qt.Orientation.Horizontal)
         self._vol.setRange(0, 150)
         self._vol.setValue(100)
@@ -105,7 +116,7 @@ class MpvPlayer(QWidget):
         self._vol.valueChanged.connect(self._set_volume)
         transport.addWidget(self._vol)
 
-        transport.addWidget(QLabel("\uc18d\ub3c4"))
+        transport.addWidget(QLabel("속도"))
         self._speed = QComboBox()
         for s in ("0.25", "0.5", "0.75", "1.0", "1.25", "1.5", "2.0"):
             self._speed.addItem(f"{s}x", float(s))
@@ -131,36 +142,60 @@ class MpvPlayer(QWidget):
                 keep_open="yes",
                 idle="yes",
             )
-            self._mpv.observe_property("duration", self._on_duration)
-            self._mpv.observe_property("pause", self._on_pause)
+            # observe_property callbacks run on mpv's thread.
+            # We use Qt signals (thread-safe) to marshal to the GUI thread.
+            self._mpv.observe_property("duration", self._on_mpv_duration)
+            self._mpv.observe_property("pause", self._on_mpv_pause)
         except Exception:
             log.exception("Failed to create mpv")
             self._mpv = None
             self._show_missing()
 
     def _show_missing(self) -> None:
-        lbl = QLabel("mpv\ub97c \uc0ac\uc6a9\ud560 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4.\npython-mpv\uc640 libmpv\ub97c \uc124\uce58\ud558\uc138\uc694.", self._container)
+        lbl = QLabel(
+            "mpv를 사용할 수 없습니다.\npython-mpv와 libmpv를 설치하세요.\n\npython setup.py 를 실행하세요.",
+            self._container,
+        )
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl.setStyleSheet("color: #aaa; font-size: 13px;")
         QVBoxLayout(self._container).addWidget(lbl)
 
-    def _on_duration(self, _n: str, val: float | None) -> None:
-        if val is not None:
-            self._duration_ms = int(val * 1000)
-            QTimer.singleShot(0, lambda: self.duration_changed.emit(self._duration_ms))
+    # ------------------------------------------------------------------
+    # mpv property observers (called from mpv thread!)
+    # These MUST NOT touch Qt widgets directly. Use signals instead.
+    # ------------------------------------------------------------------
 
-    def _on_pause(self, _n: str, val: bool | None) -> None:
-        state = "idle" if val is None else ("paused" if val else "playing")
-        QTimer.singleShot(0, lambda s=state: self._apply_state(s))
+    def _on_mpv_duration(self, _name: str, value: float | None) -> None:
+        if value is not None:
+            self._sig_duration.emit(int(value * 1000))
 
+    def _on_mpv_pause(self, _name: str, value: bool | None) -> None:
+        if value is None:
+            self._sig_pause_state.emit("idle")
+        elif value:
+            self._sig_pause_state.emit("paused")
+        else:
+            self._sig_pause_state.emit("playing")
+
+    # ------------------------------------------------------------------
+    # Qt main thread handlers
+    # ------------------------------------------------------------------
+
+    @Slot(int)
+    def _handle_duration(self, ms: int) -> None:
+        self._duration_ms = ms
+        self.duration_changed.emit(ms)
+
+    @Slot(str)
     def _apply_state(self, state: str) -> None:
-        self._btn_play.setText("\u23f8" if state == "playing" else "\u25b6")
+        self._btn_play.setText("⏸" if state == "playing" else "▶")
         self.state_changed.emit(state)
         if state == "playing":
-            self._poll.start()
+            if not self._poll.isActive():
+                self._poll.start()
         else:
             self._poll.stop()
-            self._poll_position()
+            self._poll_position()  # one final update
 
     def _poll_position(self) -> None:
         if self._mpv is None:
@@ -190,6 +225,8 @@ class MpvPlayer(QWidget):
             return
         self._mpv.play(str(path))
         self._mpv.pause = True
+        # Force an initial position poll after a short delay
+        QTimer.singleShot(200, self._poll_position)
 
     def toggle_play(self) -> None:
         if self._mpv:
@@ -201,14 +238,18 @@ class MpvPlayer(QWidget):
     def seek(self, ms: int) -> None:
         if self._mpv:
             self._mpv.seek(ms / 1000.0, reference="absolute")
+            # Poll immediately to update UI
+            QTimer.singleShot(50, self._poll_position)
 
     def frame_step(self) -> None:
         if self._mpv:
             self._mpv.command("frame-step")
+            QTimer.singleShot(50, self._poll_position)
 
     def frame_back(self) -> None:
         if self._mpv:
             self._mpv.command("frame-back-step")
+            QTimer.singleShot(50, self._poll_position)
 
     def get_position_ms(self) -> int:
         return self._position_ms
