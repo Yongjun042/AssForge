@@ -8,13 +8,29 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QTableView, QVBoxLayout, QWidget,
+    QLabel, QLineEdit, QPushButton, QTableView, QVBoxLayout, QWidget,
 )
 
-from core.project.project_db import EventRow
+from core.project.project_db import EventRow, LockState
 
 _TAG_RE = re.compile(r"\{[^}]*\}")
-_COLS = ("#", "시작", "종료", "길이", "스타일", "텍스트")
+_COLS = ("#", "잠금", "신뢰도", "시작", "종료", "길이", "스타일", "텍스트")
+
+# LockState -> 표시 기호
+_LOCK_GLYPH = {
+    LockState.UNLOCKED: "",
+    LockState.AI_SUGGESTED: "AI",
+    LockState.CONFIRMED: "✓",
+    LockState.LOCKED: "🔒",
+}
+
+
+def _conf_color(conf: float) -> QColor:
+    """신뢰도 → 빨강(낮음) ↔ 녹색(높음) 그라데이션."""
+    c = max(0.0, min(1.0, conf))
+    r = int(255 * (1.0 - c))
+    g = int(180 * c)
+    return QColor(r, g, 60)
 
 
 def _fmt(ms: int) -> str:
@@ -73,16 +89,34 @@ class _Model(QAbstractTableModel):
 
         if role == Qt.ItemDataRole.DisplayRole:
             if c == 0: return r + 1
-            if c == 1: return _fmt(ev.start_ms)
-            if c == 2: return _fmt(ev.end_ms)
-            if c == 3: return _fmt(max(0, ev.end_ms - ev.start_ms))
-            if c == 4: return ev.style_id
-            if c == 5: return _strip(ev.text)
+            if c == 1: return _LOCK_GLYPH.get(ev.lock_state, "")
+            if c == 2:
+                return f"{ev.ai_confidence:.2f}" if ev.ai_confidence > 0 else ""
+            if c == 3: return _fmt(ev.start_ms)
+            if c == 4: return _fmt(ev.end_ms)
+            if c == 5: return _fmt(max(0, ev.end_ms - ev.start_ms))
+            if c == 6: return ev.style_id
+            if c == 7: return _strip(ev.text)
 
-        if role == Qt.ItemDataRole.BackgroundRole and ev.is_comment:
-            return QBrush(QColor("#2D2D1A"))
+        if role == Qt.ItemDataRole.BackgroundRole:
+            if ev.is_comment:
+                return QBrush(QColor("#2D2D1A"))
+            # AI 제안 — 신뢰도 기반 옅은 색조
+            if ev.lock_state == LockState.AI_SUGGESTED and ev.suggested_start_ms is not None:
+                base = _conf_color(ev.ai_confidence)
+                # 어두운 테마용 옅은 채도
+                base.setAlpha(60)
+                return QBrush(base)
+            if ev.lock_state == LockState.CONFIRMED:
+                return QBrush(QColor(40, 70, 40))
+            if ev.lock_state == LockState.LOCKED:
+                return QBrush(QColor(50, 50, 60))
+
         if role == Qt.ItemDataRole.ForegroundRole:
+            if c == 2 and ev.ai_confidence > 0:
+                return QBrush(_conf_color(ev.ai_confidence))
             return QBrush(QColor("#AAA") if ev.is_comment else QColor("#DDD"))
+
         if role == Qt.ItemDataRole.FontRole and ev.is_comment:
             f = QFont(); f.setItalic(True); return f
 
@@ -102,6 +136,9 @@ class GridPanel(QWidget):
 
     selection_changed = Signal(list)
     line_activated = Signal(str)
+    insert_before_requested = Signal()
+    insert_after_requested = Signal()
+    accept_all_ai_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -152,6 +189,25 @@ class GridPanel(QWidget):
         self._search.setPlaceholderText("텍스트로 필터링...")
         self._search.setClearButtonEnabled(True)
         search.addWidget(self._search)
+
+        self._btn_insert_before = QPushButton("＋앞에")
+        self._btn_insert_before.setToolTip("선택한 줄 앞에 삽입 (Ctrl+Shift+Insert)")
+        self._btn_insert_before.clicked.connect(self.insert_before_requested.emit)
+        search.addWidget(self._btn_insert_before)
+
+        self._btn_insert_after = QPushButton("＋뒤에")
+        self._btn_insert_after.setToolTip("선택한 줄 뒤에 삽입 (Ctrl+Insert)")
+        self._btn_insert_after.clicked.connect(self.insert_after_requested.emit)
+        search.addWidget(self._btn_insert_after)
+
+        search.addSpacing(12)
+
+        self._btn_accept_all_ai = QPushButton("✓ AI 전체수락")
+        self._btn_accept_all_ai.setToolTip("모든 AI 제안을 한 번에 수락")
+        self._btn_accept_all_ai.setStyleSheet("background: #2A7A35;")
+        self._btn_accept_all_ai.clicked.connect(self.accept_all_ai_requested.emit)
+        search.addWidget(self._btn_accept_all_ai)
+
         root.addLayout(search)
 
         self._table = QTableView()
@@ -163,7 +219,7 @@ class GridPanel(QWidget):
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.doubleClicked.connect(self._on_double_click)
 
-        for col, w in ((0, 35), (1, 90), (2, 90), (3, 65), (4, 70)):
+        for col, w in ((0, 35), (1, 38), (2, 50), (3, 90), (4, 90), (5, 65), (6, 70)):
             self._table.setColumnWidth(col, w)
 
         root.addWidget(self._table)

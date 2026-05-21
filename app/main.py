@@ -5,6 +5,14 @@ import os
 import sys
 import logging
 
+# Windows 콘솔에서 한글 로그가 cp949 로 깨지는 것 방지
+if sys.platform == "win32":
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
 # Add project root to DLL search path so python-mpv can find libmpv-2.dll
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ["PATH"] = _root + os.pathsep + os.environ.get("PATH", "")
@@ -36,7 +44,13 @@ def setup_dark_theme(app: QApplication) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
+    debug = os.environ.get("ASSFORGE_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.INFO,
+        format="%(name)s: %(message)s",
+    )
+    if debug:
+        logging.getLogger("ai").setLevel(logging.DEBUG)
 
     app = QApplication(sys.argv)
     app.setApplicationName("AssForge")

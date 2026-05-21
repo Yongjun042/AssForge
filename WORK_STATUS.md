@@ -28,11 +28,22 @@ AI 워크플로를 위한 ASS 자막 저작 도구. Python + PySide6 + mpv + FFm
 - [ ] 실제 사용자 테스트
 - [ ] 패키징
 
-### Stage 2: AI Sync Assistant
-- [ ] faster-whisper 통합
-- [ ] Speech mode / Song mode 분리
-- [ ] DTW 가사 매칭
-- [ ] Anchor 기반 반자동 워크플로
+### Stage 2: AI Sync Assistant (슬라이스 1 — Case A 완료)
+- [x] faster-whisper 통합 (ai/transcription.py, lazy import)
+- [x] DTW 가사-transcript 매칭 (ai/alignment_song.py, numpy 기반)
+- [x] 가사 정규화/토큰화 (ai/lyric_normalize.py, ja/ko 문자 단위 + en 단어 단위)
+- [x] confidence 계산 (ai/scoring.py)
+- [x] 파이프라인 오케스트레이션 (ai/sync_service.py)
+- [x] DB 스키마 확장: suggested_start_ms / suggested_end_ms + 자동 마이그레이션
+- [x] AI Commands: SetLockState / ApplyAISuggestion / RejectAISuggestion / WriteAISuggestions (모두 undo 가능)
+- [x] Inspector: LockState 라디오, suggested 값 표시, Accept/Reject 버튼
+- [x] Grid: lock_state 컬럼, confidence 컬럼, 신뢰도 그라데이션 색상
+- [x] Main: AI 메뉴, 백그라운드 QThread 워커, 진행 다이얼로그
+- [x] Anchor 기반 반자동 (LOCKED 라인을 hard anchor 로 사용)
+- [ ] Speech Mode (WhisperX word alignment) — 다음 슬라이스
+- [ ] Song Mode 보컬 분리 (Demucs, 선택)
+- [ ] Bilingual / translation-only 케이스
+- [ ] 음절 단위 \k 타이밍
 
 ### Stage 3: ASS Authoring Suite
 - [ ] Style Manager
@@ -48,5 +59,5 @@ AI 워크플로를 위한 ASS 자막 저작 도구. Python + PySide6 + mpv + FFm
 - [ ] LLM Intent Parser
 
 ## 마지막 업데이트
-- **날짜**: 2026-04-02
-- **상태**: Stage 1 기능 구현 거의 완료. 키보드 타이밍, 키프레임, 자동 저장 추가. 실사용 테스트 및 패키징 남음.
+- **날짜**: 2026-04-29
+- **상태**: Stage 2 슬라이스 1 (Case A — same-language) 구현 완료. faster-whisper + DTW 정렬, anchor 기반, 수락/거부 UI, undo 가능. 실제 비디오로 종단 테스트 + 다음 슬라이스 (Bilingual / 음절 타이밍) 남음.

@@ -15,3 +15,4 @@ venv/
 cache/
 autosave/
 *.dll
+.claude/

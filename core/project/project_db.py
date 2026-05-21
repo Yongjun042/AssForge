@@ -55,6 +55,9 @@ class EventRow:
     ai_confidence: float = 0.0
     shadow_line_idx: int = -1
     order_index: int = 0
+    # AI 제안값: 사용자가 수락하기 전까지 별도 보관 (NULL = 제안 없음)
+    suggested_start_ms: int | None = None
+    suggested_end_ms: int | None = None
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -90,7 +93,9 @@ CREATE TABLE IF NOT EXISTS events (
     lock_state TEXT DEFAULT 'unlocked',
     ai_confidence REAL DEFAULT 0.0,
     shadow_line_idx INTEGER DEFAULT -1,
-    order_index INTEGER DEFAULT 0
+    order_index INTEGER DEFAULT 0,
+    suggested_start_ms INTEGER,
+    suggested_end_ms INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS styles (
@@ -152,7 +157,16 @@ class ProjectDB:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns missing in older databases."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(events)").fetchall()}
+        if "suggested_start_ms" not in cols:
+            self.conn.execute("ALTER TABLE events ADD COLUMN suggested_start_ms INTEGER")
+        if "suggested_end_ms" not in cols:
+            self.conn.execute("ALTER TABLE events ADD COLUMN suggested_end_ms INTEGER")
 
     def close(self) -> None:
         if self._conn:
@@ -217,13 +231,15 @@ class ProjectDB:
         self.conn.execute(
             """INSERT INTO events (id, track_id, start_ms, end_ms, text, style_id,
                speaker, layer, margin_l, margin_r, margin_v, effect, is_comment,
-               link_id, lock_state, ai_confidence, shadow_line_idx, order_index)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               link_id, lock_state, ai_confidence, shadow_line_idx, order_index,
+               suggested_start_ms, suggested_end_ms)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (event.id, event.track_id, event.start_ms, event.end_ms, event.text,
              event.style_id, event.speaker, event.layer, event.margin_l,
              event.margin_r, event.margin_v, event.effect, int(event.is_comment),
              event.link_id, event.lock_state.value, event.ai_confidence,
-             event.shadow_line_idx, event.order_index)
+             event.shadow_line_idx, event.order_index,
+             event.suggested_start_ms, event.suggested_end_ms)
         )
         self.conn.commit()
 
@@ -245,13 +261,15 @@ class ProjectDB:
             """UPDATE events SET start_ms=?, end_ms=?, text=?, style_id=?,
                speaker=?, layer=?, margin_l=?, margin_r=?, margin_v=?, effect=?,
                is_comment=?, link_id=?, lock_state=?, ai_confidence=?,
-               shadow_line_idx=?, order_index=?
+               shadow_line_idx=?, order_index=?,
+               suggested_start_ms=?, suggested_end_ms=?
                WHERE id=?""",
             (event.start_ms, event.end_ms, event.text, event.style_id,
              event.speaker, event.layer, event.margin_l, event.margin_r,
              event.margin_v, event.effect, int(event.is_comment),
              event.link_id, event.lock_state.value, event.ai_confidence,
-             event.shadow_line_idx, event.order_index, event.id)
+             event.shadow_line_idx, event.order_index,
+             event.suggested_start_ms, event.suggested_end_ms, event.id)
         )
         self.conn.commit()
 
@@ -263,16 +281,19 @@ class ProjectDB:
         self.conn.executemany(
             """INSERT INTO events (id, track_id, start_ms, end_ms, text, style_id,
                speaker, layer, margin_l, margin_r, margin_v, effect, is_comment,
-               link_id, lock_state, ai_confidence, shadow_line_idx, order_index)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               link_id, lock_state, ai_confidence, shadow_line_idx, order_index,
+               suggested_start_ms, suggested_end_ms)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [(e.id, e.track_id, e.start_ms, e.end_ms, e.text, e.style_id,
               e.speaker, e.layer, e.margin_l, e.margin_r, e.margin_v, e.effect,
               int(e.is_comment), e.link_id, e.lock_state.value, e.ai_confidence,
-              e.shadow_line_idx, e.order_index) for e in events]
+              e.shadow_line_idx, e.order_index,
+              e.suggested_start_ms, e.suggested_end_ms) for e in events]
         )
         self.conn.commit()
 
     def _row_to_event(self, r: sqlite3.Row) -> EventRow:
+        keys = r.keys()
         return EventRow(
             id=r["id"], track_id=r["track_id"],
             start_ms=r["start_ms"], end_ms=r["end_ms"],
@@ -286,6 +307,8 @@ class ProjectDB:
             ai_confidence=r["ai_confidence"],
             shadow_line_idx=r["shadow_line_idx"],
             order_index=r["order_index"],
+            suggested_start_ms=r["suggested_start_ms"] if "suggested_start_ms" in keys else None,
+            suggested_end_ms=r["suggested_end_ms"] if "suggested_end_ms" in keys else None,
         )
 
     # -- Styles --

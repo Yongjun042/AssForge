@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
 import uuid
 from pathlib import Path
@@ -11,8 +12,9 @@ from typing import Optional
 from PySide6.QtCore import QObject, QSettings, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QLabel, QMainWindow, QMenu,
-    QMessageBox, QSplitter, QStatusBar, QVBoxLayout, QWidget,
+    QApplication, QDialog, QDialogButtonBox, QFileDialog, QLabel, QMainWindow,
+    QMenu, QMessageBox, QPlainTextEdit, QProgressDialog, QSplitter, QStatusBar,
+    QVBoxLayout, QWidget,
 )
 
 from app.commands.bus import CommandBus
@@ -33,6 +35,44 @@ from media.ffmpeg_utils import extract_audio, extract_keyframes
 from media.waveform import generate_peaks, save_peaks, load_peaks
 
 log = logging.getLogger(__name__)
+
+
+class _AiSyncWorker(QObject):
+    """백그라운드 AI 동기화 워커.
+
+    Signals:
+        progress(float, str): 0~1, 상태 메시지
+        finished(object, str): SyncResult 또는 None, 에러 메시지
+    """
+    progress = Signal(float, str)
+    finished = Signal(object, str)
+
+    def __init__(self, db_path: str, track_id: str, audio_source: str,
+                 options) -> None:
+        super().__init__()
+        self._db_path = db_path
+        self._track_id = track_id
+        self._audio_source = audio_source
+        self._options = options
+
+    def run(self) -> None:
+        """별도 DB 연결로 sync 실행 (메인 스레드 DB 와 충돌 회피)."""
+        from ai.sync_service import run_sync
+        from core.project.project_db import ProjectDB
+        try:
+            db = ProjectDB(self._db_path)
+            db.open()
+            try:
+                result = run_sync(
+                    db, self._track_id, self._audio_source, self._options,
+                    progress=lambda f, m: self.progress.emit(f, m),
+                )
+            finally:
+                db.close()
+            self.finished.emit(result, "")
+        except Exception as exc:
+            log.exception("AI sync failed")
+            self.finished.emit(None, str(exc))
 
 
 class _VideoLoadWorker(QObject):
@@ -172,6 +212,7 @@ class MainWindow(QMainWindow):
         sm = mb.addMenu("자막(&S)")
         self._add_action(sm, "앞에 삽입", "Ctrl+Shift+Insert", self._on_insert_before)
         self._add_action(sm, "뒤에 삽입", "Ctrl+Insert", self._on_insert_after)
+        self._add_action(sm, "텍스트로 라인 만들기...", "Ctrl+Shift+V", self._on_paste_lines_from_text)
         sm.addSeparator()
         self._add_action(sm, "삭제", "Delete", self._on_delete)
         sm.addSeparator()
@@ -184,6 +225,18 @@ class MainWindow(QMainWindow):
         tm.addSeparator()
         self._add_action(tm, "시작점 마킹", "F3", self._mark_start)
         self._add_action(tm, "종료점 마킹 + 다음줄", "F4", self._mark_end_and_next)
+
+        # AI
+        am = mb.addMenu("AI(&I)")
+        self._add_action(am, "AI 동기화 실행 (전체)", "Ctrl+Shift+A", self._on_ai_sync_all)
+        self._add_action(am, "선택 영역 재정렬", "Ctrl+Alt+A", self._on_ai_sync_selection)
+        am.addSeparator()
+        self._add_action(am, "선택 줄 제안 수락", "F8", self._on_ai_accept_selection)
+        self._add_action(am, "선택 줄 제안 거부", "F9", self._on_ai_reject_selection)
+        self._add_action(am, "모든 제안 수락", "", self._on_ai_accept_all)
+        self._add_action(am, "모든 제안 거부", "", self._on_ai_reject_all)
+        am.addSeparator()
+        self._add_action(am, "선택 줄 LOCK 토글", "Ctrl+L", self._on_ai_toggle_lock)
 
         # 도움말
         hm = mb.addMenu("도움말(&H)")
@@ -222,8 +275,14 @@ class MainWindow(QMainWindow):
 
         self.grid.selection_changed.connect(self._on_grid_selection)
         self.grid.line_activated.connect(self._on_grid_activated)
+        self.grid.insert_before_requested.connect(self._on_insert_before)
+        self.grid.insert_after_requested.connect(self._on_insert_after)
+        self.grid.accept_all_ai_requested.connect(self._on_ai_accept_all)
 
         self.inspector.event_edited.connect(self._on_inspector_edit)
+        self.inspector.lock_state_changed.connect(self._on_lock_state_changed)
+        self.inspector.accept_suggestion.connect(self._on_accept_one)
+        self.inspector.reject_suggestion.connect(self._on_reject_one)
 
     # ============================================================
     # Project lifecycle
@@ -259,6 +318,7 @@ class MainWindow(QMainWindow):
             "영상 파일 (*.mp4 *.mkv *.avi *.webm *.mov *.flv *.ts *.m2ts *.mts);;모든 파일 (*)",
         )
         if path:
+            self._remember_dir(path)
             self._open_video(path)
 
     def _on_open_subtitle(self) -> None:
@@ -267,6 +327,7 @@ class MainWindow(QMainWindow):
             "ASS 자막 (*.ass *.ssa);;모든 파일 (*)",
         )
         if path:
+            self._remember_dir(path)
             self._open_subtitle(path)
 
     def _open_video(self, path: str, confirm_discard: bool = True) -> None:
@@ -303,11 +364,20 @@ class MainWindow(QMainWindow):
         self.timeline.set_keyframes(self._keyframes)
         self.statusBar().showMessage("로딩 완료", 3000)
 
-        # Auto-load associated .ass
-        if self._video_path:
+        # Auto-load associated .ass — 이미 자막이 열려 있으면 덮어쓰지 않는다.
+        # (자막을 먼저 열면서 Video File: 로 영상을 따라 부른 경로에서 이쪽이 재돌입하면
+        # 방금 로드한 자막을 다시 파싱하는 낭비가 생기기 때문)
+        applied_via_open_subtitle = False
+        if self._video_path and not self._subtitle_path:
             ass_path = Path(self._video_path).with_suffix(".ass")
             if ass_path.exists():
                 self._open_subtitle(str(ass_path), confirm_discard=False)
+                applied_via_open_subtitle = True  # _open_subtitle 안에서 이미 sub-add 호출
+
+        # 자막이 비디오보다 먼저 열렸던 경우 — 이 시점에서 비로소 mpv 가 비디오를
+        # 가지고 있으니 자막을 적용한다.
+        if self._subtitle_path and not applied_via_open_subtitle:
+            self.video_player.load_subtitle(self._subtitle_path)
 
     def _open_subtitle(self, path: str, confirm_discard: bool = True) -> None:
         if confirm_discard and not self._confirm_discard():
@@ -379,8 +449,26 @@ class MainWindow(QMainWindow):
             self._refresh_all()
             self._update_title()
 
-            # Render subtitles on video
-            self.video_player.load_subtitle(path)
+            # mpv 에 자막 적용은 비디오가 떠 있을 때만. 비디오가 아직 없으면
+            # 나중에 _on_video_load_finished 에서 적용한다 (sub-add 가 비디오 없이
+            # 호출되면 MPV_ERROR_COMMAND 로 실패).
+            if self._video_path:
+                self.video_player.load_subtitle(path)
+
+            # 사용자가 직접 자막을 열었고 영상이 아직 안 열려 있으면, [Script Info] 의
+            # Video File: 키를 따라 영상도 자동으로 같이 로드한다 (Aegisub 호환).
+            if confirm_discard and not self._video_path:
+                video_ref = script_info.get("Video File")
+                if video_ref:
+                    if not os.path.isabs(video_ref):
+                        video_ref = os.path.normpath(
+                            os.path.join(os.path.dirname(path), video_ref)
+                        )
+                    if os.path.exists(video_ref):
+                        # 자막 로드 정리가 끝난 다음 프레임에 영상 로드를 시작
+                        QTimer.singleShot(
+                            0, lambda p=video_ref: self._open_video(p, confirm_discard=False)
+                        )
 
         except Exception as exc:
             QMessageBox.critical(self, "열기 실패", str(exc))
@@ -398,6 +486,7 @@ class MainWindow(QMainWindow):
             "ASS 자막 (*.ass);;모든 파일 (*)",
         )
         if path:
+            self._remember_dir(path)
             self._save_to(path)
 
     def _save_to(self, path: str) -> None:
@@ -405,8 +494,17 @@ class MainWindow(QMainWindow):
             return
         try:
             events = self._track_mgr.export_events_for_ass(self._main_track_id)
-            script_info = self._db.get_script_info() if self._db else None
-            save_ass_file(path, self._shadow, self._styles, events, script_info)
+            script_info = dict(self._db.get_script_info() or {}) if self._db else {}
+            # Aegisub 호환 — 영상을 함께 저장해서 자막만 다시 열어도 영상이 따라오게 함.
+            if self._video_path:
+                abs_video = os.path.abspath(self._video_path)
+                ass_dir = os.path.dirname(os.path.abspath(path))
+                try:
+                    rel_video = os.path.relpath(abs_video, ass_dir)
+                except ValueError:
+                    rel_video = abs_video  # 다른 드라이브 (Windows)
+                script_info["Video File"] = rel_video
+            save_ass_file(path, self._shadow, self._styles, events, script_info or None)
             self._subtitle_path = path
             self._modified = False
             self._update_title()
@@ -425,10 +523,51 @@ class MainWindow(QMainWindow):
         self.cmd_bus.redo()
         self._refresh_all()
 
+    def _execute_ordered_insert(self, new_event: EventRow) -> None:
+        if not self._db:
+            return
+        from app.commands.edit_commands import InsertEventCommand
+
+        class OrderedInsertCommand:
+            def __init__(self, db: ProjectDB, event: EventRow) -> None:
+                self._db = db
+                self._event = event
+                self._insert = InsertEventCommand(db, event)
+
+            def execute(self) -> None:
+                try:
+                    self._db.conn.execute(
+                        """UPDATE events
+                           SET order_index=order_index+1
+                           WHERE track_id=? AND order_index>=?""",
+                        (self._event.track_id, self._event.order_index),
+                    )
+                    self._insert.execute()
+                except Exception:
+                    self._db.conn.rollback()
+                    raise
+
+            def undo(self) -> None:
+                try:
+                    self._db.conn.execute(
+                        """UPDATE events
+                           SET order_index=order_index-1
+                           WHERE track_id=? AND order_index>?""",
+                        (self._event.track_id, self._event.order_index),
+                    )
+                    self._insert.undo()
+                except Exception:
+                    self._db.conn.rollback()
+                    raise
+
+            def description(self) -> str:
+                return self._insert.description()
+
+        self.cmd_bus.execute(OrderedInsertCommand(self._db, new_event))
+
     def _on_insert_before(self) -> None:
         if not self._db or not self._main_track_id:
             return
-        from app.commands.edit_commands import InsertEventCommand
         selected = self.grid.selected_event_ids()
         # Determine order_index
         events = self._db.get_events(self._main_track_id)
@@ -446,11 +585,15 @@ class MainWindow(QMainWindow):
         new_event = EventRow(
             id=str(uuid.uuid4()),
             track_id=self._main_track_id,
+            start_ms=0,
+            end_ms=0,
+            text="",
             order_index=target_order,
         )
         self.cmd_bus.execute(InsertEventCommand(self._db, new_event))
         self._mark_modified()
         self._refresh_all()
+        self.grid.select_by_id(new_event.id)
 
     def _on_insert_after(self) -> None:
         if not self._db or not self._main_track_id:
@@ -469,11 +612,61 @@ class MainWindow(QMainWindow):
         new_event = EventRow(
             id=str(uuid.uuid4()),
             track_id=self._main_track_id,
+            start_ms=0,
+            end_ms=0,
+            text="",
             order_index=order,
         )
         self.cmd_bus.execute(InsertEventCommand(self._db, new_event))
         self._mark_modified()
         self._refresh_all()
+        self.grid.select_by_id(new_event.id)
+
+    def _on_paste_lines_from_text(self) -> None:
+        """빈 줄(엔터 두 번 이상)로 분리된 텍스트를 받아 자막 라인을 일괄 생성."""
+        if not self._db or not self._main_track_id:
+            return
+
+        dlg = _PasteLinesDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        chunks = dlg.parsed_chunks()
+        if not chunks:
+            QMessageBox.information(self, "텍스트로 라인 만들기",
+                                    "분리된 라인이 없습니다.")
+            return
+
+        # 삽입 위치: 선택이 있으면 마지막 선택 뒤, 없으면 트랙 끝.
+        events = self._db.get_events(self._main_track_id)
+        order = len(events)
+        selected = self.grid.selected_event_ids()
+        if selected and events:
+            sel_set = set(selected)
+            for ev in reversed(events):
+                if ev.id in sel_set:
+                    order = ev.order_index + 1
+                    break
+
+        new_events: list[EventRow] = []
+        for i, text in enumerate(chunks):
+            new_events.append(EventRow(
+                id=str(uuid.uuid4()),
+                track_id=self._main_track_id,
+                start_ms=0,
+                end_ms=0,
+                text=text,
+                order_index=order + i,
+            ))
+
+        from app.commands.edit_commands import BulkInsertEventsCommand
+        self.cmd_bus.execute(BulkInsertEventsCommand(self._db, new_events))
+        self._mark_modified()
+        self._refresh_all()
+        # 첫 새 라인을 선택 (전체가 한 번에 생긴 게 보이도록 스크롤)
+        self.grid.select_by_id(new_events[0].id)
+        self.statusBar().showMessage(
+            f"{len(new_events)}줄 생성됨", 5000,
+        )
 
     def _on_delete(self) -> None:
         if not self._db:
@@ -633,6 +826,187 @@ class MainWindow(QMainWindow):
         self._refresh_all()
 
     # ============================================================
+    # AI Sync
+    # ============================================================
+
+    def _on_ai_sync_all(self) -> None:
+        self._run_ai_sync(only_selected=False)
+
+    def _on_ai_sync_selection(self) -> None:
+        self._run_ai_sync(only_selected=True)
+
+    def _run_ai_sync(self, only_selected: bool) -> None:
+        if not self._db or not self._main_track_id:
+            return
+        if not self._video_path:
+            QMessageBox.information(self, "AI 동기화",
+                "비디오/오디오 파일을 먼저 열어주세요.")
+            return
+
+        only_ids = self.grid.selected_event_ids() if only_selected else None
+        if only_selected and not only_ids:
+            QMessageBox.information(self, "AI 동기화",
+                "선택된 줄이 없습니다.")
+            return
+
+        from ai.sync_service import SyncOptions
+        options = SyncOptions(only_event_ids=only_ids)
+
+        # 진행 다이얼로그
+        self._ai_progress = QProgressDialog(
+            "AI 동기화 시작 중...", "취소", 0, 100, self
+        )
+        self._ai_progress.setWindowTitle("AI 동기화")
+        self._ai_progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self._ai_progress.setMinimumDuration(0)
+        self._ai_progress.setAutoClose(True)
+        self._ai_progress.setValue(0)
+
+        # 백그라운드 워커 (별도 DB 핸들로 실행)
+        self._ai_thread = QThread()
+        self._ai_worker = _AiSyncWorker(
+            self._db.db_path, self._main_track_id, self._video_path, options
+        )
+        self._ai_worker.moveToThread(self._ai_thread)
+
+        self._ai_thread.started.connect(self._ai_worker.run)
+        self._ai_worker.progress.connect(self._on_ai_progress)
+        self._ai_worker.finished.connect(self._on_ai_finished)
+        self._ai_worker.finished.connect(self._ai_thread.quit)
+
+        self._ai_thread.start()
+
+    def _on_ai_progress(self, frac: float, msg: str) -> None:
+        if hasattr(self, "_ai_progress") and self._ai_progress is not None:
+            self._ai_progress.setLabelText(msg)
+            self._ai_progress.setValue(int(frac * 100))
+
+    def _on_ai_finished(self, result, error: str) -> None:
+        if hasattr(self, "_ai_progress") and self._ai_progress is not None:
+            self._ai_progress.close()
+            self._ai_progress = None
+
+        if error:
+            QMessageBox.critical(self, "AI 동기화 실패", error)
+            return
+        if result is None:
+            return
+
+        if not result.suggestions:
+            QMessageBox.information(self, "AI 동기화",
+                f"매칭된 라인이 없습니다 (언어: {result.language or '미상'}).")
+            return
+
+        # WriteAISuggestionsCommand 로 일괄 적용 (한 번의 undo)
+        from app.commands.ai_commands import WriteAISuggestionsCommand
+        self.cmd_bus.execute(WriteAISuggestionsCommand(self._db, result.suggestions))
+        self._mark_modified()
+        self._refresh_all()
+
+        QMessageBox.information(
+            self, "AI 동기화 완료",
+            f"{len(result.suggestions)} 줄에 제안이 기록되었습니다.\n"
+            f"평균 신뢰도: {result.avg_confidence:.2f}\n"
+            f"언어: {result.language or '미상'}\n"
+            f"건너뛴 LOCKED 라인: {result.skipped_locked}",
+        )
+
+    def _on_lock_state_changed(self, event_id: str, state_value: str) -> None:
+        if not self._db:
+            return
+        from app.commands.ai_commands import SetLockStateCommand
+        try:
+            new_state = LockState(state_value)
+        except ValueError:
+            return
+        self.cmd_bus.execute(SetLockStateCommand(self._db, [event_id], new_state))
+        self._mark_modified()
+        self.grid.update_event_row(event_id)
+
+    def _on_accept_one(self, event_id: str) -> None:
+        self._apply_suggestions([event_id])
+
+    def _on_reject_one(self, event_id: str) -> None:
+        self._reject_suggestions([event_id])
+
+    def _on_ai_accept_selection(self) -> None:
+        self._apply_suggestions(self.grid.selected_event_ids())
+
+    def _on_ai_reject_selection(self) -> None:
+        self._reject_suggestions(self.grid.selected_event_ids())
+
+    def _on_ai_accept_all(self) -> None:
+        if not self._db or not self._main_track_id:
+            return
+        rows = self._db.conn.execute(
+            "SELECT id FROM events WHERE track_id=? AND lock_state=?",
+            (self._main_track_id, LockState.AI_SUGGESTED.value),
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        if not ids:
+            QMessageBox.information(self, "AI", "수락할 제안이 없습니다.")
+            return
+        if QMessageBox.question(
+            self, "모든 제안 수락",
+            f"{len(ids)} 줄의 AI 제안을 모두 수락하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes:
+            self._apply_suggestions(ids)
+
+    def _on_ai_reject_all(self) -> None:
+        if not self._db or not self._main_track_id:
+            return
+        rows = self._db.conn.execute(
+            "SELECT id FROM events WHERE track_id=? AND lock_state=?",
+            (self._main_track_id, LockState.AI_SUGGESTED.value),
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        if not ids:
+            QMessageBox.information(self, "AI", "거부할 제안이 없습니다.")
+            return
+        if QMessageBox.question(
+            self, "모든 제안 거부",
+            f"{len(ids)} 줄의 AI 제안을 모두 거부하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes:
+            self._reject_suggestions(ids)
+
+    def _apply_suggestions(self, ids: list[str]) -> None:
+        if not self._db or not ids:
+            return
+        from app.commands.ai_commands import ApplyAISuggestionCommand
+        self.cmd_bus.execute(ApplyAISuggestionCommand(self._db, ids))
+        self._mark_modified()
+        self._refresh_all()
+
+    def _reject_suggestions(self, ids: list[str]) -> None:
+        if not self._db or not ids:
+            return
+        from app.commands.ai_commands import RejectAISuggestionCommand
+        self.cmd_bus.execute(RejectAISuggestionCommand(self._db, ids))
+        self._mark_modified()
+        self._refresh_all()
+
+    def _on_ai_toggle_lock(self) -> None:
+        """선택된 라인의 LOCK 토글 (UNLOCKED ↔ LOCKED)."""
+        if not self._db:
+            return
+        ids = self.grid.selected_event_ids()
+        if not ids:
+            return
+        # 첫 줄이 LOCKED 면 모두 UNLOCKED 로, 아니면 모두 LOCKED 로
+        rows = self._db.conn.execute(
+            f"SELECT id, lock_state FROM events WHERE id IN ({','.join('?'*len(ids))})",
+            ids,
+        ).fetchall()
+        all_locked = all(r["lock_state"] == LockState.LOCKED.value for r in rows)
+        new_state = LockState.UNLOCKED if all_locked else LockState.LOCKED
+        from app.commands.ai_commands import SetLockStateCommand
+        self.cmd_bus.execute(SetLockStateCommand(self._db, ids, new_state))
+        self._mark_modified()
+        self._refresh_all()
+
+    # ============================================================
     # Autosave
     # ============================================================
 
@@ -678,7 +1052,18 @@ class MainWindow(QMainWindow):
         for p in (self._subtitle_path, self._video_path):
             if p:
                 return str(Path(p).parent)
+        remembered = self._settings.value("lastDir", "", type=str)
+        if remembered and Path(remembered).is_dir():
+            return remembered
         return ""
+
+    def _remember_dir(self, path: str) -> None:
+        try:
+            parent = str(Path(path).parent)
+            if parent:
+                self._settings.setValue("lastDir", parent)
+        except Exception:
+            pass
 
     def _on_about(self) -> None:
         QMessageBox.about(self, "프로그램 정보",
@@ -717,11 +1102,13 @@ class MainWindow(QMainWindow):
             if ext in {".mp4", ".mkv", ".avi", ".webm", ".mov", ".flv", ".ts", ".m2ts", ".mts"}:
                 if not self._confirm_discard():
                     return
+                self._remember_dir(path)
                 self._open_video(path, confirm_discard=False)
                 return
             if ext in {".ass", ".ssa"}:
                 if not self._confirm_discard():
                     return
+                self._remember_dir(path)
                 self._open_subtitle(path, confirm_discard=False)
                 return
 
@@ -734,3 +1121,53 @@ def _fmt(ms: int) -> str:
     m = (ms // 60_000) % 60
     h = ms // 3_600_000
     return f"{h:02d}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+_PASTE_SPLIT_RE = re.compile(r"\n[ \t]*\n+")
+
+
+def _split_paste_lines(text: str) -> list[str]:
+    """빈 줄(엔터 두 번 이상)으로 분리. 양 끝 공백/빈 청크는 제거."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    parts = _PASTE_SPLIT_RE.split(text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+class _PasteLinesDialog(QDialog):
+    """빈 줄로 분리된 텍스트를 받아 자막 라인 청크 리스트로 변환."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("텍스트로 라인 만들기")
+        self.resize(560, 480)
+
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel(
+            "빈 줄(엔터 두 번 이상)로 분리된 청크 하나가 자막 라인 하나가 됩니다.\n"
+            "각 라인의 시작/종료 시간은 0:00:00.00 으로 만들어지니 이후 타이밍을 직접 잡으세요."
+        ))
+        self._edit = QPlainTextEdit()
+        self._edit.setPlaceholderText(
+            "예시:\n첫 번째 자막 라인\n\n두 번째 자막 라인\n여러 줄 텍스트도 한 라인 안에 들어갈 수 있음\n\n세 번째 자막 라인"
+        )
+        self._edit.textChanged.connect(self._update_preview)
+        root.addWidget(self._edit, 1)
+
+        self._preview = QLabel("0 라인이 생성됩니다.")
+        root.addWidget(self._preview)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("라인 만들기")
+        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("취소")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        root.addWidget(bb)
+
+    def _update_preview(self) -> None:
+        n = len(_split_paste_lines(self._edit.toPlainText()))
+        self._preview.setText(f"{n} 라인이 생성됩니다.")
+
+    def parsed_chunks(self) -> list[str]:
+        return _split_paste_lines(self._edit.toPlainText())

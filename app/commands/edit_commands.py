@@ -60,6 +60,64 @@ class InsertEventCommand(Command):
         return "이벤트 삽입"
 
 
+class BulkInsertEventsCommand(Command):
+    """Insert multiple events as one atomic, undoable operation.
+
+    삽입 시 같은 트랙의 기존 이벤트 중 ``order_index >= target`` 인 행을
+    ``len(events)`` 만큼 밀어 올린 뒤 새 이벤트를 그 자리에 꽂는다.
+    이렇게 해야 사용자가 paste 한 라인들이 기존 라인 사이에 인터리브되지 않는다.
+    Undo 는 새 행 삭제 후 기존 행을 되밀어 원복한다.
+    """
+
+    def __init__(self, db: ProjectDB, events: list[EventRow]) -> None:
+        self._db = db
+        self._events = events
+        if events:
+            track_ids = {e.track_id for e in events}
+            if len(track_ids) != 1:
+                raise ValueError(
+                    "BulkInsertEventsCommand: 모든 이벤트는 같은 track_id 여야 합니다."
+                )
+            self._track_id: str | None = events[0].track_id
+            self._target_order = min(e.order_index for e in events)
+            self._shift = len(events)
+        else:
+            self._track_id = None
+            self._target_order = 0
+            self._shift = 0
+
+    def execute(self) -> None:
+        if not self._events:
+            return
+        # 1) 기존 라인을 위로 밀기
+        self._db.conn.execute(
+            "UPDATE events SET order_index = order_index + ? "
+            "WHERE track_id = ? AND order_index >= ?",
+            (self._shift, self._track_id, self._target_order),
+        )
+        # 2) 새 라인 삽입 (commit 은 insert_event 가 매번 수행)
+        for ev in self._events:
+            self._db.insert_event(ev)
+
+    def undo(self) -> None:
+        if not self._events:
+            return
+        # 1) 새 라인 삭제
+        for ev in self._events:
+            self._db.delete_event(ev.id)
+        # 2) 위로 밀려 있던 기존 라인을 원복 — 새 라인을 모두 지웠으니
+        #    [target_order + shift, ∞) 구간에 남은 건 모두 기존 라인이다.
+        self._db.conn.execute(
+            "UPDATE events SET order_index = order_index - ? "
+            "WHERE track_id = ? AND order_index >= ?",
+            (self._shift, self._track_id, self._target_order + self._shift),
+        )
+        self._db.conn.commit()
+
+    def description(self) -> str:
+        return f"이벤트 {len(self._events)}개 일괄 삽입"
+
+
 class DeleteEventCommand(Command):
     """Delete an event."""
 

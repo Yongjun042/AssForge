@@ -7,8 +7,9 @@ from typing import Any, Optional
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
-    QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-    QLineEdit, QPlainTextEdit, QSpinBox, QVBoxLayout, QWidget,
+    QButtonGroup, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+    QLineEdit, QPlainTextEdit, QPushButton, QRadioButton, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 from core.project.project_db import EventRow, LockState
@@ -41,9 +42,15 @@ class InspectorPanel(QWidget):
 
     Signals:
         event_edited(str, dict): (event_id, {field: value})
+        lock_state_changed(str, str): (event_id, new_state_value)
+        accept_suggestion(str): (event_id)
+        reject_suggestion(str): (event_id)
     """
 
     event_edited = Signal(str, dict)
+    lock_state_changed = Signal(str, str)
+    accept_suggestion = Signal(str)
+    reject_suggestion = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -61,11 +68,32 @@ class InspectorPanel(QWidget):
         self._speaker.setText(ev.speaker)
         self._layer.setValue(ev.layer)
         self._text.setPlainText(ev.text)
-        self._lock_label.setText(f"상태: {ev.lock_state.value}")
+
+        # LockState 라디오 동기화
+        self._lock_radios[ev.lock_state].setChecked(True)
+
         if ev.ai_confidence > 0:
             self._conf_label.setText(f"신뢰도: {ev.ai_confidence:.2f}")
         else:
             self._conf_label.setText("신뢰도: —")
+
+        # AI 제안값 표시 + Accept/Reject 버튼 활성화
+        has_suggestion = (
+            ev.suggested_start_ms is not None and ev.suggested_end_ms is not None
+            and ev.lock_state != LockState.LOCKED
+        )
+        if has_suggestion:
+            self._sugg_label.setText(
+                f"제안: {_fmt(ev.suggested_start_ms)}  →  {_fmt(ev.suggested_end_ms)}"
+            )
+            self._sugg_label.setVisible(True)
+            self._btn_accept.setVisible(True)
+            self._btn_reject.setVisible(True)
+        else:
+            self._sugg_label.setVisible(False)
+            self._btn_accept.setVisible(False)
+            self._btn_reject.setVisible(False)
+
         self._updating = False
 
     def clear(self) -> None:
@@ -77,8 +105,11 @@ class InspectorPanel(QWidget):
         self._speaker.clear()
         self._layer.setValue(0)
         self._text.clear()
-        self._lock_label.setText("상태: —")
+        self._lock_radios[LockState.UNLOCKED].setChecked(True)
         self._conf_label.setText("신뢰도: —")
+        self._sugg_label.setVisible(False)
+        self._btn_accept.setVisible(False)
+        self._btn_reject.setVisible(False)
         self._updating = False
 
     def _build_ui(self) -> None:
@@ -131,10 +162,49 @@ class InspectorPanel(QWidget):
         # AI status
         sg = QGroupBox("AI 상태")
         sl = QVBoxLayout(sg)
-        self._lock_label = QLabel("상태: —")
-        sl.addWidget(self._lock_label)
+
+        # LockState 라디오
+        lock_row = QHBoxLayout()
+        lock_row.addWidget(QLabel("잠금:"))
+        self._lock_radios: dict[LockState, QRadioButton] = {}
+        self._lock_group = QButtonGroup(self)
+        for state, label in (
+            (LockState.UNLOCKED, "열림"),
+            (LockState.AI_SUGGESTED, "AI 제안"),
+            (LockState.CONFIRMED, "확인"),
+            (LockState.LOCKED, "잠금"),
+        ):
+            rb = QRadioButton(label)
+            rb.toggled.connect(lambda checked, st=state: self._on_lock_radio(checked, st))
+            self._lock_radios[state] = rb
+            self._lock_group.addButton(rb)
+            lock_row.addWidget(rb)
+        lock_row.addStretch()
+        sl.addLayout(lock_row)
+
         self._conf_label = QLabel("신뢰도: —")
         sl.addWidget(self._conf_label)
+
+        # 제안 시간 표시 + Accept/Reject
+        self._sugg_label = QLabel("")
+        self._sugg_label.setStyleSheet("color: #FFD66B;")
+        self._sugg_label.setVisible(False)
+        sl.addWidget(self._sugg_label)
+
+        btn_row = QHBoxLayout()
+        self._btn_accept = QPushButton("✓ 수락")
+        self._btn_accept.setStyleSheet("background: #2A7A35;")
+        self._btn_accept.clicked.connect(self._on_accept)
+        self._btn_accept.setVisible(False)
+        btn_row.addWidget(self._btn_accept)
+        self._btn_reject = QPushButton("✗ 거부")
+        self._btn_reject.setStyleSheet("background: #7A2A2A;")
+        self._btn_reject.clicked.connect(self._on_reject)
+        self._btn_reject.setVisible(False)
+        btn_row.addWidget(self._btn_reject)
+        btn_row.addStretch()
+        sl.addLayout(btn_row)
+
         root.addWidget(sg)
 
         root.addStretch()
@@ -166,3 +236,16 @@ class InspectorPanel(QWidget):
 
     def _on_text(self) -> None:
         self._emit({"text": self._text.toPlainText()})
+
+    def _on_lock_radio(self, checked: bool, state: LockState) -> None:
+        if not checked or self._updating or not self._event_id:
+            return
+        self.lock_state_changed.emit(self._event_id, state.value)
+
+    def _on_accept(self) -> None:
+        if self._event_id:
+            self.accept_suggestion.emit(self._event_id)
+
+    def _on_reject(self) -> None:
+        if self._event_id:
+            self.reject_suggestion.emit(self._event_id)
