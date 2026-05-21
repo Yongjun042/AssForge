@@ -590,7 +590,7 @@ class MainWindow(QMainWindow):
             text="",
             order_index=target_order,
         )
-        self.cmd_bus.execute(InsertEventCommand(self._db, new_event))
+        self._execute_ordered_insert(new_event)
         self._mark_modified()
         self._refresh_all()
         self.grid.select_by_id(new_event.id)
@@ -598,7 +598,6 @@ class MainWindow(QMainWindow):
     def _on_insert_after(self) -> None:
         if not self._db or not self._main_track_id:
             return
-        from app.commands.edit_commands import InsertEventCommand
         events = self._db.get_events(self._main_track_id)
         order = len(events)
         selected = self.grid.selected_event_ids()
@@ -617,7 +616,7 @@ class MainWindow(QMainWindow):
             text="",
             order_index=order,
         )
-        self.cmd_bus.execute(InsertEventCommand(self._db, new_event))
+        self._execute_ordered_insert(new_event)
         self._mark_modified()
         self._refresh_all()
         self.grid.select_by_id(new_event.id)
