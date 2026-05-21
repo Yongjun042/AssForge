@@ -31,8 +31,10 @@ from core.ass.parser import (
 from core.ass.serializer import save_ass_file
 from core.project.project_db import ProjectDB, TrackRole, EventRow, LockState
 from core.track.track_manager import TrackManager
-from media.ffmpeg_utils import extract_audio, extract_keyframes
-from media.waveform import generate_peaks, save_peaks, load_peaks
+from media.ffmpeg_utils import extract_keyframes
+from media.waveform import (
+    generate_peaks_from_video, save_peaks, load_peaks,
+)
 
 log = logging.getLogger(__name__)
 
@@ -80,10 +82,9 @@ class _VideoLoadWorker(QObject):
     finished = Signal(object, list)  # (peaks_or_None, keyframes)
     progress = Signal(str)           # status message
 
-    def __init__(self, video_path: str, wav_path: str, peaks_path: str) -> None:
+    def __init__(self, video_path: str, peaks_path: str) -> None:
         super().__init__()
         self._video_path = video_path
-        self._wav_path = wav_path
         self._peaks_path = peaks_path
 
     def run(self) -> None:
@@ -95,10 +96,10 @@ class _VideoLoadWorker(QObject):
                 self.progress.emit("파형 로딩 중...")
                 peaks = load_peaks(self._peaks_path)
             else:
-                self.progress.emit("오디오 추출 중...")
-                if extract_audio(self._video_path, self._wav_path):
-                    self.progress.emit("파형 생성 중...")
-                    peaks = generate_peaks(self._wav_path)
+                # Pipe ffmpeg → numpy directly; no intermediate WAV on disk.
+                self.progress.emit("파형 생성 중...")
+                peaks = generate_peaks_from_video(self._video_path)
+                if peaks is not None and len(peaks) > 0:
                     save_peaks(peaks, self._peaks_path)
 
             # Keyframes
@@ -338,14 +339,13 @@ class MainWindow(QMainWindow):
         self.video_player.load_video(path)
         self._update_title()
 
-        # Extract audio/waveform/keyframes in background thread
+        # Extract waveform/keyframes in background thread
         cache_dir = os.path.join(tempfile.gettempdir(), "assforge_cache")
         os.makedirs(cache_dir, exist_ok=True)
-        wav_path = os.path.join(cache_dir, f"{Path(path).stem}_audio.wav")
         peaks_path = os.path.join(cache_dir, f"{Path(path).stem}_peaks.bin")
 
         self._load_thread = QThread()
-        self._load_worker = _VideoLoadWorker(path, wav_path, peaks_path)
+        self._load_worker = _VideoLoadWorker(path, peaks_path)
         self._load_worker.moveToThread(self._load_thread)
 
         self._load_thread.started.connect(self._load_worker.run)

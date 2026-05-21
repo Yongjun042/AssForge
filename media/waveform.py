@@ -6,12 +6,16 @@ from __future__ import annotations
 
 import logging
 import struct
+import subprocess
+import sys
 import wave
 from pathlib import Path
 
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 
 def generate_peaks(wav_path: str, peaks_per_second: int = 100) -> np.ndarray:
@@ -62,6 +66,58 @@ def generate_peaks(wav_path: str, peaks_per_second: int = 100) -> np.ndarray:
     if max_peak > 0:
         peaks = peaks / max_peak
 
+    return peaks.astype(np.float32)
+
+
+def generate_peaks_from_video(
+    video_path: str,
+    peaks_per_second: int = 100,
+    samplerate: int = 4000,
+) -> np.ndarray:
+    """Generate peaks directly from a video via ffmpeg stdout pipe.
+
+    Avoids writing an intermediate WAV to disk. Uses a low samplerate
+    (4 kHz mono by default) since the output is just peak amplitudes
+    bucketed at `peaks_per_second`.
+    """
+    from media.ffmpeg_utils import find_ffmpeg
+
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is None:
+        return np.array([], dtype=np.float32)
+
+    args = [
+        ffmpeg, "-v", "quiet", "-nostdin",
+        "-i", str(video_path),
+        "-ac", "1",
+        "-ar", str(samplerate),
+        "-f", "s16le",
+        "-acodec", "pcm_s16le",
+        "-",
+    ]
+    try:
+        proc = subprocess.run(
+            args, capture_output=True, timeout=600,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except Exception:
+        log.exception("ffmpeg pipe failed")
+        return np.array([], dtype=np.float32)
+
+    if proc.returncode != 0 or not proc.stdout:
+        return np.array([], dtype=np.float32)
+
+    samples = np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    chunk_size = max(1, samplerate // peaks_per_second)
+    n_chunks = len(samples) // chunk_size
+    if n_chunks == 0:
+        return np.array([], dtype=np.float32)
+
+    trimmed = samples[:n_chunks * chunk_size].reshape(n_chunks, chunk_size)
+    peaks = np.abs(trimmed).max(axis=1)
+    max_peak = peaks.max()
+    if max_peak > 0:
+        peaks = peaks / max_peak
     return peaks.astype(np.float32)
 
 
