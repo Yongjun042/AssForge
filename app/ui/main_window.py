@@ -31,7 +31,7 @@ from core.ass.parser import (
 from core.ass.serializer import save_ass_file
 from core.project.project_db import ProjectDB, TrackRole, EventRow, LockState
 from core.track.track_manager import TrackManager
-from media.ffmpeg_utils import extract_keyframes
+from media.ffmpeg_utils import cache_is_fresh, cache_key_for_source, extract_keyframes
 from media.waveform import (
     generate_peaks_from_video, save_peaks, load_peaks,
 )
@@ -91,8 +91,9 @@ class _VideoLoadWorker(QObject):
         peaks = None
         keyframes = []
         try:
-            # Waveform
-            if os.path.exists(self._peaks_path):
+            # Waveform — cache check must compare against the source video
+            # mtime so an in-place re-encode doesn't keep us on the old peaks.
+            if cache_is_fresh(self._peaks_path, self._video_path):
                 self.progress.emit("파형 로딩 중...")
                 peaks = load_peaks(self._peaks_path)
             else:
@@ -342,7 +343,7 @@ class MainWindow(QMainWindow):
         # Extract waveform/keyframes in background thread
         cache_dir = os.path.join(tempfile.gettempdir(), "assforge_cache")
         os.makedirs(cache_dir, exist_ok=True)
-        peaks_path = os.path.join(cache_dir, f"{Path(path).stem}_peaks.bin")
+        peaks_path = os.path.join(cache_dir, f"{cache_key_for_source(path)}_peaks.bin")
 
         self._load_thread = QThread()
         self._load_worker = _VideoLoadWorker(path, peaks_path)

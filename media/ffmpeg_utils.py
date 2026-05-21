@@ -1,8 +1,10 @@
 """FFmpeg utilities — audio extraction, video info, waveform, hardsub."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -71,6 +73,34 @@ def _find_binary(names: list[str]) -> str | None:
 
 def find_ffmpeg() -> str | None:
     return _find_binary(["ffmpeg", "ffmpeg.exe"])
+
+
+def cache_key_for_source(path: str) -> str:
+    """Stable per-source cache key. Stem alone collides across folders
+    (e.g. ~/Downloads/song.mp4 vs ~/Backup/song.mp4); appending a short
+    hash of the resolved absolute path keeps them separate while staying
+    human-readable in the cache directory.
+    """
+    try:
+        resolved = str(Path(path).resolve())
+    except OSError:
+        resolved = os.path.abspath(path)
+    h = hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:10]
+    return f"{Path(path).stem}_{h}"
+
+
+def cache_is_fresh(cache_path: str, source_path: str) -> bool:
+    """True iff cache_path exists, has content, and is at least as new as
+    source_path. Stale (older than source) or empty caches must be
+    regenerated — otherwise re-encoding a video in place silently
+    drives downstream tools (waveform, AI sync) from the old audio.
+    """
+    try:
+        cst = os.stat(cache_path)
+        sst = os.stat(source_path)
+    except OSError:
+        return False
+    return cst.st_size > 0 and cst.st_mtime >= sst.st_mtime
 
 
 def find_ffprobe() -> str | None:

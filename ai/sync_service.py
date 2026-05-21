@@ -21,7 +21,7 @@ from ai.transcription import (
     transcribe,
 )
 from core.project.project_db import EventRow, LockState, ProjectDB
-from media.ffmpeg_utils import extract_audio
+from media.ffmpeg_utils import cache_is_fresh, cache_key_for_source, extract_audio
 
 log = logging.getLogger(__name__)
 
@@ -196,14 +196,19 @@ def run_sync(
 
 
 def _ensure_audio_wav(path: str) -> Optional[str]:
-    """비디오면 캐시 폴더에 mono 16k WAV 추출, 이미 wav 면 그대로."""
+    """비디오면 캐시 폴더에 mono 16k WAV 추출, 이미 wav 면 그대로.
+
+    캐시 키에 경로 해시를 포함시켜 다른 폴더의 동명 비디오를 구분하고,
+    소스보다 오래된 캐시는 재생성해 in-place 재인코딩 시 stale WAV
+    가 AI 정렬을 잘못된 오디오로 이끄는 것을 막는다.
+    """
     p = Path(path)
     if p.suffix.lower() == ".wav":
         return str(p)
     cache = Path(tempfile.gettempdir()) / "assforge_cache"
     cache.mkdir(parents=True, exist_ok=True)
-    out = cache / f"{p.stem}_audio.wav"
-    if out.exists() and out.stat().st_size > 0:
+    out = cache / f"{cache_key_for_source(path)}_audio.wav"
+    if cache_is_fresh(str(out), path):
         return str(out)
     ok = extract_audio(str(p), str(out), sample_rate=16000, mono=True)
     if not ok:
