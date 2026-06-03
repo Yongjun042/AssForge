@@ -14,11 +14,30 @@ log = logging.getLogger(__name__)
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 
-def _run(args: list[str], **kwargs) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        args, capture_output=True, text=True, encoding="utf-8",
-        errors="replace", creationflags=_CREATE_NO_WINDOW, **kwargs
+def _run(args: list[str], proc_sink=None, **kwargs) -> subprocess.CompletedProcess:
+    if proc_sink is None:
+        return subprocess.run(
+            args, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", creationflags=_CREATE_NO_WINDOW, **kwargs
+        )
+    # Cancellable path: expose the live Popen so a caller can kill it.
+    timeout = kwargs.pop("timeout", None)
+    proc = subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+        creationflags=_CREATE_NO_WINDOW, **kwargs
     )
+    proc_sink(proc)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except Exception:
+        try:
+            proc.kill()
+            proc.communicate()
+        except Exception:
+            pass
+        raise
+    return subprocess.CompletedProcess(args, proc.returncode, out, err)
 
 
 def _find_binary(names: list[str]) -> str | None:
@@ -163,8 +182,12 @@ def extract_audio(video_path: str, output_path: str,
         return False
 
 
-def extract_keyframes(video_path: str) -> list[int]:
-    """Extract keyframe timestamps in milliseconds."""
+def extract_keyframes(video_path: str, proc_sink=None) -> list[int]:
+    """Extract keyframe timestamps in milliseconds.
+
+    If `proc_sink` is given, it receives the live Popen so the caller can
+    kill it to cancel (e.g. on app close).
+    """
     ffprobe = find_ffprobe()
     if not ffprobe:
         return []
@@ -175,7 +198,7 @@ def extract_keyframes(video_path: str) -> list[int]:
             "-show_entries", "frame=pts_time,key_frame",
             "-of", "json",
             str(video_path),
-        ], timeout=120)
+        ], timeout=120, proc_sink=proc_sink)
         if r.returncode != 0:
             return []
         data = json.loads(r.stdout)

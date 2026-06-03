@@ -148,13 +148,14 @@ class GridPanel(QWidget):
     def set_events(self, events: list[EventRow]) -> None:
         self._model.set_events(events)
 
-    def update_event_row(self, event_id: str) -> None:
-        for i, ev in enumerate(self._model._events):
-            if ev.id == event_id:
-                tl = self._model.index(i, 0)
-                br = self._model.index(i, len(_COLS) - 1)
-                self._model.dataChanged.emit(tl, br)
-                return
+    def update_event(self, ev: EventRow) -> None:
+        """Replace a single row's data with a fresh EventRow and repaint it.
+
+        Must pass the *updated* EventRow — emitting dataChanged alone would
+        re-read the stale row the model still holds, so edits wouldn't show
+        until a full refresh.
+        """
+        self._model.update_single(ev)
 
     def select_by_id(self, event_id: str) -> None:
         """Select a row by event ID."""
@@ -190,13 +191,22 @@ class GridPanel(QWidget):
         self._search.setClearButtonEnabled(True)
         search.addWidget(self._search)
 
-        self._btn_insert_before = QPushButton("＋앞에")
-        self._btn_insert_before.setToolTip("선택한 줄 앞에 삽입 (Ctrl+Shift+Insert)")
+        search.addSpacing(8)
+        search.addWidget(QLabel("줄 추가:"))
+
+        self._btn_insert_before = QPushButton("＋ 앞에")
+        self._btn_insert_before.setToolTip("선택한 줄 앞에 새 줄 삽입  (단축키: Ctrl+Shift+Insert)")
+        self._btn_insert_before.setStyleSheet(
+            "background: #2D5B88; color: white; padding: 3px 10px; font-weight: bold;"
+        )
         self._btn_insert_before.clicked.connect(self.insert_before_requested.emit)
         search.addWidget(self._btn_insert_before)
 
-        self._btn_insert_after = QPushButton("＋뒤에")
-        self._btn_insert_after.setToolTip("선택한 줄 뒤에 삽입 (Ctrl+Insert)")
+        self._btn_insert_after = QPushButton("＋ 뒤에")
+        self._btn_insert_after.setToolTip("선택한 줄 뒤에 새 줄 삽입  (단축키: Insert)")
+        self._btn_insert_after.setStyleSheet(
+            "background: #2D5B88; color: white; padding: 3px 10px; font-weight: bold;"
+        )
         self._btn_insert_after.clicked.connect(self.insert_after_requested.emit)
         search.addWidget(self._btn_insert_after)
 

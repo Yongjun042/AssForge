@@ -73,12 +73,16 @@ def generate_peaks_from_video(
     video_path: str,
     peaks_per_second: int = 100,
     samplerate: int = 4000,
+    proc_sink=None,
 ) -> np.ndarray:
     """Generate peaks directly from a video via ffmpeg stdout pipe.
 
     Avoids writing an intermediate WAV to disk. Uses a low samplerate
     (4 kHz mono by default) since the output is just peak amplitudes
     bucketed at `peaks_per_second`.
+
+    If `proc_sink` is given, it is called with the live Popen so a caller
+    can kill it (e.g. to cancel on app close).
     """
     from media.ffmpeg_utils import find_ffmpeg
 
@@ -95,19 +99,29 @@ def generate_peaks_from_video(
         "-acodec", "pcm_s16le",
         "-",
     ]
+    proc = None
     try:
-        proc = subprocess.run(
-            args, capture_output=True, timeout=600,
+        proc = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             creationflags=_CREATE_NO_WINDOW,
         )
+        if proc_sink is not None:
+            proc_sink(proc)
+        out, _err = proc.communicate(timeout=600)
     except Exception:
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.communicate()
+            except Exception:
+                pass
         log.exception("ffmpeg pipe failed")
         return np.array([], dtype=np.float32)
 
-    if proc.returncode != 0 or not proc.stdout:
+    if proc.returncode != 0 or not out:
         return np.array([], dtype=np.float32)
 
-    samples = np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    samples = np.frombuffer(out, dtype=np.int16).astype(np.float32) / 32768.0
     chunk_size = max(1, samplerate // peaks_per_second)
     n_chunks = len(samples) // chunk_size
     if n_chunks == 0:

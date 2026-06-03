@@ -212,6 +212,13 @@ class MpvPlayer(QWidget):
     @Slot(int)
     def _handle_duration(self, ms: int) -> None:
         self._duration_ms = ms
+        # Refresh the in-widget time label immediately. The observer can fire
+        # well after load_video's one-shot poll on a cold first load, so
+        # without this the label would stay "… / 00:00:00.00" until the next
+        # poll (which only happens on play/seek).
+        self._lbl_time.setText(
+            f"{_fmt(self._position_ms)} / {_fmt(self._duration_ms)}"
+        )
         self.duration_changed.emit(ms)
 
     @Slot(str)
@@ -228,14 +235,25 @@ class MpvPlayer(QWidget):
     def _poll_position(self) -> None:
         if self._mpv is None:
             return
+        # Read duration directly too — don't rely solely on the observer,
+        # which may not have fired yet right after a cold first load.
+        try:
+            dur = self._mpv.duration
+        except Exception:
+            dur = None
+        if dur is not None:
+            d_ms = int(dur * 1000)
+            if d_ms != self._duration_ms:
+                self._duration_ms = d_ms
+                self.duration_changed.emit(d_ms)
+
         try:
             pos = self._mpv.time_pos
         except Exception:
-            return
-        if pos is None:
-            return
-        self._position_ms = int(pos * 1000)
-        self.position_changed.emit(self._position_ms)
+            pos = None
+        if pos is not None:
+            self._position_ms = int(pos * 1000)
+            self.position_changed.emit(self._position_ms)
 
         if not self._seeking:
             dur = max(self._duration_ms, 1)
@@ -251,10 +269,45 @@ class MpvPlayer(QWidget):
     def load_video(self, path: str) -> None:
         if self._mpv is None:
             return
-        self._mpv.play(str(path))
-        self._mpv.pause = True
-        # Force an initial position poll after a short delay
-        QTimer.singleShot(200, self._poll_position)
+        self._duration_ms = 0
+        self._position_ms = 0
+        self._lbl_time.setText(f"{_fmt(0)} / {_fmt(0)}")
+        try:
+            self._mpv.play(str(path))
+            self._mpv.pause = True
+        except Exception:
+            log.exception("Failed to load video: %s", path)
+            return
+        # Duration is only known once the demuxer has parsed the file, which
+        # on a cold first load can take longer than a single delayed poll.
+        # Retry until duration is known (or give up after ~3s).
+        self._post_load_attempts = 0
+        QTimer.singleShot(100, self._poll_until_duration)
+
+    def _poll_until_duration(self) -> None:
+        if self._mpv is None:
+            return
+        self._poll_position()  # reads position + duration, updates label/slider
+        self._post_load_attempts += 1
+        if self._duration_ms <= 0 and self._post_load_attempts < 30:
+            QTimer.singleShot(100, self._poll_until_duration)
+
+    def stop(self) -> None:
+        """Unload the current video and reset transport UI to zero."""
+        self._poll.stop()
+        self._duration_ms = 0
+        self._position_ms = 0
+        self._lbl_time.setText(f"{_fmt(0)} / {_fmt(0)}")
+        self._slider.blockSignals(True)
+        self._slider.setValue(0)
+        self._slider.blockSignals(False)
+        if self._mpv is not None:
+            try:
+                self._mpv.command("stop")
+            except Exception:
+                pass
+        self.duration_changed.emit(0)
+        self.position_changed.emit(0)
 
     def load_subtitle(self, path: str) -> None:
         """Load (or reload) a subtitle file into mpv."""
@@ -278,20 +331,33 @@ class MpvPlayer(QWidget):
                 pass
 
     def seek(self, ms: int) -> None:
-        if self._mpv:
+        if not self._mpv:
+            return
+        try:
             self._mpv.seek(ms / 1000.0, reference="absolute")
-            # Poll immediately to update UI
-            QTimer.singleShot(50, self._poll_position)
+        except Exception:
+            # No file loaded / not seekable yet — mpv raises MPV_ERROR_COMMAND.
+            return
+        # Poll immediately to update UI
+        QTimer.singleShot(50, self._poll_position)
 
     def frame_step(self) -> None:
-        if self._mpv:
+        if not self._mpv:
+            return
+        try:
             self._mpv.command("frame-step")
-            QTimer.singleShot(50, self._poll_position)
+        except Exception:
+            return
+        QTimer.singleShot(50, self._poll_position)
 
     def frame_back(self) -> None:
-        if self._mpv:
+        if not self._mpv:
+            return
+        try:
             self._mpv.command("frame-back-step")
-            QTimer.singleShot(50, self._poll_position)
+        except Exception:
+            return
+        QTimer.singleShot(50, self._poll_position)
 
     def get_position_ms(self) -> int:
         return self._position_ms

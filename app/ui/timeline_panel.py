@@ -52,6 +52,7 @@ class TimelinePanel(QWidget):
         self._drag: tuple[str, str] | None = None  # (event_id, "start"/"end")
         self._drag_start_x = 0.0
         self._drag_orig_ms = 0
+        self._drag_last_ms: int | None = None  # latest dragged value (None until moved)
 
         self._hbar = QScrollBar(Qt.Orientation.Horizontal, self)
         self._hbar.valueChanged.connect(self._on_scroll)
@@ -268,11 +269,13 @@ class TimelinePanel(QWidget):
                     self._drag = (er.id, "start")
                     self._drag_start_x = x
                     self._drag_orig_ms = er.start_ms
+                    self._drag_last_ms = None
                     return
                 if abs(x - x2) <= self._EDGE_GRAB:
                     self._drag = (er.id, "end")
                     self._drag_start_x = x
                     self._drag_orig_ms = er.end_ms
+                    self._drag_last_ms = None
                     return
 
         self.position_clicked.emit(self._x_to_ms(x))
@@ -283,7 +286,19 @@ class TimelinePanel(QWidget):
             delta_ms = int(dx / self._pps * 1000)
             new_ms = max(0, self._drag_orig_ms + delta_ms)
             eid, edge = self._drag
-            self.event_time_changed.emit(eid, edge, new_ms)
+            self._drag_last_ms = new_ms
+            # Update our own copy live so the block follows the cursor and the
+            # timeline never shows a stale position. The single authoritative
+            # commit happens on release (avoids flooding undo with one command
+            # per mouse-move).
+            for er in self._events:
+                if er.id == eid:
+                    if edge == "start":
+                        er.start_ms = new_ms
+                    else:
+                        er.end_ms = new_ms
+                    break
+            self.update()
         else:
             x = ev.position().x()
             y = ev.position().y()
@@ -299,7 +314,13 @@ class TimelinePanel(QWidget):
             self.setCursor(Qt.CursorShape.SizeHorCursor if on_edge else Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, ev: QMouseEvent) -> None:
+        # Commit the drag once, with the final value, so it becomes a single
+        # undoable edit (and the DB/grid sync from the authoritative value).
+        if self._drag is not None and self._drag_last_ms is not None:
+            eid, edge = self._drag
+            self.event_time_changed.emit(eid, edge, self._drag_last_ms)
         self._drag = None
+        self._drag_last_ms = None
 
     def wheelEvent(self, ev: QWheelEvent) -> None:
         delta = ev.angleDelta().y()

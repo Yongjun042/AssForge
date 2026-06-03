@@ -256,6 +256,12 @@ class ProjectDB:
         ).fetchall()
         return [self._row_to_event(r) for r in rows]
 
+    def get_event(self, event_id: str) -> EventRow | None:
+        r = self.conn.execute(
+            "SELECT * FROM events WHERE id=?", (event_id,)
+        ).fetchone()
+        return self._row_to_event(r) if r else None
+
     def update_event(self, event: EventRow) -> None:
         self.conn.execute(
             """UPDATE events SET start_ms=?, end_ms=?, text=?, style_id=?,

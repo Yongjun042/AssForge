@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -86,11 +87,41 @@ class _VideoLoadWorker(QObject):
         super().__init__()
         self._video_path = video_path
         self._peaks_path = peaks_path
+        self._proc = None
+        self._cancelled = False
+        self._lock = threading.Lock()
+
+    def cancel(self) -> None:
+        """Request cancellation and kill any running ffmpeg child so run()
+        returns promptly. Safe to call from another thread."""
+        with self._lock:
+            self._cancelled = True
+            proc = self._proc
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _set_proc(self, proc) -> None:
+        """Receive the live ffmpeg Popen (called from this worker's thread).
+        If cancellation already arrived, kill it immediately."""
+        with self._lock:
+            cancelled = self._cancelled
+            self._proc = proc
+        if cancelled:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def run(self) -> None:
         peaks = None
         keyframes = []
         try:
+            if self._cancelled:
+                self.finished.emit(None, [])
+                return
             # Waveform — cache check must compare against the source video
             # mtime so an in-place re-encode doesn't keep us on the old peaks.
             if cache_is_fresh(self._peaks_path, self._video_path):
@@ -99,13 +130,14 @@ class _VideoLoadWorker(QObject):
             else:
                 # Pipe ffmpeg → numpy directly; no intermediate WAV on disk.
                 self.progress.emit("파형 생성 중...")
-                peaks = generate_peaks_from_video(self._video_path)
-                if peaks is not None and len(peaks) > 0:
+                peaks = generate_peaks_from_video(self._video_path, proc_sink=self._set_proc)
+                if not self._cancelled and peaks is not None and len(peaks) > 0:
                     save_peaks(peaks, self._peaks_path)
 
             # Keyframes
-            self.progress.emit("키프레임 추출 중...")
-            keyframes = extract_keyframes(self._video_path)
+            if not self._cancelled:
+                self.progress.emit("키프레임 추출 중...")
+                keyframes = extract_keyframes(self._video_path, proc_sink=self._set_proc)
         except Exception:
             log.exception("Video load worker failed")
         self.finished.emit(peaks, keyframes)
@@ -131,6 +163,9 @@ class MainWindow(QMainWindow):
         self._modified = False
         self._waveform_peaks = None
         self._keyframes: list[int] = []
+        # Live (QThread, worker) video-load jobs. Strong refs keep them from
+        # being GC'd mid-run; cleaned up via deleteLater on thread.finished.
+        self._load_jobs: set = set()
 
         # Keyboard timing state
         self._timing_mode = False  # True when marking start/end via keyboard
@@ -212,8 +247,13 @@ class MainWindow(QMainWindow):
 
         # 자막
         sm = mb.addMenu("자막(&S)")
+        # NOTE: Ctrl+Insert is Windows' standard "Copy" key (Qt binds Copy to
+        # both Ctrl+C and Ctrl+Ins), so it gets swallowed and is unreliable as
+        # a menu shortcut. Plain Insert is the reliable alternate kept first so
+        # it shows in the menu; Ctrl+Insert stays as a documented secondary.
+        # (Ctrl+Shift+Insert has no standard binding, so it works as-is.)
         self._add_action(sm, "앞에 삽입", "Ctrl+Shift+Insert", self._on_insert_before)
-        self._add_action(sm, "뒤에 삽입", "Ctrl+Insert", self._on_insert_after)
+        self._add_action(sm, "뒤에 삽입", ["Insert", "Ctrl+Insert"], self._on_insert_after)
         self._add_action(sm, "텍스트로 라인 만들기...", "Ctrl+Shift+V", self._on_paste_lines_from_text)
         sm.addSeparator()
         self._add_action(sm, "삭제", "Delete", self._on_delete)
@@ -247,7 +287,10 @@ class MainWindow(QMainWindow):
     def _add_action(self, menu, text, shortcut, slot) -> QAction:
         act = menu.addAction(text)
         if shortcut:
-            act.setShortcut(QKeySequence(shortcut))
+            if isinstance(shortcut, (list, tuple)):
+                act.setShortcuts([QKeySequence(s) for s in shortcut])
+            else:
+                act.setShortcut(QKeySequence(shortcut))
         act.triggered.connect(slot)
         return act
 
@@ -310,6 +353,11 @@ class MainWindow(QMainWindow):
         self._video_path = None
         self._subtitle_path = None
         self._waveform_peaks = None
+        self._keyframes = []
+        # Unload the old video and clear stale timeline visuals.
+        self.video_player.stop()
+        self.timeline.set_waveform(None)
+        self.timeline.set_keyframes([])
         self.cmd_bus.clear()
         self._init_empty_project()
         self._refresh_all()
@@ -345,19 +393,43 @@ class MainWindow(QMainWindow):
         os.makedirs(cache_dir, exist_ok=True)
         peaks_path = os.path.join(cache_dir, f"{cache_key_for_source(path)}_peaks.bin")
 
-        self._load_thread = QThread()
-        self._load_worker = _VideoLoadWorker(path, peaks_path)
-        self._load_worker.moveToThread(self._load_thread)
+        # Each load runs in its own QThread. Hold strong refs in a set and tear
+        # the thread down only via deleteLater after it has *finished* — never
+        # by dropping the Python reference, which lets the GC destroy a
+        # still-running QThread and abort the process (the New→re-load crash).
+        thread = QThread(self)
+        worker = _VideoLoadWorker(path, peaks_path)
+        worker.moveToThread(thread)
+        self._load_jobs.add((thread, worker))
 
-        self._load_thread.started.connect(self._load_worker.run)
-        self._load_worker.progress.connect(lambda msg: self.statusBar().showMessage(msg, 0))
-        self._load_worker.finished.connect(self._on_video_load_finished)
-        self._load_worker.finished.connect(self._load_thread.quit)
+        thread.started.connect(worker.run)
+        worker.progress.connect(lambda msg: self.statusBar().showMessage(msg, 0))
+        worker.finished.connect(
+            lambda peaks, kfs, src=path: self._on_video_load_finished(peaks, kfs, src)
+        )
+        worker.finished.connect(thread.quit)
+        # Reap on the GUI thread (queued: finished() fires from the worker
+        # thread, this slot lives on self → main thread) so the set isn't
+        # mutated cross-thread.
+        thread.finished.connect(self._reap_load_jobs)
 
         self.statusBar().showMessage("영상 로딩 중...", 0)
-        self._load_thread.start()
+        thread.start()
 
-    def _on_video_load_finished(self, peaks, keyframes: list) -> None:
+    def _reap_load_jobs(self) -> None:
+        """Delete and forget any finished video-load jobs (GUI thread)."""
+        for t, w in list(self._load_jobs):
+            if t.isFinished():
+                self._load_jobs.discard((t, w))
+                w.deleteLater()
+                t.deleteLater()
+
+    def _on_video_load_finished(self, peaks, keyframes: list, source_path: str | None = None) -> None:
+        # A previous load can finish after the user has switched to another
+        # video (or hit New). Ignore results that no longer match the current
+        # video so stale peaks/keyframes don't overwrite the new ones.
+        if source_path is not None and source_path != self._video_path:
+            return
         if peaks is not None:
             self._waveform_peaks = peaks
             self.timeline.set_waveform(self._waveform_peaks)
@@ -697,8 +769,12 @@ class MainWindow(QMainWindow):
         from app.commands.edit_commands import UpdateEventCommand
         self.cmd_bus.execute(UpdateEventCommand(self._db, event_id, changes))
         self._mark_modified()
-        # Incremental update: refresh grid row + timeline, not full reset
-        self.grid.update_event_row(event_id)
+        # Incremental update: refresh grid row + timeline, not full reset.
+        # Re-fetch the edited row so the grid model shows the new value
+        # (dataChanged alone would re-read the stale row).
+        ev = self._db.get_event(event_id)
+        if ev:
+            self.grid.update_event(ev)
         self._refresh_timeline_events()
 
     def _on_timeline_drag(self, event_id: str, edge: str, new_ms: int) -> None:
@@ -708,7 +784,12 @@ class MainWindow(QMainWindow):
         field = "start_ms" if edge == "start" else "end_ms"
         self.cmd_bus.execute(UpdateEventCommand(self._db, event_id, {field: new_ms}))
         self._mark_modified()
-        self.grid.update_event_row(event_id)
+        ev = self._db.get_event(event_id)
+        if ev:
+            self.grid.update_event(ev)
+            # Keep the inspector in sync if it's showing the dragged event.
+            if event_id in self.grid.selected_event_ids():
+                self.inspector.load_event(ev)
 
     # ============================================================
     # Grid/Inspector interaction
@@ -727,7 +808,9 @@ class MainWindow(QMainWindow):
             self.inspector.clear()
 
     def _on_grid_activated(self, event_id: str) -> None:
-        if self._db:
+        # Only seek when a video is actually loaded; seeking an idle mpv raises
+        # MPV_ERROR_COMMAND. (seek() is also hardened, this avoids the churn.)
+        if self._db and self._video_path:
             rows = self._db.conn.execute(
                 "SELECT start_ms FROM events WHERE id=?", (event_id,)
             ).fetchall()
@@ -921,7 +1004,9 @@ class MainWindow(QMainWindow):
             return
         self.cmd_bus.execute(SetLockStateCommand(self._db, [event_id], new_state))
         self._mark_modified()
-        self.grid.update_event_row(event_id)
+        ev = self._db.get_event(event_id)
+        if ev:
+            self.grid.update_event(ev)
 
     def _on_accept_one(self, event_id: str) -> None:
         self._apply_suggestions([event_id])
@@ -1085,6 +1170,22 @@ class MainWindow(QMainWindow):
             return
         self._settings.setValue("geometry", self.saveGeometry())
         self._settings.setValue("windowState", self.saveState())
+        # Cancel in-flight loaders (kills their ffmpeg child so run() returns
+        # promptly), drop their callbacks so a late finish can't touch the
+        # closing window, then JOIN — never let a parented QThread be torn
+        # down while still running (that aborts the process).
+        for t, w in list(self._load_jobs):
+            try:
+                w.cancel()
+            except Exception:
+                pass
+            try:
+                w.finished.disconnect()
+            except Exception:
+                pass
+            t.quit()
+        for t, _w in list(self._load_jobs):
+            t.wait()
         self.video_player.close()
         if self._db:
             self._db.close()
