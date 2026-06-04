@@ -13,8 +13,8 @@ _CLASSES: dict[str, type[LLMProvider]] = {
     "ollama": OllamaProvider,
 }
 
-# UI/조회 표시 순서 — 로컬 무료 옵션을 먼저.
-PROVIDER_ORDER = ["ollama", "claude", "openai"]
+# UI/조회 표시 순서 — 키 없이 바로 쓰는 설치형 CLI 를 먼저, 로컬 서버를 끝에.
+PROVIDER_ORDER = ["claude", "openai", "ollama"]
 
 
 def build_provider(name: str, config: LLMConfig | None = None) -> LLMProvider:

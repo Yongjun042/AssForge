@@ -22,9 +22,12 @@ from ai.llm.registry import PROVIDER_ORDER, build_provider
 
 _LABELS = {
     "ollama": "Ollama (로컬, 무료)",
-    "claude": "Claude (Anthropic)",
-    "openai": "Codex / OpenAI",
+    "claude": "Claude (claude CLI)",
+    "openai": "Codex (codex CLI)",
 }
+
+# 설치된 CLI 의 자체 인증을 쓰는 프로바이더 — API 키/base_url 입력칸 불필요.
+_CLI_PROVIDERS = {"claude", "openai"}
 
 
 class LLMSettingsDialog(QDialog):
@@ -117,8 +120,20 @@ class LLMSettingsDialog(QDialog):
         self._model_edit.setText(vals["model"])
         self._key_edit.setText(vals["api_key"])
         self._url_edit.setText(vals["base_url"])
+
+        is_cli = name in _CLI_PROVIDERS
+        # CLI 프로바이더는 키/URL 을 쓰지 않으므로 입력칸을 비활성화한다.
+        self._key_edit.setEnabled(not is_cli)
+        self._url_edit.setEnabled(not is_cli)
+
         env = _ENV_KEYS.get(name, "")
-        if env:
+        if is_cli:
+            cli = "claude" if name == "claude" else "codex"
+            self._env_hint.setText(
+                f"설치된 `{cli}` CLI 의 로그인 인증 사용 — API 키/URL 불필요.\n"
+                f"모델은 CLI 별칭/이름(비우면 CLI 기본값)."
+            )
+        elif env:
             present = " (현재 설정됨 — 이 값이 우선 사용됩니다)" if os.environ.get(env) else " (미설정)"
             self._env_hint.setText(f"환경변수 {env}{present}")
         else:

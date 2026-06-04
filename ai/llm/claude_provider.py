@@ -1,56 +1,67 @@
-"""Claude (Anthropic) 프로바이더. `anthropic` SDK 를 lazy import."""
+"""Claude 프로바이더 — 설치된 `claude` CLI(Claude Code)를 호출.
+
+API 키가 아니라 claude CLI 가 보관한 로그인 인증을 사용한다. `claude -p`(print
+모드)로 1회 완성하고, 시스템 프롬프트는 `--system-prompt`, 사용자 프롬프트는 stdin
+으로 전달한다(긴 자막 컨텍스트도 인자 길이 제한에 걸리지 않는다).
+"""
 from __future__ import annotations
 
+import subprocess
+
+from ._cli import find_cli, run_cli
 from .base import LLMProvider, LLMResponse, LLMResponseError, LLMUnavailable
+
+_JSON_DIRECTIVE = (
+    "Respond with a single valid JSON value and nothing else. "
+    "No markdown code fences, no prose. Do not use any tools."
+)
 
 
 class ClaudeProvider(LLMProvider):
     name = "claude"
-    label = "Claude (Anthropic)"
-    default_model = "claude-sonnet-4-6"
-    requires_api_key = True
+    label = "Claude (claude CLI)"
+    default_model = "sonnet"
+    requires_api_key = False
+
+    def _exe(self) -> str | None:
+        return find_cli(["claude"])
 
     def is_available(self) -> tuple[bool, str]:
-        try:
-            import anthropic  # noqa: F401
-        except ImportError:
-            return False, "anthropic SDK 미설치 (pip install anthropic)"
-        if not self.api_key:
-            return False, "ANTHROPIC_API_KEY 없음 (설정 또는 환경변수)"
-        return True, f"준비됨 ({self.model})"
+        if not self._exe():
+            return False, "claude CLI 미설치 (Claude Code 설치 후 `claude` 가 PATH 에 있어야 함)"
+        return True, f"claude CLI 사용 ({self.model or '기본 모델'})"
 
     def complete(
         self, system, user, *, temperature=0.2, max_tokens=2048, force_json=False,
     ) -> LLMResponse:
-        try:
-            import anthropic
-        except ImportError as e:
-            raise LLMUnavailable("anthropic SDK 미설치 (pip install anthropic)") from e
-        if not self.api_key:
-            raise LLMUnavailable("ANTHROPIC_API_KEY 없음")
+        exe = self._exe()
+        if not exe:
+            raise LLMUnavailable("claude CLI 미설치")
 
         sys_prompt = system or ""
         if force_json:
-            sys_prompt = (sys_prompt + "\n\n" if sys_prompt else "") + (
-                "Respond with a single valid JSON value and nothing else. "
-                "No markdown code fences, no prose."
-            )
+            sys_prompt = (sys_prompt + "\n\n" if sys_prompt else "") + _JSON_DIRECTIVE
 
-        client = anthropic.Anthropic(api_key=self.api_key)
+        args = [exe, "-p", "--output-format", "text"]
+        if self.model:
+            args += ["--model", self.model]
+        if sys_prompt:
+            args += ["--system-prompt", sys_prompt]
+
         try:
-            msg = client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=sys_prompt,
-                messages=[{"role": "user", "content": user}],
-            )
-        except anthropic.APIError as e:
-            raise LLMResponseError(f"Anthropic API 오류: {e}") from e
+            proc = run_cli(args, stdin_text=user, timeout=300)
+        except FileNotFoundError as e:
+            raise LLMUnavailable(f"claude CLI 실행 실패: {e}") from e
+        except subprocess.TimeoutExpired as e:
+            raise LLMResponseError("claude CLI 응답 시간 초과 (300초)") from e
 
-        text = "".join(
-            getattr(block, "text", "")
-            for block in msg.content
-            if getattr(block, "type", "") == "text"
-        )
-        return LLMResponse(text=text, provider=self.name, model=self.model, raw=msg)
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            raise LLMResponseError(
+                f"claude CLI 오류(코드 {proc.returncode}): {err[:300] or '출력 없음'}"
+            )
+
+        text = (proc.stdout or "").strip()
+        if not text:
+            raise LLMResponseError("claude CLI 빈 응답")
+        return LLMResponse(text=text, provider=self.name, model=self.model, raw=proc)

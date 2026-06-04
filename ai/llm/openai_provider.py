@@ -1,59 +1,92 @@
-"""Codex / OpenAI 프로바이더. `openai` SDK 를 lazy import.
+"""Codex 프로바이더 — 설치된 `codex` CLI(OpenAI Codex)를 호출.
 
-base_url 을 지정하면 OpenAI 호환 엔드포인트(Azure, 로컬 게이트웨이 등)도 사용 가능.
+API 키가 아니라 codex CLI 가 보관한 로그인 인증을 사용한다. `codex exec`(비대화형)
+을 read-only 샌드박스로 1회 실행하고, 최종 메시지는 `--output-last-message` 파일
+에서 읽는다(stdout 은 세션 로그가 섞일 수 있어 파일이 더 깔끔하다). 프로젝트 파일을
+건드리지 않도록 임시 디렉터리를 작업 폴더로 지정한다.
+
+클래스명/레지스트리 키는 호환을 위해 `openai`/OpenAIProvider 를 유지한다.
 """
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import tempfile
+
+from ._cli import find_cli, run_cli
 from .base import LLMProvider, LLMResponse, LLMResponseError, LLMUnavailable
+
+_JSON_DIRECTIVE = (
+    "Respond with a single valid JSON value and nothing else. "
+    "No markdown code fences, no prose."
+)
 
 
 class OpenAIProvider(LLMProvider):
     name = "openai"
-    label = "Codex (OpenAI)"
-    default_model = "gpt-4o-mini"
-    requires_api_key = True
+    label = "Codex (codex CLI)"
+    default_model = ""  # 비우면 codex 설정(~/.codex)의 기본 모델 사용
+    requires_api_key = False
+
+    def _exe(self) -> str | None:
+        return find_cli(["codex"])
 
     def is_available(self) -> tuple[bool, str]:
-        try:
-            import openai  # noqa: F401
-        except ImportError:
-            return False, "openai SDK 미설치 (pip install openai)"
-        if not self.api_key:
-            return False, "OPENAI_API_KEY 없음 (설정 또는 환경변수)"
-        return True, f"준비됨 ({self.model})"
+        if not self._exe():
+            return False, "codex CLI 미설치 (`npm i -g @openai/codex` 후 PATH 확인)"
+        return True, f"codex CLI 사용 ({self.model or 'codex 기본 모델'})"
 
     def complete(
         self, system, user, *, temperature=0.2, max_tokens=2048, force_json=False,
     ) -> LLMResponse:
-        try:
-            import openai
-        except ImportError as e:
-            raise LLMUnavailable("openai SDK 미설치 (pip install openai)") from e
-        if not self.api_key:
-            raise LLMUnavailable("OPENAI_API_KEY 없음")
+        exe = self._exe()
+        if not exe:
+            raise LLMUnavailable("codex CLI 미설치")
 
-        kwargs: dict = {"api_key": self.api_key}
-        if self.base_url:
-            kwargs["base_url"] = self.base_url
-        client = openai.OpenAI(**kwargs)
-
-        params: dict = {
-            "model": self.model,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        }
+        # codex 는 별도 system 채널이 없으므로 하나의 프롬프트로 합친다.
+        prompt = (system + "\n\n" if system else "") + user
         if force_json:
-            # response_format=json_object 는 프롬프트에 'json' 단어가 있어야 한다.
-            params["response_format"] = {"type": "json_object"}
+            prompt += "\n\n" + _JSON_DIRECTIVE
+
+        workdir = tempfile.mkdtemp(prefix="assforge_codex_")
+        outfile = os.path.join(workdir, "last_message.txt")
+        args = [
+            exe, "exec",
+            "--skip-git-repo-check",
+            "-s", "read-only",
+            "-C", workdir,
+            "-o", outfile,
+        ]
+        if self.model:
+            args += ["-m", self.model]
+        args.append("-")  # 프롬프트는 stdin 으로 전달
 
         try:
-            resp = client.chat.completions.create(**params)
-        except openai.OpenAIError as e:
-            raise LLMResponseError(f"OpenAI API 오류: {e}") from e
+            try:
+                proc = run_cli(args, stdin_text=prompt, timeout=420, cwd=workdir)
+            except FileNotFoundError as e:
+                raise LLMUnavailable(f"codex CLI 실행 실패: {e}") from e
+            except subprocess.TimeoutExpired as e:
+                raise LLMResponseError("codex CLI 응답 시간 초과 (420초)") from e
 
-        text = resp.choices[0].message.content or ""
-        return LLMResponse(text=text, provider=self.name, model=self.model, raw=resp)
+            text = ""
+            if os.path.exists(outfile):
+                try:
+                    with open(outfile, encoding="utf-8") as f:
+                        text = f.read().strip()
+                except OSError:
+                    text = ""
+            if not text:
+                text = (proc.stdout or "").strip()
+
+            if proc.returncode != 0 and not text:
+                err = (proc.stderr or "").strip()
+                raise LLMResponseError(
+                    f"codex CLI 오류(코드 {proc.returncode}): {err[:300] or '출력 없음'}"
+                )
+            if not text:
+                raise LLMResponseError("codex CLI 빈 응답")
+            return LLMResponse(text=text, provider=self.name, model=self.model, raw=proc)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
