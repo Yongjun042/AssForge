@@ -13,16 +13,17 @@ from typing import Optional
 from PySide6.QtCore import QObject, QSettings, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QDialogButtonBox, QFileDialog, QLabel, QMainWindow,
-    QMenu, QMessageBox, QPlainTextEdit, QProgressDialog, QSplitter, QStatusBar,
-    QVBoxLayout, QWidget,
+    QApplication, QDialog, QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout,
+    QLabel, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QPlainTextEdit, QProgressDialog, QPushButton, QSizePolicy, QSplitter,
+    QStackedWidget, QStatusBar, QVBoxLayout, QWidget,
 )
 
 from app.commands.bus import CommandBus
 from app.ui.timeline_panel import TimelinePanel
 from app.ui.grid_panel import GridPanel
 from app.ui.inspector_panel import InspectorPanel
-from media.mpv_bridge import MpvPlayer
+from media.mpv_bridge import MpvPlayer, MPV_AVAILABLE
 from core.ass.shadow_document import ShadowDocument, LineType
 from core.ass.parser import (
     ParsedStyle, ParsedEvent,
@@ -32,7 +33,7 @@ from core.ass.parser import (
 from core.ass.serializer import save_ass_file
 from core.project.project_db import ProjectDB, TrackRole, EventRow, LockState
 from core.track.track_manager import TrackManager
-from media.ffmpeg_utils import cache_is_fresh, cache_key_for_source, extract_keyframes
+from media.ffmpeg_utils import cache_is_fresh, cache_key_for_source, extract_keyframes, find_ffmpeg
 from media.waveform import (
     generate_peaks_from_video, save_peaks, load_peaks,
 )
@@ -143,6 +144,114 @@ class _VideoLoadWorker(QObject):
         self.finished.emit(peaks, keyframes)
 
 
+class _WelcomePage(QWidget):
+    """첫 실행 시 보여주는 시작 화면 — 빈 편집기 대신 안내/최근 파일/열기 버튼.
+
+    실제 동작(파일 열기·새 프로젝트)은 MainWindow 가 시그널에 연결한다.
+    이 위젯은 QStackedWidget 의 index 0 에 놓이고, 파일이 열리면 편집기(index 1)로 전환된다.
+    """
+    open_video_requested = Signal()
+    open_subtitle_requested = Signal()
+    new_project_requested = Signal()
+    open_path_requested = Signal(str)  # 최근 파일 더블클릭
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._build()
+
+    def _build(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(48, 40, 48, 40)
+        outer.addStretch(1)
+
+        card = QWidget()
+        card.setMaximumWidth(720)
+        cl = QVBoxLayout(card)
+        cl.setSpacing(14)
+
+        title = QLabel("AssForge")
+        tf = title.font(); tf.setPointSize(28); tf.setBold(True); title.setFont(tf)
+        cl.addWidget(title)
+
+        subtitle = QLabel("AI 워크플로를 위한 ASS 자막 저작 도구")
+        subtitle.setStyleSheet("color: #9aa0a6;")
+        cl.addWidget(subtitle)
+
+        hint = QLabel("영상이나 자막 파일을 열어 시작하세요. 창에 파일을 끌어다 놓아도 됩니다.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #9aa0a6;")
+        cl.addWidget(hint)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        for text, sig in (
+            ("영상 열기", self.open_video_requested),
+            ("자막 열기", self.open_subtitle_requested),
+            ("새 프로젝트", self.new_project_requested),
+        ):
+            b = QPushButton(text)
+            b.setMinimumHeight(40)
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            b.clicked.connect(sig)
+            btn_row.addWidget(b)
+        cl.addLayout(btn_row)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #3c4043;")
+        cl.addWidget(sep)
+
+        recent_label = QLabel("최근 파일")
+        rf = recent_label.font(); rf.setBold(True); recent_label.setFont(rf)
+        cl.addWidget(recent_label)
+
+        self._recent_list = QListWidget()
+        self._recent_list.setMaximumHeight(180)
+        self._recent_list.itemDoubleClicked.connect(self._on_recent_activated)
+        cl.addWidget(self._recent_list)
+
+        self._dep_label = QLabel("")
+        self._dep_label.setWordWrap(True)
+        self._dep_label.setTextFormat(Qt.TextFormat.RichText)
+        cl.addWidget(self._dep_label)
+
+        center = QHBoxLayout()
+        center.addStretch(1)
+        center.addWidget(card)
+        center.addStretch(1)
+        outer.addLayout(center)
+        outer.addStretch(2)
+
+    def set_recent_files(self, paths: list[str]) -> None:
+        self._recent_list.clear()
+        if not paths:
+            item = QListWidgetItem("최근 파일 없음")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._recent_list.addItem(item)
+            return
+        for p in paths:
+            item = QListWidgetItem(Path(p).name)
+            item.setToolTip(p)
+            item.setData(Qt.ItemDataRole.UserRole, p)
+            self._recent_list.addItem(item)
+
+    def _on_recent_activated(self, item: QListWidgetItem) -> None:
+        p = item.data(Qt.ItemDataRole.UserRole)
+        if p:
+            self.open_path_requested.emit(str(p))
+
+    def set_dependency_status(self, mpv_ok: bool, ffmpeg_ok: bool) -> None:
+        def mark(ok: bool, name: str) -> str:
+            color = "#34a853" if ok else "#ea4335"
+            glyph = "✓" if ok else "✗"
+            return f'<span style="color:{color};">{glyph} {name}</span>'
+        line = "  ·  ".join((mark(mpv_ok, "mpv"), mark(ffmpeg_ok, "FFmpeg")))
+        if not (mpv_ok and ffmpeg_ok):
+            line += ('<br><span style="color:#9aa0a6;">누락된 구성요소가 있습니다 — '
+                     '<code>python setup.py</code> 를 실행하세요.</span>')
+        self._dep_label.setText(line)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -197,8 +306,22 @@ class MainWindow(QMainWindow):
     # ============================================================
 
     def _build_ui(self) -> None:
-        main_splitter = QSplitter(Qt.Orientation.Vertical, self)
-        self.setCentralWidget(main_splitter)
+        # 중앙은 QStackedWidget: index 0 = Welcome, index 1 = 편집기.
+        # 첫 실행 시 Welcome 을 보여주고, 파일을 열거나 새 프로젝트를 만들면
+        # _show_editor() 로 편집기로 전환한다.
+        self._stack = QStackedWidget(self)
+        self.setCentralWidget(self._stack)
+
+        # index 0 — Welcome
+        self.welcome = _WelcomePage()
+        self.welcome.open_video_requested.connect(self._on_open_video)
+        self.welcome.open_subtitle_requested.connect(self._on_open_subtitle)
+        self.welcome.new_project_requested.connect(self._on_new_from_welcome)
+        self.welcome.open_path_requested.connect(self._open_recent)
+        self._stack.addWidget(self.welcome)
+
+        # index 1 — 편집기
+        main_splitter = QSplitter(Qt.Orientation.Vertical)
 
         # Top: video player
         self.video_player = MpvPlayer()
@@ -221,6 +344,10 @@ class MainWindow(QMainWindow):
         main_splitter.setStretchFactor(0, 4)
         main_splitter.setStretchFactor(1, 1)
         main_splitter.setStretchFactor(2, 3)
+        self._stack.addWidget(main_splitter)
+
+        self.welcome.set_dependency_status(MPV_AVAILABLE, find_ffmpeg() is not None)
+        self.welcome.set_recent_files(self._recent_files())
 
     # ============================================================
     # Menus
@@ -234,6 +361,9 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "새로 만들기(&N)", "Ctrl+N", self._on_new)
         self._add_action(fm, "영상 열기(&V)...", "Ctrl+O", self._on_open_video)
         self._add_action(fm, "자막 열기(&L)...", "Ctrl+Shift+O", self._on_open_subtitle)
+        self._recent_menu = fm.addMenu("최근 파일(&R)")
+        self._recent_menu.aboutToShow.connect(self._rebuild_recent_menu)
+        self._rebuild_recent_menu()
         fm.addSeparator()
         self._add_action(fm, "저장(&S)", "Ctrl+S", self._on_save)
         self._add_action(fm, "다른 이름으로 저장(&A)...", "Ctrl+Shift+S", self._on_save_as)
@@ -259,6 +389,10 @@ class MainWindow(QMainWindow):
         self._add_action(sm, "삭제", "Delete", self._on_delete)
         sm.addSeparator()
         self._add_action(sm, "시간 이동...", "Ctrl+Shift+T", self._on_shift_times)
+        sm.addSeparator()
+        self._add_action(sm, "스타일 매니저...", "Ctrl+Shift+M", self._on_style_manager)
+        self._add_action(sm, "타이프세팅 (위치/회전/클립)...", "", self._on_typeset)
+        self._add_action(sm, "QA 검사...", "Ctrl+Shift+Q", self._on_qa)
 
         # 타이밍
         tm = mb.addMenu("타이밍(&T)")
@@ -270,6 +404,9 @@ class MainWindow(QMainWindow):
 
         # AI
         am = mb.addMenu("AI(&I)")
+        self._add_action(am, "AI 편집 (자연어/효과)...", "Ctrl+Shift+E", self._on_ai_edit)
+        self._add_action(am, "LLM 설정...", "", self._on_llm_settings)
+        am.addSeparator()
         self._add_action(am, "AI 동기화 실행 (전체)", "Ctrl+Shift+A", self._on_ai_sync_all)
         self._add_action(am, "선택 영역 재정렬", "Ctrl+Alt+A", self._on_ai_sync_selection)
         am.addSeparator()
@@ -345,6 +482,86 @@ class MainWindow(QMainWindow):
         self._modified = False
         self._update_title()
 
+    # ============================================================
+    # Welcome ↔ 편집기 전환 + 최근 파일
+    # ============================================================
+
+    def _show_editor(self) -> None:
+        """편집기 페이지(QStackedWidget index 1)로 전환. 파일을 열거나 새로 만들 때 호출."""
+        if self._stack.currentIndex() != 1:
+            self._stack.setCurrentIndex(1)
+
+    def _on_new_from_welcome(self) -> None:
+        """Welcome 의 '새 프로젝트' — 시작 시 이미 빈 프로젝트가 있으니 편집기만 띄운다."""
+        self._show_editor()
+
+    def _recent_files(self) -> list[str]:
+        """존재하는 최근 파일 경로만 (최신 순).
+
+        QSettings 는 항목이 1개뿐인 리스트를 문자열로 되돌려줄 때가 있어 방어한다.
+        """
+        raw = self._settings.value("recentFiles", [])
+        if isinstance(raw, str):
+            raw = [raw] if raw else []
+        elif raw is None:
+            raw = []
+        out: list[str] = []
+        for p in raw:
+            try:
+                if p and os.path.exists(p) and p not in out:
+                    out.append(p)
+            except Exception:
+                continue
+        return out
+
+    def _add_recent(self, path: str) -> None:
+        """최근 파일 목록 맨 앞에 추가(중복 제거, 최대 8개) 후 영속화."""
+        try:
+            path = os.path.abspath(path)
+        except Exception:
+            return
+        items = [p for p in self._recent_files() if os.path.normcase(p) != os.path.normcase(path)]
+        items.insert(0, path)
+        del items[8:]
+        self._settings.setValue("recentFiles", items)
+        self.welcome.set_recent_files(items)
+
+    def _open_recent(self, path: str) -> None:
+        """최근 파일/메뉴에서 경로를 확장자에 따라 영상 또는 자막으로 연다."""
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "파일 없음", f"파일을 찾을 수 없습니다:\n{path}")
+            # 사라진 파일은 목록에서 정리
+            items = [p for p in self._recent_files()]
+            self._settings.setValue("recentFiles", items)
+            self.welcome.set_recent_files(items)
+            return
+        ext = Path(path).suffix.lower()
+        self._remember_dir(path)
+        if ext in {".ass", ".ssa"}:
+            self._open_subtitle(path)
+        else:
+            self._open_video(path)
+
+    def _rebuild_recent_menu(self) -> None:
+        """파일 ▸ 최근 파일 서브메뉴를 현재 목록으로 다시 채운다(aboutToShow)."""
+        self._recent_menu.clear()
+        files = self._recent_files()
+        if not files:
+            act = self._recent_menu.addAction("최근 파일 없음")
+            act.setEnabled(False)
+            return
+        for p in files:
+            act = self._recent_menu.addAction(Path(p).name)
+            act.setToolTip(p)
+            act.triggered.connect(lambda _checked=False, path=p: self._open_recent(path))
+        self._recent_menu.addSeparator()
+        clear = self._recent_menu.addAction("목록 지우기")
+        clear.triggered.connect(self._clear_recent)
+
+    def _clear_recent(self) -> None:
+        self._settings.setValue("recentFiles", [])
+        self.welcome.set_recent_files([])
+
     def _on_new(self) -> None:
         if not self._confirm_discard():
             return
@@ -361,6 +578,7 @@ class MainWindow(QMainWindow):
         self.cmd_bus.clear()
         self._init_empty_project()
         self._refresh_all()
+        self._show_editor()
 
     def _on_open_video(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -385,6 +603,8 @@ class MainWindow(QMainWindow):
             return
 
         self._video_path = path
+        self._show_editor()
+        self._add_recent(path)
         self.video_player.load_video(path)
         self._update_title()
 
@@ -458,6 +678,7 @@ class MainWindow(QMainWindow):
 
         self._subtitle_path = path
         self._modified = False
+        self._show_editor()
 
         try:
             # Load shadow document
@@ -521,6 +742,7 @@ class MainWindow(QMainWindow):
             self.cmd_bus.clear()
             self._refresh_all()
             self._update_title()
+            self._add_recent(path)
 
             # mpv 에 자막 적용은 비디오가 떠 있을 때만. 비디오가 아직 없으면
             # 나중에 _on_video_load_finished 에서 적용한다 (sub-add 가 비디오 없이
@@ -1090,6 +1312,104 @@ class MainWindow(QMainWindow):
         self.cmd_bus.execute(SetLockStateCommand(self._db, ids, new_state))
         self._mark_modified()
         self._refresh_all()
+
+    # ============================================================
+    # Stage 3 도구 — 스타일 / 타이프세팅 / QA / LLM 편집
+    # ============================================================
+
+    def _play_res(self) -> tuple[int, int]:
+        """[Script Info] 의 PlayResX/Y. 없으면 1920x1080."""
+        info = self._db.get_script_info() if self._db else {}
+
+        def _int(key: str, default: int) -> int:
+            try:
+                return int(float(info.get(key, default)))
+            except (TypeError, ValueError):
+                return default
+
+        return _int("PlayResX", 1920), _int("PlayResY", 1080)
+
+    def _selected_events(self) -> list[EventRow]:
+        if not self._db:
+            return []
+        out: list[EventRow] = []
+        for eid in self.grid.selected_event_ids():
+            ev = self._db.get_event(eid)
+            if ev is not None:
+                out.append(ev)
+        return out
+
+    def _on_ai_edit(self) -> None:
+        if not self._db:
+            return
+        events = self._selected_events()
+        if not events:
+            QMessageBox.information(self, "AI 편집", "편집할 자막 줄을 먼저 선택하세요.")
+            return
+        from app.ui.ai_edit_dialog import AiEditDialog
+        dlg = AiEditDialog(self._db, events, self._play_res(), self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_command is not None:
+            self.cmd_bus.execute(dlg.result_command)
+            self._mark_modified()
+            self._refresh_all()
+
+    def _on_llm_settings(self) -> None:
+        from app.ui.llm_settings_dialog import LLMSettingsDialog
+        LLMSettingsDialog(self).exec()
+
+    def _on_style_manager(self) -> None:
+        if not self._db:
+            return
+        from app.commands.edit_commands import CompositeCommand, UpdateEventCommand
+        from app.commands.style_commands import ReplaceStylesCommand
+        from app.ui.style_manager_dialog import StyleManagerDialog
+
+        dlg = StyleManagerDialog(self._styles, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_styles = dlg.result_styles()
+        cmds: list = [ReplaceStylesCommand(self, new_styles)]
+        # 이름 변경 → 참조 이벤트 style_id 재지정 (같은 undo 단위로 묶음)
+        for old, new in dlg.rename_map().items():
+            rows = self._db.conn.execute(
+                "SELECT id FROM events WHERE style_id=?", (old,)
+            ).fetchall()
+            for r in rows:
+                cmds.append(UpdateEventCommand(self._db, r["id"], {"style_id": new}))
+        self.cmd_bus.execute(CompositeCommand(cmds, "스타일 편집"))
+        self._mark_modified()
+        self._refresh_all()
+
+    def _on_typeset(self) -> None:
+        if not self._db:
+            return
+        ids = self.grid.selected_event_ids()
+        if not ids:
+            QMessageBox.information(self, "타이프세팅", "줄을 먼저 선택하세요.")
+            return
+        from app.ui.typeset_dialog import TypesetDialog
+        dlg = TypesetDialog(self._db, ids[0], self._play_res(), self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_command is not None:
+            self.cmd_bus.execute(dlg.result_command)
+            self._mark_modified()
+            ev = self._db.get_event(ids[0])
+            if ev:
+                self.grid.update_event(ev)
+            self._refresh_timeline_events()
+
+    def _on_qa(self) -> None:
+        if not self._db:
+            return
+        from app.ui.qa_panel import QaDialog
+
+        def provider() -> tuple[list, list]:
+            events = self._db.get_all_events() if self._db else []
+            return events, list(self._styles)
+
+        dlg = QaDialog(provider, parent=self)
+        dlg.jump_to.connect(self.grid.select_by_id)
+        self._qa_dialog = dlg  # 비모달 — GC 방지용 강한 참조
+        dlg.show()
 
     # ============================================================
     # Autosave

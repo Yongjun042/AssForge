@@ -9,6 +9,29 @@ from app.commands.bus import Command
 from core.project.project_db import ProjectDB, EventRow, LockState
 
 
+class CompositeCommand(Command):
+    """여러 Command 를 하나의 undo 단위로 묶는다. 실행은 정방향, undo 는 역방향.
+
+    AI 자연어 편집/효과 적용처럼 여러 줄에 걸친 변경을 한 번의 Ctrl+Z 로
+    되돌리기 위한 래퍼. 빈 리스트면 no-op.
+    """
+
+    def __init__(self, commands: list[Command], description: str = "일괄 편집") -> None:
+        self._commands = commands
+        self._description = description
+
+    def execute(self) -> None:
+        for cmd in self._commands:
+            cmd.execute()
+
+    def undo(self) -> None:
+        for cmd in reversed(self._commands):
+            cmd.undo()
+
+    def description(self) -> str:
+        return self._description
+
+
 class UpdateEventCommand(Command):
     """Update one or more fields of an event."""
 

@@ -36,3 +36,10 @@ python -m app.main       # 실행
 
 ## Design Doc
 See `assforge-design.md` for full architecture and roadmap.
+
+## ASS Format Reference
+`docs/ass-format-reference.md` — authoritative spec for all sections, 23 V4+ style
+fields, the 37 override tags, drawing commands, karaoke/fade/animation tags, color
+format (BGR, alpha 0=opaque), and VSFilter vs libass differences. Ground all ASS tag
+work here: `core/ass/tag_tokenizer.py` (KNOWN_TAGS), `core/qa/checks.py`,
+`core/karaoke/`, `core/typeset/`, and the `effects/` compiler.
