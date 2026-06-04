@@ -35,6 +35,10 @@ class CommandBus:
         self._redo_stack: list[Command] = []
         self._max_history = max_history
         self._listeners: list[Callable[[], None]] = []
+        # Command that sat on top of the undo stack at the last save/load.
+        # None means "clean when the stack is empty". Used by is_clean so the
+        # modified flag clears when the user undoes back to the saved state.
+        self._clean_marker: Command | None = None
 
     def execute(self, cmd: Command) -> None:
         """Execute a command and push it to the undo stack."""
@@ -68,7 +72,24 @@ class CommandBus:
     def clear(self) -> None:
         self._undo_stack.clear()
         self._redo_stack.clear()
+        self._clean_marker = None
         self._notify()
+
+    def mark_clean(self) -> None:
+        """Record the current state as the saved/clean baseline."""
+        self._clean_marker = self._undo_stack[-1] if self._undo_stack else None
+        self._notify()
+
+    @property
+    def is_clean(self) -> bool:
+        """True when the current state matches the last marked-clean baseline.
+
+        Compares the top-of-stack command by identity, so undoing/redoing back
+        to the saved point reports clean, while diverging (a new edit after
+        undo) reports dirty.
+        """
+        top = self._undo_stack[-1] if self._undo_stack else None
+        return top is self._clean_marker
 
     @property
     def can_undo(self) -> bool:

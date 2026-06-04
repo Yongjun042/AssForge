@@ -801,6 +801,7 @@ class MainWindow(QMainWindow):
                 script_info["Video File"] = rel_video
             save_ass_file(path, self._shadow, self._styles, events, script_info or None)
             self._subtitle_path = path
+            self.cmd_bus.mark_clean()  # this save point is the new clean baseline
             self._modified = False
             self._update_title()
         except Exception as exc:
@@ -811,12 +812,25 @@ class MainWindow(QMainWindow):
     # ============================================================
 
     def _on_undo(self) -> None:
+        sel = self.grid.selected_event_ids()
         self.cmd_bus.undo()
         self._refresh_all()
+        self._restore_selection(sel)
 
     def _on_redo(self) -> None:
+        sel = self.grid.selected_event_ids()
         self.cmd_bus.redo()
         self._refresh_all()
+        self._restore_selection(sel)
+
+    def _restore_selection(self, ids: list[str]) -> None:
+        """Re-select after a full refresh so the inspector reflects current
+        data. _refresh_all resets the grid model (clearing selection), which
+        otherwise leaves the inspector showing a pre-undo snapshot."""
+        if ids:
+            self.grid.select_by_id(ids[0])
+        if not self.grid.selected_event_ids():
+            self.inspector.clear()
 
     def _execute_ordered_insert(self, new_event: EventRow) -> None:
         if not self._db:
@@ -1073,6 +1087,12 @@ class MainWindow(QMainWindow):
     def _on_history_changed(self) -> None:
         self._act_undo.setEnabled(self.cmd_bus.can_undo)
         self._act_redo.setEnabled(self.cmd_bus.can_redo)
+        # Drive the modified flag off the bus' clean baseline so undoing all
+        # the way back to the saved/loaded state drops the "*".
+        modified = not self.cmd_bus.is_clean
+        if modified != self._modified:
+            self._modified = modified
+            self._update_title()
 
     # ============================================================
     # Keyboard Timing
