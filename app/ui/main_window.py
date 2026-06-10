@@ -787,6 +787,7 @@ class MainWindow(QMainWindow):
     def _save_to(self, path: str) -> None:
         if not self._shadow or not self._track_mgr or not self._main_track_id:
             return
+        self.inspector.flush_pending()  # 디바운스 대기 중인 텍스트를 저장에 포함
         try:
             events = self._track_mgr.export_events_for_ass(self._main_track_id)
             script_info = dict(self._db.get_script_info() or {}) if self._db else {}
@@ -979,9 +980,14 @@ class MainWindow(QMainWindow):
     def _on_delete(self) -> None:
         if not self._db:
             return
-        from app.commands.edit_commands import DeleteEventCommand
-        for eid in self.grid.selected_event_ids():
-            self.cmd_bus.execute(DeleteEventCommand(self._db, eid))
+        from app.commands.edit_commands import CompositeCommand, DeleteEventCommand
+        ids = self.grid.selected_event_ids()
+        if not ids:
+            return
+        cmds = [DeleteEventCommand(self._db, eid) for eid in ids]
+        # 여러 줄 삭제도 Ctrl+Z 한 번으로 — 줄당 1 undo 가 되지 않게 묶는다.
+        cmd = cmds[0] if len(cmds) == 1 else CompositeCommand(cmds, f"이벤트 {len(cmds)}개 삭제")
+        self.cmd_bus.execute(cmd)
         self._mark_modified()
         self._refresh_all()
 
@@ -1439,6 +1445,7 @@ class MainWindow(QMainWindow):
         """Periodically save a backup if there are unsaved changes."""
         if not self._modified or not self._shadow or not self._track_mgr or not self._main_track_id:
             return
+        self.inspector.flush_pending()
         try:
             autosave_dir = os.path.join(tempfile.gettempdir(), "assforge_autosave")
             os.makedirs(autosave_dir, exist_ok=True)

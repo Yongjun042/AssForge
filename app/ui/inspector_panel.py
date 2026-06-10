@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
@@ -56,9 +56,19 @@ class InspectorPanel(QWidget):
         super().__init__(parent)
         self._event_id: str | None = None
         self._updating = False
+        # 텍스트 편집 디바운스 — 키스트로크마다 undo 커맨드가 쌓이지 않도록
+        # 입력이 멎은 뒤 한 번만 event_edited 를 보낸다.
+        self._text_dirty = False
+        self._text_timer = QTimer(self)
+        self._text_timer.setSingleShot(True)
+        self._text_timer.setInterval(500)
+        self._text_timer.timeout.connect(self._flush_text)
         self._build_ui()
 
     def load_event(self, ev: EventRow) -> None:
+        # 이전 줄의 미커밋 텍스트를 먼저 흘려보낸다 — 선택이 바뀌어도
+        # 마지막 입력이 유실되거나 엉뚱한 줄에 적용되지 않게.
+        self._flush_text()
         self._updating = True
         self._event_id = ev.id
         self._start.setText(_fmt(ev.start_ms))
@@ -97,6 +107,10 @@ class InspectorPanel(QWidget):
         self._updating = False
 
     def clear(self) -> None:
+        # 미커밋 텍스트는 버린다 — clear 는 보통 행 삭제/선택 해제 직후라
+        # 이미 사라진 줄에 편집을 보내면 무의미한 undo 항목만 쌓인다.
+        self._text_timer.stop()
+        self._text_dirty = False
         self._updating = True
         self._event_id = None
         self._start.clear()
@@ -235,7 +249,22 @@ class InspectorPanel(QWidget):
         })
 
     def _on_text(self) -> None:
+        if self._updating or not self._event_id:
+            return
+        self._text_dirty = True
+        self._text_timer.start()  # 재시작 — 입력이 멎으면 1회 flush
+
+    def _flush_text(self) -> None:
+        if not self._text_dirty or not self._event_id:
+            return
+        self._text_timer.stop()
+        self._text_dirty = False
         self._emit({"text": self._text.toPlainText()})
+
+    def flush_pending(self) -> None:
+        """디바운스 대기 중인 텍스트 편집을 즉시 커밋 — 저장 직전에 호출해
+        마지막 키 입력(<500ms)이 저장에서 빠지지 않게 한다."""
+        self._flush_text()
 
     def _on_lock_radio(self, checked: bool, state: LockState) -> None:
         if not checked or self._updating or not self._event_id:

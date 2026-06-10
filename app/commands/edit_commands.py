@@ -1,12 +1,10 @@
 """Concrete edit commands for subtitle manipulation."""
 from __future__ import annotations
 
-import copy
-import uuid
 from typing import Any
 
 from app.commands.bus import Command
-from core.project.project_db import ProjectDB, EventRow, LockState
+from core.project.project_db import ProjectDB, EventRow
 
 
 class CompositeCommand(Command):
@@ -166,14 +164,28 @@ class DeleteEventCommand(Command):
 
 
 class ShiftTimesCommand(Command):
-    """Shift start/end times of selected events."""
+    """Shift start/end times of selected events.
+
+    Undo 는 스냅샷 복원이다 — 시프트는 MAX(0, …) 클램프 때문에 역연산이
+    불가역이라(0 으로 잘린 줄에 +Δ 를 더하면 원값이 아님) 변경 전 값을
+    저장해 두었다가 그대로 되돌린다.
+    """
 
     def __init__(self, db: ProjectDB, event_ids: list[str], delta_ms: int) -> None:
         self._db = db
-        self._event_ids = event_ids
+        self._event_ids = list(event_ids)
         self._delta_ms = delta_ms
+        self._old: dict[str, tuple[int, int]] = {}
 
     def execute(self) -> None:
+        if not self._event_ids:
+            return
+        placeholders = ",".join("?" * len(self._event_ids))
+        rows = self._db.conn.execute(
+            f"SELECT id, start_ms, end_ms FROM events WHERE id IN ({placeholders})",
+            self._event_ids,
+        ).fetchall()
+        self._old = {r["id"]: (r["start_ms"], r["end_ms"]) for r in rows}
         for eid in self._event_ids:
             self._db.conn.execute(
                 "UPDATE events SET start_ms=MAX(0, start_ms+?), end_ms=MAX(0, end_ms+?) WHERE id=?",
@@ -182,10 +194,10 @@ class ShiftTimesCommand(Command):
         self._db.conn.commit()
 
     def undo(self) -> None:
-        for eid in self._event_ids:
+        for eid, (s_ms, e_ms) in self._old.items():
             self._db.conn.execute(
-                "UPDATE events SET start_ms=MAX(0, start_ms+?), end_ms=MAX(0, end_ms+?) WHERE id=?",
-                (-self._delta_ms, -self._delta_ms, eid)
+                "UPDATE events SET start_ms=?, end_ms=? WHERE id=?",
+                (s_ms, e_ms, eid)
             )
         self._db.conn.commit()
 

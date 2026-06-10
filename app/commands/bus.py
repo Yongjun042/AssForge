@@ -5,10 +5,8 @@ commands, records them for undo, and handles redo truncation.
 """
 from __future__ import annotations
 
-import copy
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Callable
 
 
 class Command(ABC):

@@ -158,9 +158,9 @@ class RejectAISuggestionCommand(Command):
 class WriteAISuggestionsCommand(Command):
     """sync_service 결과를 DB 에 한꺼번에 기록 — 한 번의 undo 로 전체 롤백.
 
-    sync_service.run_sync 는 자체적으로 DB 를 쓰지만, undo 가능하도록 결과를
-    다시 한 번 이 Command 로 감싸서 적용한다. 호출자는 (event_id, start, end, conf)
-    리스트를 만들어 전달.
+    sync_service.run_sync 는 DB 를 읽기만 하고 제안을 반환만 한다. 실제 쓰기는
+    이 Command 가 유일한 지점이라 execute 시점의 스냅샷이 정확한 undo 기준이
+    된다. 호출자는 (event_id, start, end, conf) 리스트를 만들어 전달.
     """
 
     def __init__(self, db: ProjectDB, suggestions: list[tuple[str, int, int, float]]) -> None:

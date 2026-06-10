@@ -295,5 +295,8 @@ class AiEditDialog(QDialog):
             self._show_proposal(payload)
 
     def reject(self) -> None:
+        # 실행 중인 CLI 를 먼저 죽여야 wait() 가 CLI 타임아웃(수 분)까지
+        # GUI 를 붙잡지 않는다.
+        self._runner.cancel()
         self._runner.wait()
         super().reject()
