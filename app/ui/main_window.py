@@ -813,12 +813,20 @@ class MainWindow(QMainWindow):
     # ============================================================
 
     def _on_undo(self) -> None:
+        # 디바운스 대기 중인 타이핑을 먼저 커밋 — Ctrl+Z 는 방금 친 텍스트부터
+        # 되돌린다(표준 에디터 동작). 이 순서가 아니면 undo 가 끝난 뒤
+        # 선택 복원/타이머 flush 가 stale 텍스트를 문서 위에 다시 커밋한다.
+        self.inspector.flush_pending()
         sel = self.grid.selected_event_ids()
         self.cmd_bus.undo()
         self._refresh_all()
         self._restore_selection(sel)
 
     def _on_redo(self) -> None:
+        # 타이핑(=새 편집)은 redo 스택을 비우는 것이 표준 동작 — flush 가
+        # 그 의미론을 그대로 만들어 준다. stale 텍스트가 redo 결과 위에
+        # 얹히는 것도 함께 막는다.
+        self.inspector.flush_pending()
         sel = self.grid.selected_event_ids()
         self.cmd_bus.redo()
         self._refresh_all()
