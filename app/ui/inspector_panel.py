@@ -107,10 +107,10 @@ class InspectorPanel(QWidget):
         self._updating = False
 
     def clear(self) -> None:
-        # 미커밋 텍스트는 버린다 — clear 는 보통 행 삭제/선택 해제 직후라
-        # 이미 사라진 줄에 편집을 보내면 무의미한 undo 항목만 쌓인다.
-        self._text_timer.stop()
-        self._text_dirty = False
+        # 미커밋 텍스트를 먼저 커밋한다 — clear 는 행 삭제뿐 아니라 단순
+        # 선택 해제(빈 곳 클릭, 필터링)로도 불리므로 버리면 입력이 유실된다.
+        # 행이 정말 삭제된 경우는 수신측(_on_inspector_edit)이 걸러낸다.
+        self._flush_text()
         self._updating = True
         self._event_id = None
         self._start.clear()

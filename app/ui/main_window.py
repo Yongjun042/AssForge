@@ -1008,6 +1008,10 @@ class MainWindow(QMainWindow):
         """Handle field edits from the inspector panel."""
         if not self._db:
             return
+        # 디바운스 flush 가 행 삭제 직후 도착할 수 있다 — 사라진 행이면
+        # no-op 커맨드로 undo 히스토리를 더럽히지 말고 무시한다.
+        if self._db.get_event(event_id) is None:
+            return
         from app.commands.edit_commands import UpdateEventCommand
         self.cmd_bus.execute(UpdateEventCommand(self._db, event_id, changes))
         self._mark_modified()
@@ -1472,6 +1476,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{name}{mod} — AssForge")
 
     def _confirm_discard(self) -> bool:
+        # 디바운스 대기 중인 인스펙터 텍스트를 먼저 커밋해야 _modified 가
+        # 정확해진다 — 안 그러면 마지막 입력(<500ms)만 있는 상태에서 닫기/
+        # 새로 만들기/열기가 확인 없이 진행돼 입력이 조용히 사라진다.
+        self.inspector.flush_pending()
         if not self._modified:
             return True
         return QMessageBox.question(
