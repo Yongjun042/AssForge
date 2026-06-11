@@ -950,10 +950,44 @@ class MainWindow(QMainWindow):
             self._remember_dir(path)
             self._save_to(path)
 
+    def _count_pending_suggestions(self) -> list[str]:
+        """아직 수락되지 않은 AI 제안이 있는 (LOCKED 제외) 이벤트 id 목록."""
+        if not self._db:
+            return []
+        rows = self._db.conn.execute(
+            "SELECT id FROM events WHERE suggested_start_ms IS NOT NULL "
+            "AND lock_state != ?", (LockState.LOCKED.value,),
+        ).fetchall()
+        return [r["id"] for r in rows]
+
     def _save_to(self, path: str) -> None:
         if not self._shadow or not self._track_mgr or not self._main_track_id:
             return
         self.inspector.flush_pending()  # 디바운스 대기 중인 텍스트를 저장에 포함
+
+        # AI 제안은 .ass 에 저장되지 않는 임시 데이터다 — 수락 없이 저장하면
+        # 파일에는 원래 시간(새로 만든 가사 줄이면 0:00)만 남아, 다시 열었을 때
+        # 동기화 결과가 통째로 사라진 것처럼 보인다. 저장 전에 선택을 받는다.
+        pending = self._count_pending_suggestions()
+        if pending:
+            box = QMessageBox(self)
+            box.setWindowTitle("수락되지 않은 AI 제안")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(
+                f"AI 제안 {len(pending)}건이 아직 수락되지 않았습니다.\n\n"
+                "제안 시간은 파일에 저장되지 않습니다 — 그대로 저장하면\n"
+                "원래 시간만 남고, 다시 열면 제안은 사라집니다."
+            )
+            btn_accept = box.addButton("모두 수락 후 저장", QMessageBox.ButtonRole.AcceptRole)
+            btn_ignore = box.addButton("제안 버리고 저장", QMessageBox.ButtonRole.DestructiveRole)
+            btn_cancel = box.addButton("취소", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(btn_accept)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is btn_cancel or clicked is None:
+                return
+            if clicked is btn_accept:
+                self._apply_suggestions(pending)
         try:
             events = self._track_mgr.export_events_for_ass(self._main_track_id)
             script_info = dict(self._db.get_script_info() or {}) if self._db else {}
