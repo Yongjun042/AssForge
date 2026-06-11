@@ -5,6 +5,7 @@ AI-first ASS subtitle authoring tool. Stage 1: Timing Editor.
 
 ## Stack
 Python 3.11+ / PySide6 / python-mpv / FFmpeg / numpy / SQLite
+AI: faster-whisper (전사) / demucs (보컬 분리) / claude·codex CLI (LLM 편집 — pip 아님, 설치형 CLI 로그인 사용)
 
 ## Architecture
 - `core/ass/` — Shadow Document (line-based round-trip), parser, serializer
