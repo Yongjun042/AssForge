@@ -14,7 +14,8 @@ from typing import Optional
 from PySide6.QtCore import QObject, QSettings, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout,
+    QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QFrame, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QProgressDialog, QPushButton, QSizePolicy, QSplitter,
     QStackedWidget, QStatusBar, QVBoxLayout, QWidget,
@@ -40,6 +41,8 @@ from media.waveform import (
 )
 
 log = logging.getLogger(__name__)
+
+_VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".flv", ".ts", ".m2ts", ".mts"}
 
 
 class _AiSyncWorker(QObject):
@@ -251,6 +254,77 @@ class _WelcomePage(QWidget):
             line += ('<br><span style="color:#9aa0a6;">누락된 구성요소가 있습니다 — '
                      '<code>python setup.py</code> 를 실행하세요.</span>')
         self._dep_label.setText(line)
+
+
+class _AiSyncOptionsDialog(QDialog):
+    """AI 동기화 옵션 — 가사 언어 / Whisper 모델. 마지막 선택을 기억한다.
+
+    노래는 Whisper 언어 자동 감지가 자주 틀린다(첫 소절이 다른 언어면 전체가
+    그 언어로 고정되기도 함) — 가사 언어를 직접 지정할 수 있게 한다.
+    """
+
+    _LANGS = [
+        ("자동 감지", ""),
+        ("일본어 (ja)", "ja"),
+        ("한국어 (ko)", "ko"),
+        ("영어 (en)", "en"),
+        ("중국어 (zh)", "zh"),
+    ]
+    _MODELS = ["tiny", "base", "small", "medium", "large-v3"]
+
+    def __init__(self, settings: QSettings, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("AI 동기화 옵션")
+        self._settings = settings
+
+        form = QFormLayout(self)
+
+        self._lang = QComboBox()
+        for label, code in self._LANGS:
+            self._lang.addItem(label, code)
+        saved_lang = settings.value("aiSyncLanguage", "", type=str)
+        for i, (_label, code) in enumerate(self._LANGS):
+            if code == saved_lang:
+                self._lang.setCurrentIndex(i)
+                break
+        form.addRow("가사 언어:", self._lang)
+
+        self._model = QComboBox()
+        self._model.addItems(self._MODELS)
+        saved_model = settings.value("aiSyncModel", "small", type=str)
+        if saved_model in self._MODELS:
+            self._model.setCurrentText(saved_model)
+        form.addRow("Whisper 모델:", self._model)
+
+        hint = QLabel(
+            "노래/BGM 은 언어 자동 감지가 자주 틀립니다 — 가사 언어를 직접 지정하세요.\n"
+            "모델이 클수록 정확하지만 첫 사용 시 다운로드가 필요합니다\n"
+            "(small≈460MB · medium≈1.5GB · large-v3≈2.9GB).",
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888;")
+        form.addRow(hint)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("실행")
+        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("취소")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def accept(self) -> None:
+        self._settings.setValue("aiSyncLanguage", self._lang.currentData() or "")
+        self._settings.setValue("aiSyncModel", self._model.currentText())
+        super().accept()
+
+    def language(self) -> Optional[str]:
+        """선택된 ISO 코드. 자동 감지는 None."""
+        return self._lang.currentData() or None
+
+    def model_size(self) -> str:
+        return self._model.currentText()
 
 
 class MainWindow(QMainWindow):
@@ -595,6 +669,40 @@ class MainWindow(QMainWindow):
         partner = self._load_associations().get(os.path.normcase(os.path.abspath(path)))
         return partner if partner and os.path.exists(partner) else None
 
+    def _scan_partner_in_dir(self, path: str, *, want_subtitle: bool) -> str | None:
+        """같은 폴더에서 stem 포함관계로 짝 후보 탐색 — 정확히 1개일 때만.
+
+        '00237 로랑신궁.m2ts' ↔ '로랑신궁.ass' 처럼 한쪽 stem 이 다른 쪽에
+        포함되는 흔한 명명(에피소드 번호 접두 등)을 기억된 연결이 없어도
+        처음 열 때부터 잡는다. 후보가 여럿이면 추측하지 않는다.
+        """
+        p = Path(path)
+        my_stem = p.stem.casefold().strip()
+        if not my_stem:
+            return None
+        exts = {".ass", ".ssa"} if want_subtitle else _VIDEO_EXTS
+        candidates: list[str] = []
+        try:
+            for f in p.parent.iterdir():
+                if not f.is_file() or f.suffix.lower() not in exts:
+                    continue
+                other = f.stem.casefold().strip()
+                if other and (other in my_stem or my_stem in other):
+                    candidates.append(str(f))
+        except OSError:
+            return None
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _find_partner_subtitle(self, video_path: str) -> str | None:
+        """영상의 짝 자막: 같은 이름 → 기억된 짝 → 폴더 내 stem 포함 1건."""
+        candidate = Path(video_path).with_suffix(".ass")
+        if candidate.exists():
+            return str(candidate)
+        partner = self._associated_partner(video_path)
+        if partner and Path(partner).suffix.lower() in {".ass", ".ssa"}:
+            return partner
+        return self._scan_partner_in_dir(video_path, want_subtitle=True)
+
     def _on_new(self) -> None:
         if not self._confirm_discard():
             return
@@ -640,6 +748,16 @@ class MainWindow(QMainWindow):
         self._add_recent(path)
         self.video_player.load_video(path)
         self._update_title()
+
+        if self._subtitle_path:
+            # 자막이 먼저 열려 있던 경우 — 짝을 즉시 기억 (워커 완료 불요)
+            self._record_association()
+        else:
+            # 짝 자막도 즉시 같이 연다 — 예전엔 파형/키프레임 워커가 끝난 뒤에야
+            # 열어서(수십 초) 자막이 안 열리는 것처럼 보였다.
+            sub_path = self._find_partner_subtitle(path)
+            if sub_path:
+                self._open_subtitle(sub_path, confirm_discard=False)
 
         # Extract waveform/keyframes in background thread
         cache_dir = os.path.join(tempfile.gettempdir(), "assforge_cache")
@@ -695,13 +813,8 @@ class MainWindow(QMainWindow):
         # 방금 로드한 자막을 다시 파싱하는 낭비가 생기기 때문)
         applied_via_open_subtitle = False
         if self._video_path and not self._subtitle_path:
-            # 1순위: 같은 이름의 .ass, 2순위: 이전에 함께 열었던 짝(기억된 연결)
-            candidate = Path(self._video_path).with_suffix(".ass")
-            sub_path = str(candidate) if candidate.exists() else None
-            if not sub_path:
-                partner = self._associated_partner(self._video_path)
-                if partner and Path(partner).suffix.lower() in {".ass", ".ssa"}:
-                    sub_path = partner
+            # 안전망 — 보통은 _open_video 가 이미 즉시 열었다.
+            sub_path = self._find_partner_subtitle(self._video_path)
             if sub_path:
                 self._open_subtitle(sub_path, confirm_discard=False)
                 applied_via_open_subtitle = True  # _open_subtitle 안에서 이미 sub-add 호출
@@ -810,6 +923,8 @@ class MainWindow(QMainWindow):
                     partner = self._associated_partner(path)
                     if partner and Path(partner).suffix.lower() not in {".ass", ".ssa"}:
                         resolved = partner
+                if not resolved:
+                    resolved = self._scan_partner_in_dir(path, want_subtitle=False)
                 if resolved:
                     # 자막 로드 정리가 끝난 다음 프레임에 영상 로드를 시작
                     QTimer.singleShot(
@@ -1244,7 +1359,14 @@ class MainWindow(QMainWindow):
             return
 
         from ai.sync_service import SyncOptions
-        options = SyncOptions(only_event_ids=only_ids)
+        opt_dlg = _AiSyncOptionsDialog(self._settings, self)
+        if opt_dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        options = SyncOptions(
+            model_size=opt_dlg.model_size(),
+            language=opt_dlg.language(),
+            only_event_ids=only_ids,
+        )
 
         # 진행 다이얼로그
         self._ai_progress = QProgressDialog(
