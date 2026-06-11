@@ -1,6 +1,7 @@
 """Main window — orchestrates all panels and manages project lifecycle."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -562,6 +563,38 @@ class MainWindow(QMainWindow):
         self._settings.setValue("recentFiles", [])
         self.welcome.set_recent_files([])
 
+    # -- 영상↔자막 연결 기억 ------------------------------------------------
+    # 영상과 자막이 함께 열렸을 때 그 짝을 기억해 두고, 나중에(특히 최근
+    # 파일에서) 한쪽만 열어도 짝을 같이 띄운다. 파일명이 달라 같은-stem
+    # 매칭이 안 되고 [Script Info] Video File: 키도 없는 경우를 보완한다.
+
+    def _load_associations(self) -> dict[str, str]:
+        raw = self._settings.value("fileAssociations", "", type=str)
+        try:
+            data = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _record_association(self) -> None:
+        """현재 열린 영상+자막 짝을 양방향으로 영속화 (둘 다 있을 때만)."""
+        if not (self._video_path and self._subtitle_path):
+            return
+        video = os.path.abspath(self._video_path)
+        sub = os.path.abspath(self._subtitle_path)
+        assoc = self._load_associations()
+        for key, val in ((os.path.normcase(video), sub), (os.path.normcase(sub), video)):
+            assoc.pop(key, None)  # 재삽입으로 최신성 유지 (dict 삽입 순서)
+            assoc[key] = val
+        while len(assoc) > 32:  # 오래된 짝부터 정리
+            assoc.pop(next(iter(assoc)))
+        self._settings.setValue("fileAssociations", json.dumps(assoc, ensure_ascii=False))
+
+    def _associated_partner(self, path: str) -> str | None:
+        """path 와 짝으로 기억된 파일 경로 (존재할 때만)."""
+        partner = self._load_associations().get(os.path.normcase(os.path.abspath(path)))
+        return partner if partner and os.path.exists(partner) else None
+
     def _on_new(self) -> None:
         if not self._confirm_discard():
             return
@@ -662,15 +695,24 @@ class MainWindow(QMainWindow):
         # 방금 로드한 자막을 다시 파싱하는 낭비가 생기기 때문)
         applied_via_open_subtitle = False
         if self._video_path and not self._subtitle_path:
-            ass_path = Path(self._video_path).with_suffix(".ass")
-            if ass_path.exists():
-                self._open_subtitle(str(ass_path), confirm_discard=False)
+            # 1순위: 같은 이름의 .ass, 2순위: 이전에 함께 열었던 짝(기억된 연결)
+            candidate = Path(self._video_path).with_suffix(".ass")
+            sub_path = str(candidate) if candidate.exists() else None
+            if not sub_path:
+                partner = self._associated_partner(self._video_path)
+                if partner and Path(partner).suffix.lower() in {".ass", ".ssa"}:
+                    sub_path = partner
+            if sub_path:
+                self._open_subtitle(sub_path, confirm_discard=False)
                 applied_via_open_subtitle = True  # _open_subtitle 안에서 이미 sub-add 호출
 
         # 자막이 비디오보다 먼저 열렸던 경우 — 이 시점에서 비로소 mpv 가 비디오를
         # 가지고 있으니 자막을 적용한다.
         if self._subtitle_path and not applied_via_open_subtitle:
             self.video_player.load_subtitle(self._subtitle_path)
+
+        # 영상+자막이 함께 열린 상태가 됐으면 짝을 기억해 둔다.
+        self._record_association()
 
     def _open_subtitle(self, path: str, confirm_discard: bool = True) -> None:
         if confirm_discard and not self._confirm_discard():
@@ -749,21 +791,30 @@ class MainWindow(QMainWindow):
             # 호출되면 MPV_ERROR_COMMAND 로 실패).
             if self._video_path:
                 self.video_player.load_subtitle(path)
+                self._record_association()  # 영상이 이미 떠 있던 경우의 짝 기록
 
-            # 사용자가 직접 자막을 열었고 영상이 아직 안 열려 있으면, [Script Info] 의
-            # Video File: 키를 따라 영상도 자동으로 같이 로드한다 (Aegisub 호환).
+            # 사용자가 직접 자막을 열었고 영상이 아직 안 열려 있으면 영상도 자동으로
+            # 같이 연다. 1순위: [Script Info] Video File: 키(Aegisub 호환),
+            # 2순위: 이전에 함께 열었던 짝(기억된 연결).
             if confirm_discard and not self._video_path:
                 video_ref = script_info.get("Video File")
+                resolved = None
                 if video_ref:
                     if not os.path.isabs(video_ref):
                         video_ref = os.path.normpath(
                             os.path.join(os.path.dirname(path), video_ref)
                         )
                     if os.path.exists(video_ref):
-                        # 자막 로드 정리가 끝난 다음 프레임에 영상 로드를 시작
-                        QTimer.singleShot(
-                            0, lambda p=video_ref: self._open_video(p, confirm_discard=False)
-                        )
+                        resolved = video_ref
+                if not resolved:
+                    partner = self._associated_partner(path)
+                    if partner and Path(partner).suffix.lower() not in {".ass", ".ssa"}:
+                        resolved = partner
+                if resolved:
+                    # 자막 로드 정리가 끝난 다음 프레임에 영상 로드를 시작
+                    QTimer.singleShot(
+                        0, lambda p=resolved: self._open_video(p, confirm_discard=False)
+                    )
 
         except Exception as exc:
             QMessageBox.critical(self, "열기 실패", str(exc))
