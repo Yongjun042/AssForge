@@ -43,6 +43,7 @@ class SyncOptions:
     compute_type: str = "auto"
     language: Optional[str] = None  # None = 자동
     only_event_ids: Optional[list[str]] = None  # None = 트랙 전체
+    separate_vocals: bool = False  # demucs 로 반주 제거 후 전사
 
 
 def run_sync(
@@ -134,8 +135,27 @@ def run_sync(
     if not wav_path:
         raise RuntimeError("오디오 추출에 실패했습니다 (FFmpeg 설치 확인).")
 
+    # 2.5) 보컬 분리 (선택) — 반주를 제거한 보컬 트랙으로 전사
+    t0 = 0.05
+    if options.separate_vocals:
+        from ai.vocal_separation import is_available, separate_vocals
+        ok, why = is_available()
+        if not ok:
+            raise RuntimeError(f"보컬 분리를 사용할 수 없습니다: {why}")
+        vocals = separate_vocals(
+            audio_source, progress=lambda f, m: _p(0.03 + 0.32 * f, m),
+        )
+        if not vocals:
+            raise RuntimeError(
+                "보컬 분리에 실패했습니다 (로그 확인). "
+                "옵션에서 보컬 분리를 끄고 다시 시도할 수 있습니다."
+            )
+        log.info("보컬 분리 사용: %s", vocals)
+        wav_path = vocals
+        t0 = 0.35
+
     # 3) 전사
-    _p(0.05, "Whisper 모델 준비 중...")
+    _p(t0, "Whisper 모델 준비 중...")
     try:
         result: TranscriptionResult = transcribe(
             wav_path,
@@ -143,7 +163,7 @@ def run_sync(
             model_size=options.model_size,
             device=options.device,
             compute_type=options.compute_type,
-            progress=lambda f, m: _p(0.05 + 0.7 * f, m),
+            progress=lambda f, m, _t0=t0: _p(_t0 + (0.78 - _t0) * f, m),
         )
     except TranscriptionUnavailable as exc:
         raise RuntimeError(str(exc))

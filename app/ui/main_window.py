@@ -14,7 +14,8 @@ from typing import Optional
 from PySide6.QtCore import QObject, QSettings, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout,
     QFrame, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QProgressDialog, QPushButton, QSizePolicy, QSplitter,
@@ -296,10 +297,25 @@ class _AiSyncOptionsDialog(QDialog):
             self._model.setCurrentText(saved_model)
         form.addRow("Whisper 모델:", self._model)
 
+        from ai.vocal_separation import is_available as _vocals_available
+        vocals_ok, vocals_why = _vocals_available()
+        self._vocals = QCheckBox("보컬 분리 후 전사 (반주 제거 — 노래 정확도↑, 수 분 소요)")
+        if vocals_ok:
+            self._vocals.setChecked(
+                settings.value("aiSyncSeparateVocals", False, type=bool)
+            )
+        else:
+            self._vocals.setChecked(False)
+            self._vocals.setEnabled(False)
+            self._vocals.setText(f"보컬 분리 후 전사 — {vocals_why}")
+        form.addRow(self._vocals)
+
         hint = QLabel(
             "노래/BGM 은 언어 자동 감지가 자주 틀립니다 — 가사 언어를 직접 지정하세요.\n"
             "모델이 클수록 정확하지만 첫 사용 시 다운로드가 필요합니다\n"
-            "(small≈460MB · medium≈1.5GB · large-v3≈2.9GB).",
+            "(small≈460MB · medium≈1.5GB · large-v3≈2.9GB).\n"
+            "보컬 분리는 첫 실행 시 demucs 모델(~80MB)을 받고, 곡당 수 분 걸립니다\n"
+            "(결과는 캐시되어 같은 영상 재실행은 즉시).",
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #888;")
@@ -317,6 +333,8 @@ class _AiSyncOptionsDialog(QDialog):
     def accept(self) -> None:
         self._settings.setValue("aiSyncLanguage", self._lang.currentData() or "")
         self._settings.setValue("aiSyncModel", self._model.currentText())
+        if self._vocals.isEnabled():
+            self._settings.setValue("aiSyncSeparateVocals", self._vocals.isChecked())
         super().accept()
 
     def language(self) -> Optional[str]:
@@ -325,6 +343,9 @@ class _AiSyncOptionsDialog(QDialog):
 
     def model_size(self) -> str:
         return self._model.currentText()
+
+    def separate_vocals(self) -> bool:
+        return self._vocals.isEnabled() and self._vocals.isChecked()
 
 
 class MainWindow(QMainWindow):
@@ -1399,6 +1420,7 @@ class MainWindow(QMainWindow):
         options = SyncOptions(
             model_size=opt_dlg.model_size(),
             language=opt_dlg.language(),
+            separate_vocals=opt_dlg.separate_vocals(),
             only_event_ids=only_ids,
         )
 
