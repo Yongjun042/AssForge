@@ -25,7 +25,7 @@ import re
 
 _TAG_RE = re.compile(r"\{[^}]*\}")
 _LEAD_RE = re.compile(r"^\s*\{([^}]*)\}")
-_K_IN_TAG = re.compile(r"\\k[fo]?\d*|\\K\d*")
+_K_IN_TAG = re.compile(r"\\k[fot]?\d*|\\K\d*")  # \k \kf \ko \kt \K 전부
 
 
 def _plain(text: str) -> str:
