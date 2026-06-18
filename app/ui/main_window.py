@@ -381,6 +381,20 @@ class MainWindow(QMainWindow):
         self._autosave_timer.setInterval(60_000)  # 60 seconds
         self._autosave_timer.timeout.connect(self._do_autosave)
 
+        # 라이브 영상 미리보기 — 편집을 임시 .ass 로 직렬화해 mpv 에 다시 로드.
+        # 같은 경로면 mpv 가 캐시할 수 있어 두 경로를 번갈아(ping-pong) 쓴다.
+        # 디바운스해 매 키 입력마다 재로드하지 않는다.
+        _ph = uuid.uuid4().hex[:8]
+        self._preview_paths = [
+            os.path.join(tempfile.gettempdir(), f"assforge_preview_{_ph}_a.ass"),
+            os.path.join(tempfile.gettempdir(), f"assforge_preview_{_ph}_b.ass"),
+        ]
+        self._preview_idx = 0
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(220)
+        self._preview_timer.timeout.connect(self._do_video_preview)
+
         # Command bus
         self.cmd_bus = CommandBus()
         self.cmd_bus.add_listener(self._on_history_changed)
@@ -847,7 +861,7 @@ class MainWindow(QMainWindow):
         # 자막이 비디오보다 먼저 열렸던 경우 — 이 시점에서 비로소 mpv 가 비디오를
         # 가지고 있으니 자막을 적용한다.
         if self._subtitle_path and not applied_via_open_subtitle:
-            self.video_player.load_subtitle(self._subtitle_path)
+            self._do_video_preview()
 
         # 영상+자막이 함께 열린 상태가 됐으면 짝을 기억해 둔다.
         self._record_association()
@@ -928,7 +942,7 @@ class MainWindow(QMainWindow):
             # 나중에 _on_video_load_finished 에서 적용한다 (sub-add 가 비디오 없이
             # 호출되면 MPV_ERROR_COMMAND 로 실패).
             if self._video_path:
-                self.video_player.load_subtitle(path)
+                self._do_video_preview()
                 self._record_association()  # 영상이 이미 떠 있던 경우의 짝 기록
 
             # 사용자가 직접 자막을 열었고 영상이 아직 안 열려 있으면 영상도 자동으로
@@ -1794,6 +1808,30 @@ class MainWindow(QMainWindow):
     def _mark_modified(self) -> None:
         self._modified = True
         self._update_title()
+        self._schedule_video_preview()
+
+    # -- 라이브 영상 미리보기 -------------------------------------------------
+    def _schedule_video_preview(self) -> None:
+        """편집 후 디바운스해 영상 자막을 갱신 (영상이 열려 있을 때만)."""
+        if self._video_path:
+            self._preview_timer.start()
+
+    def _do_video_preview(self) -> None:
+        """현재 DB 상태를 임시 .ass 로 써서 mpv 에 다시 로드 — 편집을 영상에 반영."""
+        if not (self._video_path and self._shadow and self._track_mgr
+                and self._main_track_id):
+            return
+        self.inspector.flush_pending()
+        path = self._preview_paths[self._preview_idx]
+        self._preview_idx ^= 1  # 다음엔 다른 경로 — mpv 의 동일-경로 캐시 회피
+        try:
+            events = self._track_mgr.export_events_for_ass(self._main_track_id)
+            script_info = dict(self._db.get_script_info() or {}) if self._db else {}
+            save_ass_file(path, self._shadow, self._styles, events, script_info or None)
+        except Exception:
+            log.exception("라이브 미리보기 렌더 실패")
+            return
+        self.video_player.load_subtitle(path)
 
     def _update_title(self) -> None:
         name = Path(self._subtitle_path).name if self._subtitle_path else "(제목 없음)"
@@ -1869,6 +1907,12 @@ class MainWindow(QMainWindow):
         self.video_player.close()
         if self._db:
             self._db.close()
+        for p in getattr(self, "_preview_paths", []):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
         super().closeEvent(event)
 
     # Drag and drop
