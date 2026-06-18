@@ -200,7 +200,7 @@ class MpvPlayer(QWidget):
 
     def _on_mpv_duration(self, _name: str, value: float | None) -> None:
         if value is not None:
-            self._sig_duration.emit(int(value * 1000))
+            self._sig_duration.emit(round(value * 1000))
 
     def _on_mpv_pause(self, _name: str, value: bool | None) -> None:
         if value is None:
@@ -247,7 +247,7 @@ class MpvPlayer(QWidget):
         except Exception:
             dur = None
         if dur is not None:
-            d_ms = int(dur * 1000)
+            d_ms = round(dur * 1000)
             if d_ms != self._duration_ms:
                 self._duration_ms = d_ms
                 self.duration_changed.emit(d_ms)
@@ -257,13 +257,13 @@ class MpvPlayer(QWidget):
         except Exception:
             pos = None
         if pos is not None:
-            self._position_ms = int(pos * 1000)
+            self._position_ms = round(pos * 1000)
             self.position_changed.emit(self._position_ms)
 
         if not self._seeking:
             dur = max(self._duration_ms, 1)
             self._slider.blockSignals(True)
-            self._slider.setValue(int(self._position_ms / dur * 1000))
+            self._slider.setValue(round(self._position_ms / dur * 1000))
             self._slider.blockSignals(False)
 
         self._lbl_time.setText(
@@ -381,12 +381,12 @@ class MpvPlayer(QWidget):
 
     def _on_slider_pressed(self) -> None:
         self._seeking = True
-        ms = int(self._slider.value() / 1000 * self._duration_ms)
+        ms = round(self._slider.value() / 1000 * self._duration_ms)
         self.seek(ms)
 
     def _on_slider_released(self) -> None:
         self._seeking = False
-        ms = int(self._slider.value() / 1000 * self._duration_ms)
+        ms = round(self._slider.value() / 1000 * self._duration_ms)
         self.seek(ms)
 
     def _set_volume(self, val: int) -> None:

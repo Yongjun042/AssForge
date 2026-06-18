@@ -141,12 +141,22 @@ def serialize_style_line(style: ParsedStyle, format_fields: list[str]) -> str:
     parts = []
     for fname in format_fields:
         val = field_map.get(fname, "")
-        # Format floats: emit as int if value is whole, else as minimal decimal
-        if isinstance(val, float):
-            parts.append(str(int(val)) if val == int(val) else str(val))
-        else:
-            parts.append(str(val))
+        parts.append(_fmt_style_num(val))
     return "Style: " + ",".join(parts)
+
+
+def _fmt_style_num(val) -> str:
+    """Format a style field: whole floats as int, others as a minimal decimal.
+
+    Bare str(float) would leak IEEE-754 tails (e.g. ScaleX edited to 100.1
+    saved as '100.09999999999999'). Round to 4 decimals and strip trailing
+    zeros so edited numeric style fields stay clean.
+    """
+    if isinstance(val, float):
+        if val == int(val):
+            return str(int(val))
+        return f"{val:.4f}".rstrip("0").rstrip(".")
+    return str(val)
 
 
 def parse_event_line(format_fields: list[str], line_text: str) -> ParsedEvent:

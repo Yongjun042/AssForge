@@ -152,4 +152,4 @@ def get_duration_from_peaks(peaks: np.ndarray, peaks_per_second: int = 100) -> i
     """Get duration in milliseconds from peaks array."""
     if len(peaks) == 0:
         return 0
-    return int(len(peaks) / peaks_per_second * 1000)
+    return round(len(peaks) / peaks_per_second * 1000)

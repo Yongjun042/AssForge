@@ -155,15 +155,15 @@ def _run_transcription(
                 w_prob = float(getattr(w, "probability", 1.0) or 1.0)
                 words.append(Word(
                     text=str(getattr(w, "word", "")).strip(),
-                    start_ms=int(w_start * 1000),
-                    end_ms=int(w_end * 1000),
+                    start_ms=round(w_start * 1000),
+                    end_ms=round(w_end * 1000),
                     prob=w_prob,
                 ))
         s_start = float(getattr(seg, "start", 0.0) or 0.0)
         s_end = float(getattr(seg, "end", s_start) or s_start)
         segments.append(Segment(
-            start_ms=int(s_start * 1000),
-            end_ms=int(s_end * 1000),
+            start_ms=round(s_start * 1000),
+            end_ms=round(s_end * 1000),
             text=str(getattr(seg, "text", "")).strip(),
             words=words,
         ))

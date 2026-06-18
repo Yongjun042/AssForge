@@ -245,7 +245,7 @@ def _audio_duration_ms(wav_path: str) -> int:
             rate = w.getframerate()
             if rate == 0:
                 return 0
-            return int(frames * 1000 / rate)
+            return round(frames * 1000 / rate)
     except Exception:
         return 0
 

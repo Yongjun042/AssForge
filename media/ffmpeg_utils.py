@@ -146,7 +146,7 @@ def get_video_info(video_path: str) -> dict:
         fmt = data.get("format", {})
         dur = fmt.get("duration")
         if dur:
-            info["duration_ms"] = int(float(dur) * 1000)
+            info["duration_ms"] = round(float(dur) * 1000)
 
         for stream in data.get("streams", []):
             if stream.get("codec_type") == "video":
@@ -223,7 +223,7 @@ def extract_keyframes(video_path: str, proc_sink=None) -> list[int]:
         data = json.loads(r.stdout)
         frames = data.get("frames", [])
         return [
-            int(float(f["pts_time"]) * 1000)
+            round(float(f["pts_time"]) * 1000)
             for f in frames
             if f.get("key_frame") == 1 and "pts_time" in f
         ]

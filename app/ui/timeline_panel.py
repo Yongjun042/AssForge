@@ -251,7 +251,7 @@ class TimelinePanel(QWidget):
         end = (self._scroll_off + w) / self._pps
 
         while t <= end:
-            x = self._ms_to_x(int(t * 1000))
+            x = self._ms_to_x(round(t * 1000))
             if 0 <= x <= w:
                 p.drawLine(QPointF(x, self._RULER_H - 6), QPointF(x, self._RULER_H))
                 m_int, s_frac = divmod(t, 60)
@@ -281,7 +281,7 @@ class TimelinePanel(QWidget):
 
         for px_x in range(w):
             ms = self._x_to_ms(px_x)
-            peak_idx = int(ms / 1000.0 * self._peaks_per_sec)
+            peak_idx = round(ms / 1000.0 * self._peaks_per_sec)
             if 0 <= peak_idx < len(self._peaks):
                 amp = float(self._peaks[peak_idx])
             else:
