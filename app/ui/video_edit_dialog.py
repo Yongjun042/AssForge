@@ -161,8 +161,12 @@ class VideoEditDialog(QDialog):
         ctl.addWidget(QLabel("회전°:"))
         self._rot = QDoubleSpinBox()
         self._rot.setRange(-360, 360)
-        self._rot.setDecimals(1)
+        self._rot.setDecimals(2)
         self._rot.setValue(get_rotation(self._orig_text))
+        # 사용자가 실제로 바꿨을 때만 기록 — 스핀박스 반올림이 원본 \frz 정밀도를
+        # 무음으로 깎지 않도록 (connect 는 초기 setValue 이후라 그건 무시된다).
+        self._rot_dirty = False
+        self._rot.valueChanged.connect(self._on_rot_changed)
         ctl.addWidget(self._rot)
         btn_reset = QPushButton("위치 지우기")
         btn_reset.setToolTip("\\pos 를 제거해 스타일 기본 위치로 되돌림")
@@ -204,6 +208,7 @@ class VideoEditDialog(QDialog):
         # 적용해도 정렬/모션 기반 위치가 고정 좌표로 바뀌지 않도록.
         self._clear_pos = False
         self._pos_dirty = False
+        self._rot_dirty = False
         self._update_label()
 
     # -- 좌표 변환 (이미지 픽셀 ↔ PlayRes) --
@@ -227,6 +232,9 @@ class VideoEditDialog(QDialog):
         self._pos_dirty = False
         self._coord.setText("\\pos 제거 (스타일 기본 위치)")
 
+    def _on_rot_changed(self, _val: float) -> None:
+        self._rot_dirty = True
+
     def _on_accept(self) -> None:
         text = self._orig_text
         # 위치는 명시적 의도가 있을 때만 건드린다: 드래그했거나(=_pos_dirty)
@@ -237,10 +245,10 @@ class VideoEditDialog(QDialog):
         elif self._pos_dirty:
             vx, vy = self._img_to_vid(self._anchor.pos())
             text = set_position(text, round(vx), round(vy))
-        # 회전은 값을 바꿨을 때만 (애니메이션 \t(\frz) 보존).
-        rot = self._rot.value()
-        if rot != get_rotation(self._orig_text):
-            text = set_rotation(text, rot)
+        # 회전은 사용자가 스핀박스를 실제로 바꿨을 때만 — 안 그러면 반올림된
+        # 값이 원본 \frz 를 무음으로 덮어쓴다. 애니메이션 \t(\frz) 도 보존.
+        if self._rot_dirty:
+            text = set_rotation(text, self._rot.value())
         if text != self._orig_text:
             self.result_command = UpdateEventCommand(
                 self._db, self._event_id, {"text": text}
