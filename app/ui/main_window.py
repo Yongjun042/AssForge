@@ -86,8 +86,8 @@ class _AiSyncWorker(QObject):
 
 class _VideoLoadWorker(QObject):
     """Background worker for audio extraction, waveform generation, and keyframe extraction."""
-    finished = Signal(object, list)  # (peaks_or_None, keyframes)
-    progress = Signal(str)           # status message
+    finished = Signal(object, list, str)  # (peaks_or_None, keyframes, source_path)
+    progress = Signal(str)                # status message
 
     def __init__(self, video_path: str, peaks_path: str) -> None:
         super().__init__()
@@ -126,7 +126,7 @@ class _VideoLoadWorker(QObject):
         keyframes = []
         try:
             if self._cancelled:
-                self.finished.emit(None, [])
+                self.finished.emit(None, [], self._video_path)
                 return
             # Waveform — cache check must compare against the source video
             # mtime so an in-place re-encode doesn't keep us on the old peaks.
@@ -146,7 +146,7 @@ class _VideoLoadWorker(QObject):
                 keyframes = extract_keyframes(self._video_path, proc_sink=self._set_proc)
         except Exception:
             log.exception("Video load worker failed")
-        self.finished.emit(peaks, keyframes)
+        self.finished.emit(peaks, keyframes, self._video_path)
 
 
 class _WelcomePage(QWidget):
@@ -813,10 +813,11 @@ class MainWindow(QMainWindow):
         self._load_jobs.add((thread, worker))
 
         thread.started.connect(worker.run)
-        worker.progress.connect(lambda msg: self.statusBar().showMessage(msg, 0))
-        worker.finished.connect(
-            lambda peaks, kfs, src=path: self._on_video_load_finished(peaks, kfs, src)
-        )
+        worker.progress.connect(self._on_load_progress)
+        # Bound-method connect (not a lambda) so AutoConnection queues this to
+        # the GUI thread — a lambda would run DirectConnection in the worker
+        # thread, and _on_video_load_finished touches the DB (thread-bound).
+        worker.finished.connect(self._on_video_load_finished)
         worker.finished.connect(thread.quit)
         # Reap on the GUI thread (queued: finished() fires from the worker
         # thread, this slot lives on self → main thread) so the set isn't
@@ -825,6 +826,10 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("영상 로딩 중...", 0)
         thread.start()
+
+    def _on_load_progress(self, msg: str) -> None:
+        # Bound method → queued to the GUI thread (worker emits from its thread).
+        self.statusBar().showMessage(msg, 0)
 
     def _reap_load_jobs(self) -> None:
         """Delete and forget any finished video-load jobs (GUI thread)."""
