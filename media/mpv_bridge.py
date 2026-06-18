@@ -169,6 +169,11 @@ class MpvPlayer(QWidget):
                 osd_level=0,
                 keep_open="yes",
                 idle="yes",
+                # 정확 시킹 강제 + 데뮤서를 타깃보다 충분히 앞에서 시작해
+                # 인덱스가 빈약한 TS(예: start_time=600s 인 .m2ts)에서도
+                # 맨 앞(0초) 근처로 정확히 시킹되게 한다.
+                hr_seek="yes",
+                hr_seek_demuxer_offset=2.0,
             )
             # observe_property callbacks run on mpv's thread.
             # We use Qt signals (thread-safe) to marshal to the GUI thread.
