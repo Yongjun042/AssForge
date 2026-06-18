@@ -484,6 +484,9 @@ class MainWindow(QMainWindow):
         em = mb.addMenu("편집(&E)")
         self._act_undo = self._add_action(em, "실행 취소(&U)", "Ctrl+Z", self._on_undo)
         self._act_redo = self._add_action(em, "다시 실행(&R)", "Ctrl+Y", self._on_redo)
+        em.addSeparator()
+        self._add_action(em, "찾기/바꾸기...", "Ctrl+H", self._on_find_replace)
+        self._add_action(em, "줄 선택...", "Ctrl+Shift+L", self._on_select_lines)
 
         # 자막
         sm = mb.addMenu("자막(&S)")
@@ -495,6 +498,9 @@ class MainWindow(QMainWindow):
         self._add_action(sm, "앞에 삽입", "Ctrl+Shift+Insert", self._on_insert_before)
         self._add_action(sm, "뒤에 삽입", ["Insert", "Ctrl+Insert"], self._on_insert_after)
         self._add_action(sm, "텍스트로 라인 만들기...", "Ctrl+Shift+V", self._on_paste_lines_from_text)
+        self._add_action(sm, "줄 복제", "Ctrl+D", self._on_duplicate_lines)
+        self._add_action(sm, "줄 합치기", "Ctrl+J", self._on_join_lines)
+        self._add_action(sm, "줄 나누기 (재생 위치)", "Ctrl+Shift+J", self._on_split_line)
         sm.addSeparator()
         self._add_action(sm, "삭제", "Delete", self._on_delete)
         sm.addSeparator()
@@ -1255,6 +1261,259 @@ class MainWindow(QMainWindow):
                 self.cmd_bus.execute(ShiftTimesCommand(self._db, ids, ms))
                 self._mark_modified()
                 self._refresh_all()
+
+    # ============================================================
+    # 편집 파워 — 복제 / 합치기 / 나누기 / 찾기·바꾸기 / 줄 선택
+    # ============================================================
+
+    def _selected_rows_sorted(self) -> list:
+        """선택된 이벤트를 진행 순서대로."""
+        if not self._db or not self._main_track_id:
+            return []
+        sel = set(self.grid.selected_event_ids())
+        return [e for e in self._db.get_events(self._main_track_id) if e.id in sel]
+
+    def _clone_event(self, e, **overrides) -> EventRow:
+        data = dict(
+            id=str(uuid.uuid4()), track_id=e.track_id,
+            start_ms=e.start_ms, end_ms=e.end_ms, text=e.text,
+            style_id=e.style_id, speaker=e.speaker, layer=e.layer,
+            margin_l=e.margin_l, margin_r=e.margin_r, margin_v=e.margin_v,
+            effect=e.effect, is_comment=e.is_comment, order_index=e.order_index,
+        )
+        data.update(overrides)
+        return EventRow(**data)
+
+    def _on_duplicate_lines(self) -> None:
+        """선택한 줄들을 마지막 선택 줄 바로 뒤에 복제."""
+        sel = self._selected_rows_sorted()
+        if not sel:
+            return
+        from app.commands.edit_commands import BulkInsertEventsCommand
+        order = max(e.order_index for e in sel) + 1
+        new_events = [self._clone_event(e, order_index=order + i)
+                      for i, e in enumerate(sel)]
+        self.cmd_bus.execute(BulkInsertEventsCommand(self._db, new_events))
+        self._mark_modified()
+        self._refresh_all()
+        self.grid.select_by_ids([e.id for e in new_events])
+        self.statusBar().showMessage(f"{len(new_events)}줄 복제됨", 4000)
+
+    def _on_join_lines(self) -> None:
+        """선택한 여러 줄을 한 줄로 — 시간은 전체 범위, 텍스트는 \\N 으로 연결."""
+        sel = self._selected_rows_sorted()
+        if len(sel) < 2:
+            self.statusBar().showMessage("합칠 줄을 2개 이상 선택하세요.", 4000)
+            return
+        from app.commands.edit_commands import (
+            CompositeCommand, DeleteEventCommand, UpdateEventCommand,
+        )
+        first = sel[0]
+        start = min(e.start_ms for e in sel)
+        end = max(e.end_ms for e in sel)
+        joined = "\\N".join(e.text for e in sel if e.text.strip())
+        cmds = [UpdateEventCommand(self._db, first.id,
+                                   {"start_ms": start, "end_ms": end, "text": joined})]
+        cmds += [DeleteEventCommand(self._db, e.id) for e in sel[1:]]
+        self.cmd_bus.execute(CompositeCommand(cmds, f"{len(sel)}줄 합치기"))
+        self._mark_modified()
+        self._refresh_all()
+        self.grid.select_by_id(first.id)
+
+    def _on_split_line(self) -> None:
+        """선택한 한 줄을 현재 재생 위치에서 둘로 나눔 (범위 밖이면 시간 중앙)."""
+        ids = self.grid.selected_event_ids()
+        if len(ids) != 1:
+            self.statusBar().showMessage("나눌 줄 하나만 선택하세요.", 4000)
+            return
+        ev = self._db.get_event(ids[0]) if self._db else None
+        if ev is None:
+            return
+        pos = self.video_player.get_position_ms()
+        if not (ev.start_ms < pos < ev.end_ms):
+            pos = (ev.start_ms + ev.end_ms) // 2
+        if pos <= ev.start_ms or pos >= ev.end_ms:
+            self.statusBar().showMessage("나눌 수 없는 길이입니다.", 4000)
+            return
+        from app.commands.edit_commands import (
+            BulkInsertEventsCommand, CompositeCommand, UpdateEventCommand,
+        )
+        second = self._clone_event(ev, start_ms=pos, end_ms=ev.end_ms,
+                                   order_index=ev.order_index + 1)
+        cmds = [
+            UpdateEventCommand(self._db, ev.id, {"end_ms": pos}),
+            BulkInsertEventsCommand(self._db, [second]),
+        ]
+        self.cmd_bus.execute(CompositeCommand(cmds, "줄 나누기"))
+        self._mark_modified()
+        self._refresh_all()
+        self.grid.select_by_id(ev.id)
+
+    def _on_find_replace(self) -> None:
+        if not self._db:
+            return
+        if getattr(self, "_find_dlg", None) is None:
+            from app.ui.find_replace_dialog import FindReplaceDialog
+            self._find_dlg = FindReplaceDialog(self)
+            self._find_dlg.find_next.connect(self._find_next)
+            self._find_dlg.replace_one.connect(self._replace_one)
+            self._find_dlg.replace_all.connect(self._replace_all)
+        # 검색 시작 텍스트 = 선택 줄의 텍스트 일부
+        self._find_dlg.show()
+        self._find_dlg.raise_()
+        self._find_dlg.activateWindow()
+
+    def _make_matcher(self, opts: dict):
+        """opts 로부터 (text)->match 함수와 치환 함수를 만든다."""
+        find = opts.get("find", "")
+        regex = opts.get("regex", False)
+        case = opts.get("case", False)
+        flags = 0 if case else re.IGNORECASE
+        if regex:
+            try:
+                pat = re.compile(find, flags)
+            except re.error as e:
+                raise ValueError(f"정규식 오류: {e}")
+        else:
+            pat = re.compile(re.escape(find), flags)
+        return pat
+
+    def _find_scope_ids(self, opts: dict) -> list[str]:
+        if not self._main_track_id:
+            return []
+        events = self._db.get_events(self._main_track_id)
+        if opts.get("selected_only"):
+            sel = set(self.grid.selected_event_ids())
+            events = [e for e in events if e.id in sel]
+        return [(e.id, e.text) for e in events]
+
+    def _find_next(self, opts: dict) -> None:
+        if not self._db or not self._main_track_id:
+            return
+        try:
+            pat = self._make_matcher(opts)
+        except ValueError as e:
+            self.statusBar().showMessage(str(e), 5000)
+            return
+        if not opts.get("find"):
+            return
+        scope = self._find_scope_ids(opts)
+        cur = self.grid.selected_event_ids()
+        cur_id = cur[-1] if cur else None
+        start = 0
+        if cur_id is not None:
+            for i, (eid, _t) in enumerate(scope):
+                if eid == cur_id:
+                    start = i + 1
+                    break
+        n = len(scope)
+        for k in range(n):
+            eid, text = scope[(start + k) % n]
+            if pat.search(text or ""):
+                self.grid.select_by_id(eid)
+                self.statusBar().showMessage("찾음", 2000)
+                return
+        self.statusBar().showMessage("일치하는 줄이 없습니다.", 3000)
+
+    def _replace_one(self, opts: dict) -> None:
+        if not self._db:
+            return
+        try:
+            pat = self._make_matcher(opts)
+        except ValueError as e:
+            self.statusBar().showMessage(str(e), 5000)
+            return
+        ids = self.grid.selected_event_ids()
+        repl = opts.get("replace", "")
+        if ids:
+            ev = self._db.get_event(ids[-1])
+            if ev and pat.search(ev.text or ""):
+                new_text = pat.sub(repl, ev.text or "")
+                from app.commands.edit_commands import UpdateEventCommand
+                self.cmd_bus.execute(UpdateEventCommand(self._db, ev.id, {"text": new_text}))
+                self._mark_modified()
+                self._refresh_all()
+                self.grid.select_by_id(ev.id)
+        self._find_next(opts)
+
+    def _replace_all(self, opts: dict) -> None:
+        if not self._db or not self._main_track_id:
+            return
+        try:
+            pat = self._make_matcher(opts)
+        except ValueError as e:
+            self.statusBar().showMessage(str(e), 5000)
+            return
+        if not opts.get("find"):
+            return
+        repl = opts.get("replace", "")
+        scope = self._find_scope_ids(opts)
+        from app.commands.edit_commands import CompositeCommand, UpdateEventCommand
+        cmds = []
+        count = 0
+        for eid, text in scope:
+            new_text, n = pat.subn(repl, text or "")
+            if n:
+                cmds.append(UpdateEventCommand(self._db, eid, {"text": new_text}))
+                count += n
+        if not cmds:
+            self.statusBar().showMessage("바꿀 내용이 없습니다.", 3000)
+            return
+        self.cmd_bus.execute(CompositeCommand(cmds, f"모두 바꾸기 ({len(cmds)}줄)"))
+        self._mark_modified()
+        self._refresh_all()
+        self.statusBar().showMessage(f"{count}곳 바꿈 ({len(cmds)}줄)", 5000)
+
+    def _on_select_lines(self) -> None:
+        if not self._db or not self._main_track_id:
+            return
+        from app.ui.select_lines_dialog import SelectLinesDialog
+        styles = sorted({e.style_id for e in self._db.get_events(self._main_track_id)})
+        dlg = SelectLinesDialog(styles, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        crit = dlg.criteria()
+        events = self._db.get_events(self._main_track_id)
+        matched = [e.id for e in events if self._line_matches(e, crit)]
+        mode = crit["mode"]
+        cur = set(self.grid.selected_event_ids())
+        if mode == "new":
+            result = matched
+        elif mode == "add":
+            result = list(cur | set(matched))
+        else:  # subtract
+            result = list(cur - set(matched))
+        self.grid.select_by_ids(result)
+        self.statusBar().showMessage(f"{len(matched)}줄 일치 — 선택 {len(result)}줄", 5000)
+
+    def _line_matches(self, e, crit: dict) -> bool:
+        import re as _re
+        if crit.get("text"):
+            txt = e.text or ""
+            if crit.get("regex"):
+                try:
+                    if not _re.search(crit["text"], txt,
+                                      0 if crit.get("case") else _re.IGNORECASE):
+                        return False
+                except _re.error:
+                    return False
+            else:
+                hay = txt if crit.get("case") else txt.lower()
+                needle = crit["text"] if crit.get("case") else crit["text"].lower()
+                if needle not in hay:
+                    return False
+        if crit.get("style") and e.style_id != crit["style"]:
+            return False
+        if crit.get("min_ms") is not None and e.start_ms < crit["min_ms"]:
+            return False
+        if crit.get("max_ms") is not None and e.end_ms > crit["max_ms"]:
+            return False
+        kind = crit.get("kind", "any")
+        if kind == "dialogue" and e.is_comment:
+            return False
+        if kind == "comment" and not e.is_comment:
+            return False
+        return True
 
     def _on_inspector_edit(self, event_id: str, changes: dict) -> None:
         """Handle field edits from the inspector panel."""
