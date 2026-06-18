@@ -30,6 +30,8 @@ from core.typeset import (
 
 _AN_RE = re.compile(r"\\an([1-9])")
 _TAG_RE = re.compile(r"\{[^}]*\}")
+_MOVE_RE = re.compile(r"\\move\s*\(")
+_ANIM_RE = re.compile(r"\\t\s*\(")
 
 
 def _plain(text: str) -> str:
@@ -175,6 +177,20 @@ class VideoEditDialog(QDialog):
         hint.setStyleSheet("color:#888;")
         root.addWidget(hint)
 
+        # 이 줄이 이미 모션/애니메이션 위치를 갖고 있으면 경고 — 드래그 적용이
+        # \move 를 고정 \pos 로 대체하므로 사용자가 모르게 데이터를 잃지 않도록.
+        self._has_move = bool(_MOVE_RE.search(self._orig_text))
+        if self._has_move or _ANIM_RE.search(self._orig_text):
+            kind = "\\move 모션" if self._has_move else "\\t 애니메이션"
+            warn = QLabel(
+                f"⚠ 이 줄은 {kind}을 사용합니다. 앵커를 드래그해 적용하면 "
+                "고정 위치(\\pos)로 대체되어 모션이 사라집니다. "
+                "위치를 바꾸지 않으려면 드래그하지 말고 적용하세요."
+            )
+            warn.setWordWrap(True)
+            warn.setStyleSheet("color:#E0B040;")
+            root.addWidget(warn)
+
         bb = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -184,8 +200,11 @@ class VideoEditDialog(QDialog):
         bb.rejected.connect(self.reject)
         root.addWidget(bb)
 
+        # 사용자가 실제로 앵커를 드래그했을 때만 \pos 를 쓴다 — 그냥 열어보고
+        # 적용해도 정렬/모션 기반 위치가 고정 좌표로 바뀌지 않도록.
         self._clear_pos = False
-        self._on_moved()
+        self._pos_dirty = False
+        self._update_label()
 
     # -- 좌표 변환 (이미지 픽셀 ↔ PlayRes) --
     def _vid_to_img(self, vx: float, vy: float) -> QPointF:
@@ -194,24 +213,33 @@ class VideoEditDialog(QDialog):
     def _img_to_vid(self, pt: QPointF) -> tuple[float, float]:
         return (pt.x() / self._img_w * self._rx, pt.y() / self._img_h * self._ry)
 
-    def _on_moved(self) -> None:
+    def _update_label(self) -> None:
         vx, vy = self._img_to_vid(self._anchor.pos())
         self._coord.setText(f"\\pos({vx:.0f}, {vy:.0f})")
+
+    def _on_moved(self) -> None:
+        self._pos_dirty = True   # 사용자가 실제로 드래그함
         self._clear_pos = False
+        self._update_label()
 
     def _on_clear_pos(self) -> None:
         self._clear_pos = True
+        self._pos_dirty = False
         self._coord.setText("\\pos 제거 (스타일 기본 위치)")
 
     def _on_accept(self) -> None:
         text = self._orig_text
+        # 위치는 명시적 의도가 있을 때만 건드린다: 드래그했거나(=_pos_dirty)
+        # '위치 지우기'를 눌렀을 때만. 안 그러면 \move/정렬 위치를 보존.
         if self._clear_pos:
             text = remove_tag(text, "pos")
-        else:
+            text = remove_tag(text, "move")
+        elif self._pos_dirty:
             vx, vy = self._img_to_vid(self._anchor.pos())
             text = set_position(text, round(vx), round(vy))
+        # 회전은 값을 바꿨을 때만 (애니메이션 \t(\frz) 보존).
         rot = self._rot.value()
-        if rot != 0 or get_rotation(self._orig_text) != 0:
+        if rot != get_rotation(self._orig_text):
             text = set_rotation(text, rot)
         if text != self._orig_text:
             self.result_command = UpdateEventCommand(
