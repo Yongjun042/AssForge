@@ -507,7 +507,7 @@ class MainWindow(QMainWindow):
         self._add_action(sm, "시간 이동...", "Ctrl+Shift+T", self._on_shift_times)
         sm.addSeparator()
         self._add_action(sm, "스타일 매니저...", "Ctrl+Shift+M", self._on_style_manager)
-        self._add_action(sm, "영상 위에서 위치 편집...", "Ctrl+Shift+P", self._on_video_edit)
+        self._add_action(sm, "영상 위에서 비주얼 편집...", "Ctrl+Shift+P", self._on_video_edit)
         self._add_action(sm, "타이프세팅 (위치/회전/클립)...", "", self._on_typeset)
         self._add_action(sm, "QA 검사...", "Ctrl+Shift+Q", self._on_qa)
 
