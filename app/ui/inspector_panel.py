@@ -51,6 +51,7 @@ class InspectorPanel(QWidget):
     lock_state_changed = Signal(str, str)
     accept_suggestion = Signal(str)
     reject_suggestion = Signal(str)
+    set_time_to_current = Signal(str)  # "start" | "end" — 현재 재생 위치로 설정
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -135,14 +136,26 @@ class InspectorPanel(QWidget):
         tl = QHBoxLayout(tg)
         tl.addWidget(QLabel("시작:"))
         self._start = QLineEdit()
-        self._start.setMaximumWidth(110)
+        self._start.setMaximumWidth(96)
         self._start.editingFinished.connect(self._on_time)
         tl.addWidget(self._start)
+        btn_start_now = QPushButton("⏱")
+        btn_start_now.setFixedWidth(26)
+        btn_start_now.setToolTip("시작을 현재 재생 위치로 (F3)")
+        btn_start_now.clicked.connect(lambda: self.set_time_to_current.emit("start"))
+        tl.addWidget(btn_start_now)
+
         tl.addWidget(QLabel("종료:"))
         self._end = QLineEdit()
-        self._end.setMaximumWidth(110)
+        self._end.setMaximumWidth(96)
         self._end.editingFinished.connect(self._on_time)
         tl.addWidget(self._end)
+        btn_end_now = QPushButton("⏱")
+        btn_end_now.setFixedWidth(26)
+        btn_end_now.setToolTip("종료를 현재 재생 위치로")
+        btn_end_now.clicked.connect(lambda: self.set_time_to_current.emit("end"))
+        tl.addWidget(btn_end_now)
+
         tl.addWidget(QLabel("길이:"))
         self._dur = QLabel("—")
         tl.addWidget(self._dur)

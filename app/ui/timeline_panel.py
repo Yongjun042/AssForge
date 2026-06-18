@@ -7,7 +7,7 @@ from typing import Optional, Sequence
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
-    QBrush, QColor, QPainter, QPainterPath, QPen,
+    QBrush, QColor, QPainter, QPainterPath, QPen, QPolygonF,
     QWheelEvent, QMouseEvent, QPaintEvent, QResizeEvent, QFont,
 )
 from PySide6.QtWidgets import QWidget, QScrollBar, QVBoxLayout
@@ -19,12 +19,16 @@ class TimelinePanel(QWidget):
     """Waveform timeline with subtitle event blocks.
 
     Signals:
-        position_clicked(int): seek to ms
+        position_clicked(int): seek to ms (click/scrub on ruler+waveform)
         event_time_changed(str, str, int): (event_id, "start"/"end", new_ms)
+        event_moved(str, int, int): (event_id, new_start_ms, new_end_ms) — block move
+        region_selected(int, int): (start_ms, end_ms) — shift-drag region
     """
 
     position_clicked = Signal(int)
     event_time_changed = Signal(str, str, int)
+    event_moved = Signal(str, int, int)
+    region_selected = Signal(int, int)
 
     _RULER_H = 22
     _WAVE_H = 60
@@ -49,10 +53,14 @@ class TimelinePanel(QWidget):
         self._pps: float = 50.0  # pixels per second
         self._scroll_off: float = 0.0
 
-        self._drag: tuple[str, str] | None = None  # (event_id, "start"/"end")
+        # 드래그 상태머신: mode ∈ {None,"start","end","move","scrub","region"}
+        self._drag_mode: str | None = None
+        self._drag_eid: str | None = None
         self._drag_start_x = 0.0
-        self._drag_orig_ms = 0
-        self._drag_last_ms: int | None = None  # latest dragged value (None until moved)
+        self._drag_orig_start = 0      # move: 원래 start_ms
+        self._drag_orig_end = 0        # move/edge: 원래 값
+        self._drag_committed = False   # 실제로 움직였는지 (클릭 vs 드래그 구분)
+        self._region: tuple[int, int] | None = None  # 선택 구간 (start_ms, end_ms)
 
         self._hbar = QScrollBar(Qt.Orientation.Horizontal, self)
         self._hbar.valueChanged.connect(self._on_scroll)
@@ -92,12 +100,38 @@ class TimelinePanel(QWidget):
         self._keyframes = keyframes
         self.update()
 
+    def set_region(self, region: tuple[int, int] | None) -> None:
+        self._region = region
+        self.update()
+
     # -- Coordinates --
     def _ms_to_x(self, ms: int) -> float:
         return ms / 1000.0 * self._pps - self._scroll_off
 
     def _x_to_ms(self, x: float) -> int:
-        return max(0, int((x + self._scroll_off) / self._pps * 1000))
+        # round (not floor) so a click maps to the nearest ms — floor biased
+        # the playhead ~1px left of the cursor.
+        return max(0, int(round((x + self._scroll_off) / self._pps * 1000.0)))
+
+    def _block_top(self) -> int:
+        return self._RULER_H + self._WAVE_H + self._BLOCK_Y_OFFSET
+
+    def _hit_test(self, x: float, y: float) -> tuple[Optional[EventRow], str]:
+        """(event, zone) — zone ∈ {"start","end","body",""}. 빈 곳이면 (None,"")."""
+        bt = self._block_top()
+        if not (bt <= y <= bt + self._BLOCK_H):
+            return None, ""
+        # 위에 그려지는(=나중 순서) 블록이 우선하도록 역순 검사
+        for er in reversed(self._events):
+            x1 = self._ms_to_x(er.start_ms)
+            x2 = self._ms_to_x(er.end_ms)
+            if abs(x - x1) <= self._EDGE_GRAB:
+                return er, "start"
+            if abs(x - x2) <= self._EDGE_GRAB:
+                return er, "end"
+            if x1 <= x <= x2:
+                return er, "body"
+        return None, ""
 
     def _total_w(self) -> float:
         return self._duration_ms / 1000.0 * self._pps
@@ -170,11 +204,30 @@ class TimelinePanel(QWidget):
                 p.drawText(rect.adjusted(3, 1, -3, -1),
                           Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, txt)
 
-        # Position line
+        # Selection region (shift-drag) — translucent band across full height
+        if self._region is not None:
+            rs, re_ = sorted(self._region)
+            rx1 = self._ms_to_x(rs)
+            rx2 = self._ms_to_x(re_)
+            if rx2 >= 0 and rx1 <= w:
+                rx1c = max(0.0, rx1)
+                rx2c = min(float(w), rx2)
+                p.fillRect(QRectF(rx1c, 0, max(1.0, rx2c - rx1c), h),
+                           QColor(90, 160, 255, 45))
+                p.setPen(QPen(QColor(120, 190, 255, 200), 1))
+                p.drawLine(QPointF(rx1, 0), QPointF(rx1, h))
+                p.drawLine(QPointF(rx2, 0), QPointF(rx2, h))
+
+        # Position line (red playhead) — with a grab handle on the ruler
         px = self._ms_to_x(self._position_ms)
         if 0 <= px <= w:
             p.setPen(QPen(QColor("#FF3333"), 2))
             p.drawLine(QPointF(px, 0), QPointF(px, h))
+            p.setBrush(QBrush(QColor("#FF3333")))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawPolygon(QPolygonF([
+                QPointF(px - 5, 0), QPointF(px + 5, 0), QPointF(px, 7),
+            ]))
 
         p.end()
 
@@ -259,68 +312,111 @@ class TimelinePanel(QWidget):
             return
         x = ev.position().x()
         y = ev.position().y()
-        block_top = self._RULER_H + self._WAVE_H + self._BLOCK_Y_OFFSET
+        self._drag_start_x = x
+        self._drag_committed = False
 
-        for er in self._events:
-            x1 = self._ms_to_x(er.start_ms)
-            x2 = self._ms_to_x(er.end_ms)
-            if block_top <= y <= block_top + self._BLOCK_H:
-                if abs(x - x1) <= self._EDGE_GRAB:
-                    self._drag = (er.id, "start")
-                    self._drag_start_x = x
-                    self._drag_orig_ms = er.start_ms
-                    self._drag_last_ms = None
-                    return
-                if abs(x - x2) <= self._EDGE_GRAB:
-                    self._drag = (er.id, "end")
-                    self._drag_start_x = x
-                    self._drag_orig_ms = er.end_ms
-                    self._drag_last_ms = None
-                    return
+        # Shift+drag anywhere → region selection (over waveform/ruler/blocks)
+        if ev.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self._drag_mode = "region"
+            ms = self._x_to_ms(x)
+            self._region = (ms, ms)
+            self.update()
+            return
 
-        self.position_clicked.emit(self._x_to_ms(x))
+        er, zone = self._hit_test(x, y)
+        if er is not None and zone in ("start", "end"):
+            self._drag_mode = zone
+            self._drag_eid = er.id
+            self._drag_orig_start = er.start_ms
+            self._drag_orig_end = er.end_ms
+            return
+        if er is not None and zone == "body":
+            self._drag_mode = "move"
+            self._drag_eid = er.id
+            self._drag_orig_start = er.start_ms
+            self._drag_orig_end = er.end_ms
+            return
+
+        # Empty area (ruler/waveform) → scrub: seek now and keep seeking on drag
+        self._drag_mode = "scrub"
+        ms = self._x_to_ms(x)
+        self._position_ms = ms          # 즉시 반영 — 영상 응답을 기다리지 않음
+        self.update()
+        self.position_clicked.emit(ms)
 
     def mouseMoveEvent(self, ev: QMouseEvent) -> None:
-        if self._drag:
-            dx = ev.position().x() - self._drag_start_x
-            delta_ms = int(dx / self._pps * 1000)
-            new_ms = max(0, self._drag_orig_ms + delta_ms)
-            eid, edge = self._drag
-            self._drag_last_ms = new_ms
-            # Update our own copy live so the block follows the cursor and the
-            # timeline never shows a stale position. The single authoritative
-            # commit happens on release (avoids flooding undo with one command
-            # per mouse-move).
-            for er in self._events:
-                if er.id == eid:
-                    if edge == "start":
-                        er.start_ms = new_ms
-                    else:
-                        er.end_ms = new_ms
-                    break
+        x = ev.position().x()
+        y = ev.position().y()
+        mode = self._drag_mode
+
+        if mode is None:
+            # hover cursor 힌트
+            _er, zone = self._hit_test(x, y)
+            if zone in ("start", "end"):
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            elif zone == "body":
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            return
+
+        if abs(x - self._drag_start_x) > 2:
+            self._drag_committed = True
+        delta_ms = int(round((x - self._drag_start_x) / self._pps * 1000.0))
+
+        if mode == "scrub":
+            ms = self._x_to_ms(x)
+            self._position_ms = ms
             self.update()
-        else:
-            x = ev.position().x()
-            y = ev.position().y()
-            block_top = self._RULER_H + self._WAVE_H + self._BLOCK_Y_OFFSET
-            on_edge = False
-            for er in self._events:
-                x1 = self._ms_to_x(er.start_ms)
-                x2 = self._ms_to_x(er.end_ms)
-                if block_top <= y <= block_top + self._BLOCK_H:
-                    if abs(x - x1) <= self._EDGE_GRAB or abs(x - x2) <= self._EDGE_GRAB:
-                        on_edge = True
-                        break
-            self.setCursor(Qt.CursorShape.SizeHorCursor if on_edge else Qt.CursorShape.ArrowCursor)
+            self.position_clicked.emit(ms)
+            return
+
+        if mode == "region":
+            self._region = (self._x_to_ms(self._drag_start_x), self._x_to_ms(x))
+            self.update()
+            return
+
+        # 블록 편집 — 로컬 사본을 즉시 갱신(라이브 미리보기), commit 은 release 에서
+        for er in self._events:
+            if er.id != self._drag_eid:
+                continue
+            if mode == "start":
+                er.start_ms = max(0, min(self._drag_orig_start + delta_ms, er.end_ms))
+            elif mode == "end":
+                er.end_ms = max(er.start_ms, self._drag_orig_end + delta_ms)
+            elif mode == "move":
+                dur = self._drag_orig_end - self._drag_orig_start
+                new_start = max(0, self._drag_orig_start + delta_ms)
+                er.start_ms = new_start
+                er.end_ms = new_start + dur
+            break
+        self.update()
 
     def mouseReleaseEvent(self, ev: QMouseEvent) -> None:
-        # Commit the drag once, with the final value, so it becomes a single
-        # undoable edit (and the DB/grid sync from the authoritative value).
-        if self._drag is not None and self._drag_last_ms is not None:
-            eid, edge = self._drag
-            self.event_time_changed.emit(eid, edge, self._drag_last_ms)
-        self._drag = None
-        self._drag_last_ms = None
+        mode = self._drag_mode
+        eid = self._drag_eid
+        self._drag_mode = None
+        self._drag_eid = None
+
+        if mode == "region":
+            if self._region is not None:
+                a, b = sorted(self._region)
+                if b - a >= 20:  # 너무 짧은 드래그는 무시
+                    self.region_selected.emit(a, b)
+            return
+
+        if not self._drag_committed:
+            return  # 클릭만 — scrub 은 이미 seek 함, 블록은 변경 없음
+
+        cur = next((er for er in self._events if er.id == eid), None)
+        if cur is None:
+            return
+        if mode in ("start", "end"):
+            self.event_time_changed.emit(
+                eid, mode, cur.start_ms if mode == "start" else cur.end_ms
+            )
+        elif mode == "move":
+            self.event_moved.emit(eid, cur.start_ms, cur.end_ms)
 
     def wheelEvent(self, ev: QWheelEvent) -> None:
         delta = ev.angleDelta().y()

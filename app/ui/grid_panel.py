@@ -171,6 +171,22 @@ class GridPanel(QWidget):
                 self._table.scrollTo(idx)
                 return
 
+    def select_by_ids(self, event_ids: list[str]) -> None:
+        """Select multiple rows by event ID (clears prior selection)."""
+        want = set(event_ids)
+        sm = self._table.selectionModel()
+        sm.clearSelection()
+        flag = (sm.SelectionFlag.Select | sm.SelectionFlag.Rows)
+        first_idx = None
+        for i, ev in enumerate(self._model._events):
+            if ev.id in want:
+                idx = self._model.index(i, 0)
+                sm.select(idx, flag)
+                if first_idx is None:
+                    first_idx = idx
+        if first_idx is not None:
+            self._table.scrollTo(first_idx)
+
     def selected_event_ids(self) -> list[str]:
         indices = self._table.selectionModel().selectedRows()
         ids = []

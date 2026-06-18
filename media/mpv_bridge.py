@@ -334,7 +334,9 @@ class MpvPlayer(QWidget):
         if not self._mpv:
             return
         try:
-            self._mpv.seek(ms / 1000.0, reference="absolute")
+            # precision="exact": 키프레임으로 스냅하지 않고 정확한 위치로 — 파형
+            # 클릭/스크럽이 커서 위치와 어긋나지 않게 한다.
+            self._mpv.seek(ms / 1000.0, reference="absolute", precision="exact")
         except Exception:
             # No file loaded / not seekable yet — mpv raises MPV_ERROR_COMMAND.
             return

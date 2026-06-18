@@ -550,6 +550,8 @@ class MainWindow(QMainWindow):
 
         self.timeline.position_clicked.connect(self.video_player.seek)
         self.timeline.event_time_changed.connect(self._on_timeline_drag)
+        self.timeline.event_moved.connect(self._on_timeline_move)
+        self.timeline.region_selected.connect(self._on_timeline_region)
 
         self.grid.selection_changed.connect(self._on_grid_selection)
         self.grid.line_activated.connect(self._on_grid_activated)
@@ -561,6 +563,7 @@ class MainWindow(QMainWindow):
         self.inspector.lock_state_changed.connect(self._on_lock_state_changed)
         self.inspector.accept_suggestion.connect(self._on_accept_one)
         self.inspector.reject_suggestion.connect(self._on_reject_one)
+        self.inspector.set_time_to_current.connect(self._on_set_time_to_current)
 
     # ============================================================
     # Project lifecycle
@@ -1258,13 +1261,60 @@ class MainWindow(QMainWindow):
         from app.commands.edit_commands import UpdateEventCommand
         field = "start_ms" if edge == "start" else "end_ms"
         self.cmd_bus.execute(UpdateEventCommand(self._db, event_id, {field: new_ms}))
+        self._after_timeline_edit(event_id)
+
+    def _on_timeline_move(self, event_id: str, new_start_ms: int, new_end_ms: int) -> None:
+        """블록 통째 이동 — start/end 를 한 커맨드(=단일 undo)로 갱신."""
+        if not self._db:
+            return
+        from app.commands.edit_commands import UpdateEventCommand
+        self.cmd_bus.execute(UpdateEventCommand(
+            self._db, event_id, {"start_ms": new_start_ms, "end_ms": new_end_ms},
+        ))
+        self._after_timeline_edit(event_id)
+
+    def _after_timeline_edit(self, event_id: str) -> None:
         self._mark_modified()
         ev = self._db.get_event(event_id)
         if ev:
             self.grid.update_event(ev)
-            # Keep the inspector in sync if it's showing the dragged event.
             if event_id in self.grid.selected_event_ids():
                 self.inspector.load_event(ev)
+
+    def _on_timeline_region(self, start_ms: int, end_ms: int) -> None:
+        """파형에서 Shift+드래그한 구간과 겹치는 이벤트들을 선택한다.
+
+        이후 'AI > 선택 영역 재정렬'(Ctrl+Alt+A) 로 그 줄들만 동기화할 수 있다.
+        """
+        if not self._db or not self._main_track_id:
+            return
+        events = self._db.get_events(self._main_track_id)
+        ids = [
+            e.id for e in events
+            if e.start_ms < end_ms and e.end_ms > start_ms  # 구간과 겹침
+        ]
+        self.timeline.set_region((start_ms, end_ms))
+        if not ids:
+            self.statusBar().showMessage("선택한 구간에 자막 줄이 없습니다.", 4000)
+            return
+        self.grid.select_by_ids(ids)
+        self.statusBar().showMessage(
+            f"{len(ids)}줄 선택됨 — Ctrl+Alt+A 로 이 구간만 AI 재정렬", 6000,
+        )
+
+    def _on_set_time_to_current(self, edge: str) -> None:
+        """인스펙터 버튼 — 선택한 줄의 start/end 를 현재 재생 위치로 설정."""
+        if not self._db:
+            return
+        ids = self.grid.selected_event_ids()
+        if not ids:
+            return
+        pos = self.video_player.get_position_ms()
+        field = "start_ms" if edge == "start" else "end_ms"
+        from app.commands.edit_commands import UpdateEventCommand
+        self.cmd_bus.execute(UpdateEventCommand(self._db, ids[0], {field: pos}))
+        self._after_timeline_edit(ids[0])
+        self._refresh_timeline_events()
 
     # ============================================================
     # Grid/Inspector interaction
