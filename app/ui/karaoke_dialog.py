@@ -21,11 +21,27 @@ from core.karaoke.toolkit import (
     split_syllables, total_duration_cs,
 )
 
-_TAG_RE = __import__("re").compile(r"\{[^}]*\}")
+import re
+
+_TAG_RE = re.compile(r"\{[^}]*\}")
+_LEAD_RE = re.compile(r"^\s*\{([^}]*)\}")
+_K_IN_TAG = re.compile(r"\\k[fo]?\d*|\\K\d*")
 
 
 def _plain(text: str) -> str:
     return _TAG_RE.sub("", text).replace("\\N", " ").replace("\\n", " ")
+
+
+def _extract_lead(text: str) -> tuple[str, bool]:
+    """선두 오버라이드 블록에서 \\k 계열을 뺀 나머지 태그와, 중간(선두 외)에
+    의미있는 태그가 더 있는지 여부를 반환."""
+    m = _LEAD_RE.match(text)
+    lead = _K_IN_TAG.sub("", m.group(1)) if m else ""
+    rest = text[m.end():] if m else text
+    # 중간 블록 중 \k 만 있는 게 아니면 보존되지 않음 → 경고용 플래그
+    has_mid = any(_K_IN_TAG.sub("", b.strip("{}")).strip()
+                  for b in _TAG_RE.findall(rest))
+    return lead, has_mid
 
 
 class KaraokeDialog(QDialog):
@@ -39,6 +55,10 @@ class KaraokeDialog(QDialog):
         self._dur_ms = max(0, end_ms - start_ms)
         self._player = video_player
         self._result: str | None = None
+
+        # 선두 오버라이드 태그(\pos/색상/굵기 등)는 보존한다 — 카라오케 렌더가
+        # \k 만 내보내서 원본 태그를 잃지 않도록.
+        self._lead, has_mid = _extract_lead(text)
 
         # 기존 카라오케가 있으면 읽고, 없으면 평문을 음절로 분리
         existing = parse_karaoke(text)
@@ -58,6 +78,12 @@ class KaraokeDialog(QDialog):
             f"줄 길이 {self._dur_ms} ms · 음절 {len(self._sylls)}개. "
             "표에서 직접 입력하거나, 아래 '재생하며 탭'으로 들으며 타이밍하세요."
         ))
+        if has_mid:
+            warn = QLabel("⚠ 줄 중간의 오버라이드 태그는 카라오케 적용 시 보존되지 "
+                          "않습니다 (선두 태그만 유지).")
+            warn.setWordWrap(True)
+            warn.setStyleSheet("color:#E0B040;")
+            root.addWidget(warn)
 
         self._table = QTableWidget(len(self._sylls), 2)
         self._table.setHorizontalHeaderLabels(["음절", "길이(cs)"])
@@ -196,9 +222,15 @@ class KaraokeDialog(QDialog):
             return
         super().keyPressEvent(ev)
 
+    def _render(self) -> str:
+        """카라오케 텍스트 — 선두 오버라이드 태그를 첫 \\k 블록에 합쳐 보존."""
+        rendered = render_karaoke(self._sylls, self._kind.currentData())
+        if self._lead and rendered.startswith("{"):
+            rendered = "{" + self._lead + rendered[1:]
+        return rendered
+
     def _update_preview(self) -> None:
-        kind = self._kind.currentData()
-        rendered = render_karaoke(self._sylls, kind)
+        rendered = self._render()
         self._preview.setText(rendered)
         tot = total_duration_cs(self._sylls) * 10
         self._total_lbl.setText(
@@ -207,7 +239,7 @@ class KaraokeDialog(QDialog):
         )
 
     def _on_accept(self) -> None:
-        self._result = render_karaoke(self._sylls, self._kind.currentData())
+        self._result = self._render()
         self.accept()
 
     def result_text(self) -> str | None:

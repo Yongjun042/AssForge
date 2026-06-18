@@ -45,6 +45,25 @@ log = logging.getLogger(__name__)
 
 _VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".flv", ".ts", ".m2ts", ".mts"}
 
+# 찾기/바꾸기는 보이는 텍스트에만 적용해야 한다 — {…} 오버라이드 블록과
+# \N/\n/\h 이스케이프는 보호(그 안을 치환하면 태그가 깨진다).
+_PROTECT_RE = re.compile(r"(\{[^}]*\}|\\[Nnh])")
+
+
+def _sub_text_only(pat, repl, text):
+    """{…} 블록과 줄바꿈 이스케이프 바깥의 텍스트에만 pat.sub. (new_text, count)."""
+    parts = _PROTECT_RE.split(text)
+    total = 0
+    for i in range(0, len(parts), 2):  # 짝수 인덱스 = 보호 토큰 바깥
+        parts[i], n = pat.subn(repl, parts[i])
+        total += n
+    return "".join(parts), total
+
+
+def _search_text_only(pat, text) -> bool:
+    parts = _PROTECT_RE.split(text)
+    return any(pat.search(parts[i]) for i in range(0, len(parts), 2))
+
 
 class _AiSyncWorker(QObject):
     """백그라운드 AI 동기화 워커.
@@ -1415,7 +1434,7 @@ class MainWindow(QMainWindow):
         n = len(scope)
         for k in range(n):
             eid, text = scope[(start + k) % n]
-            if pat.search(text or ""):
+            if _search_text_only(pat, text or ""):
                 self.grid.select_by_id(eid)
                 self.statusBar().showMessage("찾음", 2000)
                 return
@@ -1433,8 +1452,8 @@ class MainWindow(QMainWindow):
         repl = opts.get("replace", "")
         if ids:
             ev = self._db.get_event(ids[-1])
-            if ev and pat.search(ev.text or ""):
-                new_text = pat.sub(repl, ev.text or "")
+            if ev and _search_text_only(pat, ev.text or ""):
+                new_text, _ = _sub_text_only(pat, repl, ev.text or "")
                 from app.commands.edit_commands import UpdateEventCommand
                 self.cmd_bus.execute(UpdateEventCommand(self._db, ev.id, {"text": new_text}))
                 self._mark_modified()
@@ -1458,7 +1477,7 @@ class MainWindow(QMainWindow):
         cmds = []
         count = 0
         for eid, text in scope:
-            new_text, n = pat.subn(repl, text or "")
+            new_text, n = _sub_text_only(pat, repl, text or "")
             if n:
                 cmds.append(UpdateEventCommand(self._db, eid, {"text": new_text}))
                 count += n
