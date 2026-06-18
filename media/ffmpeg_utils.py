@@ -182,6 +182,25 @@ def extract_audio(video_path: str, output_path: str,
         return False
 
 
+def extract_frame(video_path: str, time_ms: int, output_path: str) -> bool:
+    """video_path 의 time_ms 위치 프레임 1장을 저장 (비주얼 편집 배경용)."""
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        return False
+    try:
+        r = _run([
+            ffmpeg, "-y",
+            "-ss", f"{max(0, time_ms) / 1000.0:.3f}",
+            "-i", str(video_path),
+            "-frames:v", "1", "-q:v", "2",
+            str(output_path),
+        ], timeout=60)
+        return r.returncode == 0 and os.path.exists(output_path)
+    except Exception:
+        log.exception("Frame extraction failed")
+        return False
+
+
 def extract_keyframes(video_path: str, proc_sink=None) -> list[int]:
     """Extract keyframe timestamps in milliseconds.
 

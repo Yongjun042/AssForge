@@ -487,6 +487,7 @@ class MainWindow(QMainWindow):
         self._add_action(sm, "시간 이동...", "Ctrl+Shift+T", self._on_shift_times)
         sm.addSeparator()
         self._add_action(sm, "스타일 매니저...", "Ctrl+Shift+M", self._on_style_manager)
+        self._add_action(sm, "영상 위에서 위치 편집...", "Ctrl+Shift+P", self._on_video_edit)
         self._add_action(sm, "타이프세팅 (위치/회전/클립)...", "", self._on_typeset)
         self._add_action(sm, "QA 검사...", "Ctrl+Shift+Q", self._on_qa)
 
@@ -1696,6 +1697,43 @@ class MainWindow(QMainWindow):
         self.cmd_bus.execute(CompositeCommand(cmds, "스타일 편집"))
         self._mark_modified()
         self._refresh_all()
+
+    def _on_video_edit(self) -> None:
+        """현재 프레임 스냅샷 위에서 선택 줄의 \\pos 를 드래그로 편집."""
+        if not self._db:
+            return
+        ids = self.grid.selected_event_ids()
+        if not ids:
+            QMessageBox.information(self, "위치 편집", "편집할 자막 줄을 먼저 선택하세요.")
+            return
+
+        # 현재 프레임 캡처: mpv 스크린샷 우선, 실패 시 ffmpeg.
+        frame_path = None
+        if self._video_path:
+            cache = os.path.join(tempfile.gettempdir(), "assforge_cache")
+            os.makedirs(cache, exist_ok=True)
+            frame = os.path.join(cache, "_edit_frame.png")
+            ok = self.video_player.screenshot_to_file(frame)
+            if not ok or not os.path.exists(frame):
+                from media.ffmpeg_utils import extract_frame
+                ok = extract_frame(
+                    self._video_path, self.video_player.get_position_ms(), frame,
+                )
+            if ok and os.path.exists(frame):
+                frame_path = frame
+        if frame_path is None:
+            QMessageBox.information(
+                self, "위치 편집",
+                "영상 프레임을 가져오지 못했습니다. 영상을 먼저 열고 재생 위치를 맞춰주세요.",
+            )
+            return
+
+        from app.ui.video_edit_dialog import VideoEditDialog
+        dlg = VideoEditDialog(self._db, ids[0], frame_path, self._play_res(), self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_command is not None:
+            self.cmd_bus.execute(dlg.result_command)
+            self._after_timeline_edit(ids[0])
+            self._refresh_timeline_events()
 
     def _on_typeset(self) -> None:
         if not self._db:

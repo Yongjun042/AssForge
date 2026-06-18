@@ -292,6 +292,16 @@ class MpvPlayer(QWidget):
         if self._duration_ms <= 0 and self._post_load_attempts < 30:
             QTimer.singleShot(100, self._poll_until_duration)
 
+    def screenshot_to_file(self, path: str) -> bool:
+        """현재 프레임을 자막/OSD 없이 파일로 저장 (비주얼 편집 배경용)."""
+        if self._mpv is None:
+            return False
+        try:
+            self._mpv.command("screenshot-to-file", str(path), "video")
+            return True
+        except Exception:
+            return False
+
     def stop(self) -> None:
         """Unload the current video and reset transport UI to zero."""
         self._poll.stop()
