@@ -76,6 +76,7 @@ class MpvPlayer(QWidget):
         self._duration_ms = 0
         self._position_ms = 0
         self._seeking = False
+        self._play_until_ms: int | None = None  # 구간 재생 시 멈출 지점
 
         self._build_ui()
 
@@ -259,6 +260,14 @@ class MpvPlayer(QWidget):
         if pos is not None:
             self._position_ms = round(pos * 1000)
             self.position_changed.emit(self._position_ms)
+            # 구간 재생: 끝 지점에 닿으면 일시정지
+            if (self._play_until_ms is not None
+                    and self._position_ms >= self._play_until_ms):
+                self._play_until_ms = None
+                try:
+                    self._mpv.pause = True
+                except Exception:
+                    pass
 
         if not self._seeking:
             dur = max(self._duration_ms, 1)
@@ -348,6 +357,7 @@ class MpvPlayer(QWidget):
     def seek(self, ms: int) -> None:
         if not self._mpv:
             return
+        self._play_until_ms = None  # 수동 시킹은 구간 재생을 취소
         try:
             # precision="exact": 키프레임으로 스냅하지 않고 정확한 위치로 — 파형
             # 클릭/스크럽이 커서 위치와 어긋나지 않게 한다.
@@ -357,6 +367,23 @@ class MpvPlayer(QWidget):
             return
         # Poll immediately to update UI
         QTimer.singleShot(50, self._poll_position)
+
+    def play_range(self, start_ms: int, end_ms: int) -> None:
+        """start_ms 로 시킹 후 end_ms 까지 재생하고 멈춘다 (줄 타이밍 청취용)."""
+        if not self._mpv:
+            return
+        self.seek(int(start_ms))                 # seek 이 _play_until_ms 를 비우므로
+        self._play_until_ms = max(int(start_ms), int(end_ms))  # 그 다음에 설정
+        try:
+            self._mpv.pause = False
+        except Exception:
+            return
+        if not self._poll.isActive():
+            self._poll.start()
+
+    def play_around(self, ms: int, pre_ms: int = 600, post_ms: int = 500) -> None:
+        """ms 경계 주변(앞 pre, 뒤 post)을 재생 — 싱크 확인용."""
+        self.play_range(max(0, int(ms) - pre_ms), int(ms) + post_ms)
 
     def frame_step(self) -> None:
         if not self._mpv:

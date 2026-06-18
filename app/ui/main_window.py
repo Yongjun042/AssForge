@@ -518,6 +518,12 @@ class MainWindow(QMainWindow):
         tm.addSeparator()
         self._add_action(tm, "시작점 마킹", "F3", self._mark_start)
         self._add_action(tm, "종료점 마킹 + 다음줄", "F4", self._mark_end_and_next)
+        tm.addSeparator()
+        self._add_action(tm, "선택 줄 재생", "F5", self._on_play_line)
+        self._add_action(tm, "시작 주변 재생", "F6", self._on_play_around_start)
+        self._add_action(tm, "종료 주변 재생", "F7", self._on_play_around_end)
+        tm.addSeparator()
+        self._add_action(tm, "가라오케 타이밍...", "Ctrl+K", self._on_karaoke_timing)
 
         # AI
         am = mb.addMenu("AI(&I)")
@@ -1514,6 +1520,42 @@ class MainWindow(QMainWindow):
         if kind == "comment" and not e.is_comment:
             return False
         return True
+
+    # -- 오디오 타이밍 / 가라오케 --
+    def _selected_one(self):
+        ids = self.grid.selected_event_ids()
+        if not ids or not self._db:
+            return None
+        return self._db.get_event(ids[-1])
+
+    def _on_play_line(self) -> None:
+        ev = self._selected_one()
+        if ev is not None:
+            self.video_player.play_range(ev.start_ms, ev.end_ms)
+
+    def _on_play_around_start(self) -> None:
+        ev = self._selected_one()
+        if ev is not None:
+            self.video_player.play_around(ev.start_ms)
+
+    def _on_play_around_end(self) -> None:
+        ev = self._selected_one()
+        if ev is not None:
+            self.video_player.play_around(ev.end_ms)
+
+    def _on_karaoke_timing(self) -> None:
+        ev = self._selected_one()
+        if ev is None:
+            self.statusBar().showMessage("가라오케 타이밍할 줄을 선택하세요.", 4000)
+            return
+        from app.ui.karaoke_dialog import KaraokeDialog
+        dlg = KaraokeDialog(ev.text, ev.start_ms, ev.end_ms, self.video_player, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_text = dlg.result_text()
+            if new_text is not None and new_text != ev.text:
+                from app.commands.edit_commands import UpdateEventCommand
+                self.cmd_bus.execute(UpdateEventCommand(self._db, ev.id, {"text": new_text}))
+                self._after_timeline_edit(ev.id)
 
     def _on_inspector_edit(self, event_id: str, changes: dict) -> None:
         """Handle field edits from the inspector panel."""
