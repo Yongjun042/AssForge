@@ -490,9 +490,16 @@ class MainWindow(QMainWindow):
         # index 1 — 편집기
         main_splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # Top: video player
+        # Top: 영상 영역 — mpv 재생기(0)와 인라인 비주얼 편집 패널(1)을 스택으로.
+        from app.ui.video_edit_dialog import VideoEditPanel
+        self._video_stack = QStackedWidget()
         self.video_player = MpvPlayer()
-        main_splitter.addWidget(self.video_player)
+        self._video_stack.addWidget(self.video_player)          # index 0
+        self._edit_panel = VideoEditPanel()
+        self._edit_panel.committed.connect(self._on_visual_edit_committed)
+        self._edit_panel.closed.connect(self._exit_visual_edit)
+        self._video_stack.addWidget(self._edit_panel)           # index 1
+        main_splitter.addWidget(self._video_stack)
 
         # Middle: timeline with waveform
         self.timeline = TimelinePanel()
@@ -815,6 +822,7 @@ class MainWindow(QMainWindow):
     def _on_new(self) -> None:
         if not self._confirm_discard():
             return
+        self._exit_visual_edit()  # 편집 모드 중이면 빠져나온다
         if self._db:
             self._db.close()
         self._video_path = None
@@ -2142,12 +2150,22 @@ class MainWindow(QMainWindow):
             )
             return
 
-        from app.ui.video_edit_dialog import VideoEditDialog
-        dlg = VideoEditDialog(self._db, ids[0], frame_path, self._play_res(), self)
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_command is not None:
-            self.cmd_bus.execute(dlg.result_command)
-            self._after_timeline_edit(ids[0])
-            self._refresh_timeline_events()
+        # 새 창 대신 영상 영역을 편집 패널로 전환 (인라인).
+        self._edit_panel.load(self._db, ids[0], frame_path, self._play_res())
+        self._video_stack.setCurrentWidget(self._edit_panel)
+        self.statusBar().showMessage(
+            "비주얼 편집 모드 — 드래그로 위치/회전/배율/색/클립, '적용' 또는 '닫기'", 0)
+
+    def _on_visual_edit_committed(self, command) -> None:
+        eid = self._edit_panel._event_id
+        self.cmd_bus.execute(command)
+        self._after_timeline_edit(eid)
+        self._refresh_timeline_events()
+        self._exit_visual_edit()
+
+    def _exit_visual_edit(self) -> None:
+        self._video_stack.setCurrentWidget(self.video_player)
+        self.statusBar().clearMessage()
 
     def _on_typeset(self) -> None:
         if not self._db:
