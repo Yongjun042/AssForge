@@ -165,13 +165,24 @@ def get_video_info(video_path: str) -> dict:
 
 
 def extract_audio(video_path: str, output_path: str,
-                  sample_rate: int = 16000, mono: bool = True) -> bool:
-    """Extract audio to WAV for waveform/AI."""
+                  sample_rate: int = 16000, mono: bool = True,
+                  start_ms: int | None = None, end_ms: int | None = None) -> bool:
+    """Extract audio to WAV for waveform/AI.
+
+    start_ms/end_ms 를 주면 그 구간만 추출한다(선택 영역 재정렬용).
+    """
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         return False
     try:
-        args = [ffmpeg, "-y", "-i", str(video_path)]
+        args = [ffmpeg, "-y"]
+        if start_ms is not None:
+            args += ["-ss", f"{max(0, start_ms) / 1000.0:.3f}"]
+        args += ["-i", str(video_path)]
+        if end_ms is not None and start_ms is not None:
+            args += ["-t", f"{max(0, end_ms - start_ms) / 1000.0:.3f}"]
+        elif end_ms is not None:
+            args += ["-to", f"{max(0, end_ms) / 1000.0:.3f}"]
         if mono:
             args += ["-ac", "1"]
         args += ["-ar", str(sample_rate), "-vn", "-f", "wav", str(output_path)]

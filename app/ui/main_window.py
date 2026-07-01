@@ -14,7 +14,8 @@ from typing import Optional
 from PySide6.QtCore import QObject, QSettings, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QFileDialog,
     QFormLayout,
     QFrame, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
@@ -292,10 +293,12 @@ class _AiSyncOptionsDialog(QDialog):
     ]
     _MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 
-    def __init__(self, settings: QSettings, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, settings: QSettings, parent: Optional[QWidget] = None,
+                 sel_range: "tuple[int, int] | None" = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("AI 동기화 옵션")
         self._settings = settings
+        self._sel_range = sel_range
 
         form = QFormLayout(self)
 
@@ -328,6 +331,31 @@ class _AiSyncOptionsDialog(QDialog):
             self._vocals.setEnabled(False)
             self._vocals.setText(f"보컬 분리 후 전사 — {vocals_why}")
         form.addRow(self._vocals)
+
+        # 동영상 시간 범위 제한 (선택 영역 재정렬 시) — 그 구간만 전사
+        self._clip_on = QCheckBox("동영상 시간 범위만 전사 (초)")
+        self._clip_start = QDoubleSpinBox()
+        self._clip_start.setRange(0, 360000)
+        self._clip_start.setDecimals(2)
+        self._clip_end = QDoubleSpinBox()
+        self._clip_end.setRange(0, 360000)
+        self._clip_end.setDecimals(2)
+        if sel_range is not None:
+            self._clip_start.setValue(sel_range[0] / 1000.0)
+            self._clip_end.setValue(sel_range[1] / 1000.0)
+            self._clip_on.setChecked(True)  # 선택 재정렬이면 기본 켬
+        else:
+            self._clip_end.setValue(360000)
+        crow = QHBoxLayout()
+        crow.addWidget(self._clip_start)
+        crow.addWidget(QLabel("~"))
+        crow.addWidget(self._clip_end)
+        cw = QWidget()
+        cw.setLayout(crow)
+        form.addRow(self._clip_on)
+        form.addRow("범위:", cw)
+        self._clip_on.toggled.connect(cw.setEnabled)
+        cw.setEnabled(self._clip_on.isChecked())
 
         hint = QLabel(
             "노래/BGM 은 언어 자동 감지가 자주 틀립니다 — 가사 언어를 직접 지정하세요.\n"
@@ -365,6 +393,16 @@ class _AiSyncOptionsDialog(QDialog):
 
     def separate_vocals(self) -> bool:
         return self._vocals.isEnabled() and self._vocals.isChecked()
+
+    def clip_range(self) -> "tuple[Optional[int], Optional[int]]":
+        """(start_ms, end_ms) 또는 (None, None) — 시간 범위 미사용."""
+        if not self._clip_on.isChecked():
+            return None, None
+        s = int(self._clip_start.value() * 1000)
+        e = int(self._clip_end.value() * 1000)
+        if e <= s:
+            return None, None
+        return s, e
 
 
 class MainWindow(QMainWindow):
@@ -1828,15 +1866,27 @@ class MainWindow(QMainWindow):
                 "선택된 줄이 없습니다.")
             return
 
+        # 선택 재정렬이면 선택 줄들의 시간 범위를 기본값으로 넘긴다.
+        sel_range = None
+        if only_selected and only_ids and self._db:
+            sel_evs = [self._db.get_event(i) for i in only_ids]
+            sel_evs = [e for e in sel_evs if e is not None]
+            if sel_evs:
+                sel_range = (min(e.start_ms for e in sel_evs),
+                             max(e.end_ms for e in sel_evs))
+
         from ai.sync_service import SyncOptions
-        opt_dlg = _AiSyncOptionsDialog(self._settings, self)
+        opt_dlg = _AiSyncOptionsDialog(self._settings, self, sel_range=sel_range)
         if opt_dlg.exec() != QDialog.DialogCode.Accepted:
             return
+        clip_s, clip_e = opt_dlg.clip_range()
         options = SyncOptions(
             model_size=opt_dlg.model_size(),
             language=opt_dlg.language(),
             separate_vocals=opt_dlg.separate_vocals(),
             only_event_ids=only_ids,
+            clip_start_ms=clip_s,
+            clip_end_ms=clip_e,
         )
 
         # 진행 다이얼로그

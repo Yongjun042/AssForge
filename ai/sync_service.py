@@ -44,6 +44,8 @@ class SyncOptions:
     language: Optional[str] = None  # None = 자동
     only_event_ids: Optional[list[str]] = None  # None = 트랙 전체
     separate_vocals: bool = False  # demucs 로 반주 제거 후 전사
+    clip_start_ms: Optional[int] = None  # 지정 시 이 구간만 전사(오디오)
+    clip_end_ms: Optional[int] = None
 
 
 def run_sync(
@@ -129,9 +131,21 @@ def run_sync(
             )
         raise RuntimeError(f"AI 동기화 중단: {reason}")
 
-    # 2) 오디오 준비
+    # 2) 오디오 준비 — 구간이 지정되면 그 부분만 추출(선택 영역 재정렬)
     _p(0.02, "오디오 준비 중...")
-    wav_path = _ensure_audio_wav(audio_source)
+    clip = (options.clip_start_ms is not None and options.clip_end_ms is not None
+            and options.clip_end_ms > options.clip_start_ms)
+    offset_ms = int(options.clip_start_ms) if clip else 0
+    if clip:
+        clip_src = _extract_clip_source(audio_source,
+                                        options.clip_start_ms, options.clip_end_ms)
+        if not clip_src:
+            raise RuntimeError("구간 오디오 추출에 실패했습니다 (FFmpeg 확인).")
+        sep_input = clip_src
+        wav_path = _to_whisper_wav(clip_src)
+    else:
+        sep_input = audio_source
+        wav_path = _ensure_audio_wav(audio_source)
     if not wav_path:
         raise RuntimeError("오디오 추출에 실패했습니다 (FFmpeg 설치 확인).")
 
@@ -143,7 +157,7 @@ def run_sync(
         if not ok:
             raise RuntimeError(f"보컬 분리를 사용할 수 없습니다: {why}")
         vocals = separate_vocals(
-            audio_source, progress=lambda f, m: _p(0.03 + 0.32 * f, m),
+            sep_input, progress=lambda f, m: _p(0.03 + 0.32 * f, m),
         )
         if not vocals:
             raise RuntimeError(
@@ -168,12 +182,23 @@ def run_sync(
     except TranscriptionUnavailable as exc:
         raise RuntimeError(str(exc))
 
+    # 구간 전사면 결과 시간이 0 기준이므로 원래 위치로 오프셋한다.
+    if offset_ms:
+        for seg in result.segments:
+            seg.start_ms += offset_ms
+            seg.end_ms += offset_ms
+            for w in seg.words:
+                w.start_ms += offset_ms
+                w.end_ms += offset_ms
+
     detected_lang = result.language or options.language or _guess_lang_from_lines(rows)
-    log.info("Whisper 언어=%s, segment=%d", detected_lang, len(result.segments))
+    log.info("Whisper 언어=%s, segment=%d, 오프셋=%dms", detected_lang,
+             len(result.segments), offset_ms)
 
     # 4) 정렬 — DTW
     _p(0.78, "가사 정렬 중...")
-    audio_dur_ms = _audio_duration_ms(wav_path)
+    audio_dur_ms = (_audio_duration_ms(wav_path) + offset_ms) if offset_ms \
+        else _audio_duration_ms(wav_path)
     alignments = align_lines_to_transcript(
         align_input, result, language=detected_lang, audio_duration_ms=audio_dur_ms,
     )
@@ -234,6 +259,26 @@ def _ensure_audio_wav(path: str) -> Optional[str]:
     if not ok:
         return None
     return str(out)
+
+
+def _extract_clip_source(path: str, start_ms: int, end_ms: int) -> Optional[str]:
+    """[start,end] 구간을 44.1k 스테레오 WAV 로 — 분리/다운샘플 공용 입력."""
+    cache = Path(tempfile.gettempdir()) / "assforge_cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    out = cache / f"{cache_key_for_source(path)}_clip_{int(start_ms)}_{int(end_ms)}.wav"
+    if cache_is_fresh(str(out), path):
+        return str(out)
+    ok = extract_audio(str(path), str(out), sample_rate=44100, mono=False,
+                       start_ms=int(start_ms), end_ms=int(end_ms))
+    return str(out) if ok else None
+
+
+def _to_whisper_wav(src_wav: str) -> Optional[str]:
+    """분리 입력(44.1k 스테레오) → Whisper 용 16k mono."""
+    out = str(Path(src_wav).with_name(Path(src_wav).stem + "_16k.wav"))
+    if cache_is_fresh(out, src_wav):
+        return out
+    return out if extract_audio(src_wav, out, sample_rate=16000, mono=True) else None
 
 
 def _audio_duration_ms(wav_path: str) -> int:
