@@ -77,6 +77,13 @@ def run_sync(
         set(options.only_event_ids) if options.only_event_ids else None
     )
 
+    # 구간 지정 시 그 부분만 전사한다 — 구간과 겹치는 줄만 대상으로 잡아야
+    # 구간 밖 줄이 부분 transcript 에 엉뚱하게 정렬되지 않는다.
+    clip = (options.clip_start_ms is not None and options.clip_end_ms is not None
+            and options.clip_end_ms > options.clip_start_ms)
+    clip_s = int(options.clip_start_ms) if clip else 0
+    clip_e = int(options.clip_end_ms) if clip else 0
+
     align_input: list[tuple[str, str, bool, int, int]] = []
     n_comment = 0
     n_empty = 0
@@ -92,6 +99,8 @@ def run_sync(
             n_empty += 1
             continue
         in_target = (target_set is None) or (ev.id in target_set) or is_locked
+        if clip and not (ev.start_ms < clip_e and ev.end_ms > clip_s):
+            in_target = False  # 구간과 겹치지 않는 줄은 제외
         if not in_target:
             n_off_target += 1
             continue
@@ -133,12 +142,9 @@ def run_sync(
 
     # 2) 오디오 준비 — 구간이 지정되면 그 부분만 추출(선택 영역 재정렬)
     _p(0.02, "오디오 준비 중...")
-    clip = (options.clip_start_ms is not None and options.clip_end_ms is not None
-            and options.clip_end_ms > options.clip_start_ms)
-    offset_ms = int(options.clip_start_ms) if clip else 0
+    offset_ms = clip_s if clip else 0
     if clip:
-        clip_src = _extract_clip_source(audio_source,
-                                        options.clip_start_ms, options.clip_end_ms)
+        clip_src = _extract_clip_source(audio_source, clip_s, clip_e)
         if not clip_src:
             raise RuntimeError("구간 오디오 추출에 실패했습니다 (FFmpeg 확인).")
         sep_input = clip_src
@@ -220,8 +226,15 @@ def run_sync(
             continue
         if skip_set is not None and ev.id not in skip_set:
             continue
+        s_ms, e_ms = int(al.start_ms), int(al.end_ms)
+        if clip:
+            # 구간 밖으로 튄 추정(특히 매칭 0 fallback)을 구간 안으로 클램프.
+            s_ms = max(clip_s, min(s_ms, clip_e))
+            e_ms = max(clip_s, min(e_ms, clip_e))
+            if e_ms <= s_ms:
+                e_ms = min(clip_e, s_ms + 100)
         conf = line_confidence(al)
-        suggestions.append((al.event_id, int(al.start_ms), int(al.end_ms), conf))
+        suggestions.append((al.event_id, s_ms, e_ms, conf))
         confs.append(conf)
 
     avg_conf = float(sum(confs) / len(confs)) if confs else 0.0
