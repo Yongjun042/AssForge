@@ -123,7 +123,49 @@ class _Model(QAbstractTableModel):
         return None
 
     def flags(self, index):
-        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        if index.isValid():
+            base |= Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled
+        return base | Qt.ItemFlag.ItemIsDropEnabled
+
+
+class _ReorderTable(QTableView):
+    """행 드래그로 순서 바꾸기 — 드롭 위치를 계산해 rows_dropped 로 알린다.
+
+    모델은 moveRows 를 지원하지 않으므로 기본 InternalMove 동작에 맡기지 않고,
+    드롭 지점(어느 행 앞)만 계산해 시그널로 넘긴다(실제 재정렬은 MainWindow 가
+    커맨드로 수행 → 되돌리기 가능).
+    """
+
+    rows_dropped = Signal(int)  # 드롭 대상 행 인덱스(그 앞에 삽입, len=맨 끝)
+
+    def dragEnterEvent(self, e) -> None:
+        if e.source() is self:
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e) -> None:
+        if e.source() is self:
+            e.acceptProposedAction()
+        else:
+            super().dragMoveEvent(e)
+
+    def dropEvent(self, e) -> None:
+        if e.source() is not self:
+            super().dropEvent(e)
+            return
+        pos = e.position().toPoint()
+        idx = self.indexAt(pos)
+        if idx.isValid():
+            target = idx.row()
+            rect = self.visualRect(idx)
+            if pos.y() > rect.center().y():
+                target += 1
+        else:
+            target = self.model().rowCount()
+        self.rows_dropped.emit(target)
+        e.acceptProposedAction()
 
 
 class GridPanel(QWidget):
@@ -139,6 +181,7 @@ class GridPanel(QWidget):
     insert_before_requested = Signal()
     insert_after_requested = Signal()
     accept_all_ai_requested = Signal()
+    reorder_requested = Signal(list, int)  # (드래그한 event_id 들, 드롭 대상 행)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -236,7 +279,7 @@ class GridPanel(QWidget):
 
         root.addLayout(search)
 
-        self._table = QTableView()
+        self._table = _ReorderTable()
         self._table.setModel(self._model)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -244,6 +287,13 @@ class GridPanel(QWidget):
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.doubleClicked.connect(self._on_double_click)
+        # 행 드래그로 순서 재정렬
+        self._table.setDragEnabled(True)
+        self._table.setAcceptDrops(True)
+        self._table.setDropIndicatorShown(True)
+        self._table.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self._table.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self._table.rows_dropped.connect(self._on_rows_dropped)
 
         for col, w in ((0, 35), (1, 38), (2, 50), (3, 90), (4, 90), (5, 65), (6, 70)):
             self._table.setColumnWidth(col, w)
@@ -253,6 +303,11 @@ class GridPanel(QWidget):
 
     def _on_sel(self) -> None:
         self.selection_changed.emit(self.selected_event_ids())
+
+    def _on_rows_dropped(self, target: int) -> None:
+        src = self.selected_event_ids()
+        if src:
+            self.reorder_requested.emit(src, target)
 
     def _on_double_click(self, idx: QModelIndex) -> None:
         ev = self._model.get_event(idx.row())

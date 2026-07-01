@@ -205,6 +205,42 @@ class ShiftTimesCommand(Command):
         return f"시간 이동 ({self._delta_ms:+d}ms)"
 
 
+class ReorderEventsCommand(Command):
+    """이벤트 순서를 통째로 재지정(order_index=0..n-1). 스냅샷 기반 undo."""
+
+    def __init__(self, db: ProjectDB, ordered_ids: list[str]) -> None:
+        self._db = db
+        self._new = list(ordered_ids)
+        self._old: dict[str, int] = {}
+
+    def execute(self) -> None:
+        if not self._new:
+            return
+        placeholders = ",".join("?" * len(self._new))
+        rows = self._db.conn.execute(
+            f"SELECT id, order_index FROM events WHERE id IN ({placeholders})",
+            self._new,
+        ).fetchall()
+        self._old = {r["id"]: r["order_index"] for r in rows}
+        self._db.conn.executemany(
+            "UPDATE events SET order_index=? WHERE id=?",
+            [(i, eid) for i, eid in enumerate(self._new)],
+        )
+        self._db.conn.commit()
+
+    def undo(self) -> None:
+        if not self._old:
+            return
+        self._db.conn.executemany(
+            "UPDATE events SET order_index=? WHERE id=?",
+            [(oi, eid) for eid, oi in self._old.items()],
+        )
+        self._db.conn.commit()
+
+    def description(self) -> str:
+        return "순서 변경"
+
+
 class ToggleCommentCommand(Command):
     """Toggle comment state of events."""
 

@@ -604,6 +604,7 @@ class MainWindow(QMainWindow):
         self.grid.insert_before_requested.connect(self._on_insert_before)
         self.grid.insert_after_requested.connect(self._on_insert_after)
         self.grid.accept_all_ai_requested.connect(self._on_ai_accept_all)
+        self.grid.reorder_requested.connect(self._on_grid_reorder)
 
         self.inspector.event_edited.connect(self._on_inspector_edit)
         self.inspector.lock_state_changed.connect(self._on_lock_state_changed)
@@ -1308,6 +1309,30 @@ class MainWindow(QMainWindow):
         )
         data.update(overrides)
         return EventRow(**data)
+
+    def _on_grid_reorder(self, src_ids: list, target_row: int) -> None:
+        """그리드에서 드래그한 줄들을 target_row 앞으로 이동 (order_index 재지정)."""
+        if not self._db or not self._main_track_id:
+            return
+        events = self._db.get_events(self._main_track_id)
+        src_set = set(src_ids)
+        remaining = [e for e in events if e.id not in src_set]
+        moved = [e for e in events if e.id in src_set]  # 원래 상대순서 유지
+        if not moved:
+            return
+        # 드롭 라인(target_row) 앞의 '비선택' 행 수 = remaining 삽입 위치.
+        # 이렇게 하면 자기 자리에 드롭해도 순서가 그대로다(no-op).
+        target_row = max(0, min(target_row, len(events)))
+        insert_at = sum(1 for e in events[:target_row] if e.id not in src_set)
+        new_order = remaining[:insert_at] + moved + remaining[insert_at:]
+        new_ids = [e.id for e in new_order]
+        if new_ids == [e.id for e in events]:
+            return  # 순서 변화 없음
+        from app.commands.edit_commands import ReorderEventsCommand
+        self.cmd_bus.execute(ReorderEventsCommand(self._db, new_ids))
+        self._mark_modified()
+        self._refresh_all()
+        self.grid.select_by_ids(src_ids)
 
     def _on_duplicate_lines(self) -> None:
         """선택한 줄들을 마지막 선택 줄 바로 뒤에 복제."""
