@@ -25,11 +25,40 @@ import re
 
 _TAG_RE = re.compile(r"\{[^}]*\}")
 _LEAD_RE = re.compile(r"^\s*\{([^}]*)\}")
-_K_IN_TAG = re.compile(r"\\k[fot]?\d*|\\K\d*")  # \k \kf \ko \kt \K 전부
+# \k \kf \ko \kt \K 전부. 소수점 duration(\kf10.5 — 스펙 외지만 toolkit 이
+# 허용)도 잔여물 없이 통째로 지운다.
+_K_IN_TAG = re.compile(r"\\k[fot]?\d*(?:\.\d+)?|\\K\d*(?:\.\d+)?")
+_BREAK_RE = re.compile(r"\\[Nn]")
 
 
 def _plain(text: str) -> str:
     return _TAG_RE.sub("", text).replace("\\N", " ").replace("\\n", " ")
+
+
+def _split_with_breaks(text: str) -> list[str]:
+    """태그를 뺀 평문을 음절 토큰으로 분리하되 \\N 줄바꿈 위치를 보존한다.
+
+    줄바꿈 직후 음절의 텍스트 앞에 '\\N' 을 붙여 렌더 시 그대로 복원되게 한다
+    (연속 \\N 은 하나로 접힘).
+    """
+    plain = _TAG_RE.sub("", text)
+    toks: list[str] = []
+    break_at: set[int] = set()
+    for si, seg in enumerate(_BREAK_RE.split(plain)):
+        if si > 0:
+            break_at.add(len(toks))
+        toks.extend(split_syllables(seg))
+    return ["\\N" + t if i in break_at else t for i, t in enumerate(toks)]
+
+
+def _distribute_marked(marked: list[str], total_ms: int, kind: str) -> list[Syllable]:
+    """\\N 마커가 붙은 토큰 리스트를 분배 — 가중치는 마커를 뺀 텍스트로 계산."""
+    clean = [t[2:] if t.startswith("\\N") else t for t in marked]
+    sylls = distribute_durations(clean, total_ms, kind)
+    for i, t in enumerate(marked):
+        if t.startswith("\\N"):
+            sylls[i].text = "\\N" + sylls[i].text
+    return sylls
 
 
 def _extract_lead(text: str) -> tuple[str, bool]:
@@ -60,13 +89,14 @@ class KaraokeDialog(QDialog):
         # \k 만 내보내서 원본 태그를 잃지 않도록.
         self._lead, has_mid = _extract_lead(text)
 
-        # 기존 카라오케가 있으면 읽고, 없으면 평문을 음절로 분리
+        # 기존 카라오케가 있으면 읽고, 없으면 평문을 음절로 분리.
+        # \N 줄바꿈은 음절 텍스트에 마커로 보존해 적용 시 사라지지 않게 한다.
         existing = parse_karaoke(text)
         if existing and total_duration_cs(existing) > 0:
             self._sylls = existing
         else:
-            toks = split_syllables(_plain(text)) or [_plain(text) or "음절"]
-            self._sylls = distribute_durations(toks, self._dur_ms, "kf")
+            marked = _split_with_breaks(text) or [_plain(text) or "음절"]
+            self._sylls = _distribute_marked(marked, self._dur_ms, "kf")
 
         # 탭 상태
         self._tapping = False
@@ -144,7 +174,8 @@ class KaraokeDialog(QDialog):
     # -- 표 --
     def _fill_table(self) -> None:
         for i, s in enumerate(self._sylls):
-            item = QTableWidgetItem(s.visible or s.text)
+            disp = (s.visible or s.text).replace("\\N", "⏎").replace("\\n", "⏎")
+            item = QTableWidgetItem(disp)
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self._table.setItem(i, 0, item)
             sp = QSpinBox()
@@ -168,8 +199,8 @@ class KaraokeDialog(QDialog):
 
     # -- 동작 --
     def _on_even(self) -> None:
-        toks = [s.text for s in self._sylls]
-        self._sylls = distribute_durations(toks, self._dur_ms, self._kind.currentData())
+        marked = [s.text for s in self._sylls]
+        self._sylls = _distribute_marked(marked, self._dur_ms, self._kind.currentData())
         self._sync_spins()
         self._update_preview()
 

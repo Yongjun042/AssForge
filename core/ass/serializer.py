@@ -53,36 +53,41 @@ def export_ass(
         last_style_idx = shadow_style_lines[-1].index
         inserts[last_style_idx] = [serialize_style_line(s, style_fmt) for s in new_styles]
 
-    # Override modified events
+    # Events: `events` 의 순서(= order_index 순)가 파일에 실리는 최종 순서다.
+    # 기존 이벤트를 각자의 원래 shadow 줄(slot)에 되쓰면 그리드에서 재정렬한
+    # 순서가 저장 시 사라지므로, 살아남은 slot 들을 문서 순서대로 모아
+    # events 순서대로 "순차" 배정한다. 순서가 안 바뀐 파일은 이전과 동일하게
+    # 자기 자리에 되써져 round-trip 이 유지된다.
     shadow_event_lines = [
         rl for rl in shadow.lines
         if rl.line_type in (LineType.DIALOGUE, LineType.COMMENT) and not rl.deleted
     ]
-    event_by_shadow = {e.shadow_line_idx: e for e in events if e.shadow_line_idx >= 0}
+    valid_slot_idxs = {rl.index for rl in shadow_event_lines}
+    existing_events = [
+        e for e in events
+        if e.shadow_line_idx >= 0 and e.shadow_line_idx in valid_slot_idxs
+    ]
+    used_slot_idxs = {e.shadow_line_idx for e in existing_events}
+    slots = [rl.index for rl in shadow_event_lines if rl.index in used_slot_idxs]
 
-    for rl in shadow_event_lines:
-        if rl.index in event_by_shadow:
-            e = event_by_shadow[rl.index]
-            overrides[rl.index] = serialize_event_line(e, event_fmt)
+    # 매칭되는 이벤트가 없는 slot 은 삭제된 이벤트 — 이번 export 에서만 제외.
+    deleted_event_idxs.update(valid_slot_idxs - used_slot_idxs)
 
-    # New events (no shadow_line_idx)
-    new_events = [e for e in events if e.shadow_line_idx < 0]
-    if new_events:
-        if shadow_event_lines:
-            last_event_idx = shadow_event_lines[-1].index
-        elif event_format_lines:
-            last_event_idx = event_format_lines[-1].index
+    # 새 이벤트(shadow_line_idx < 0)는 직전 이벤트의 slot 뒤에 끼워 넣어
+    # 중간 삽입/재정렬 위치를 유지한다. 첫 이벤트보다 앞이면 Format 줄 뒤.
+    if event_format_lines:
+        lead_anchor = event_format_lines[-1].index
+    else:
+        lead_anchor = shadow.lines[-1].index if shadow.lines else -1
+
+    slot_iter = iter(slots)
+    anchor = lead_anchor
+    for e in events:
+        if e.shadow_line_idx >= 0 and e.shadow_line_idx in valid_slot_idxs:
+            anchor = next(slot_iter)
+            overrides[anchor] = serialize_event_line(e, event_fmt)
         else:
-            last_event_idx = shadow.lines[-1].index if shadow.lines else -1
-        inserts.setdefault(last_event_idx, []).extend(
-            serialize_event_line(e, event_fmt) for e in new_events
-        )
-
-    # Handle deleted events for this export only. Do not mutate the shadow.
-    existing_shadow_idxs = {e.shadow_line_idx for e in events if e.shadow_line_idx >= 0}
-    for rl in shadow_event_lines:
-        if rl.index not in existing_shadow_idxs and rl.index not in overrides:
-            deleted_event_idxs.add(rl.index)
+            inserts.setdefault(anchor, []).append(serialize_event_line(e, event_fmt))
 
     # Override script info if changed
     if script_info:

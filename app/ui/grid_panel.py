@@ -4,7 +4,9 @@ from __future__ import annotations
 import re
 from typing import Any, Optional, Sequence
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
+from PySide6.QtCore import (
+    QAbstractTableModel, QItemSelection, QModelIndex, Qt, Signal,
+)
 from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QHeaderView,
@@ -123,10 +125,12 @@ class _Model(QAbstractTableModel):
         return None
 
     def flags(self, index):
-        base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        # 드롭은 행 위/루트(빈 영역) 어디서든 허용, 드래그는 실제 행만.
+        base = (Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsDropEnabled)
         if index.isValid():
-            base |= Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled
-        return base | Qt.ItemFlag.ItemIsDropEnabled
+            base |= Qt.ItemFlag.ItemIsDragEnabled
+        return base
 
 
 class _ReorderTable(QTableView):
@@ -215,18 +219,25 @@ class GridPanel(QWidget):
                 return
 
     def select_by_ids(self, event_ids: list[str]) -> None:
-        """Select multiple rows by event ID (clears prior selection)."""
+        """Select multiple rows by event ID (clears prior selection).
+
+        QItemSelection 하나로 모아 select() 를 1회만 호출한다 — 행마다
+        호출하면 행 수만큼 selectionChanged 파이프라인(그리드→메인→타임라인)이
+        돌아 수백 줄 선택이 수 초씩 걸린다.
+        """
         want = set(event_ids)
         sm = self._table.selectionModel()
-        sm.clearSelection()
-        flag = (sm.SelectionFlag.Select | sm.SelectionFlag.Rows)
+        selection = QItemSelection()
+        last_col = max(0, self._model.columnCount() - 1)
         first_idx = None
         for i, ev in enumerate(self._model._events):
             if ev.id in want:
-                idx = self._model.index(i, 0)
-                sm.select(idx, flag)
+                top_left = self._model.index(i, 0)
+                selection.select(top_left, self._model.index(i, last_col))
                 if first_idx is None:
-                    first_idx = idx
+                    first_idx = top_left
+        flag = (sm.SelectionFlag.ClearAndSelect | sm.SelectionFlag.Rows)
+        sm.select(selection, flag)
         if first_idx is not None:
             self._table.scrollTo(first_idx)
 

@@ -44,26 +44,61 @@ from media.waveform import (
 
 log = logging.getLogger(__name__)
 
+# 영상 확장자의 단일 출처 — 열기 다이얼로그 필터/드래그드롭/짝 자막 탐색이 공유.
 _VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".flv", ".ts", ".m2ts", ".mts"}
+_VIDEO_FILTER = "영상 파일 (" + " ".join(
+    "*" + e for e in sorted(_VIDEO_EXTS)) + ");;모든 파일 (*)"
 
 # 찾기/바꾸기는 보이는 텍스트에만 적용해야 한다 — {…} 오버라이드 블록과
 # \N/\n/\h 이스케이프는 보호(그 안을 치환하면 태그가 깨진다).
+# \p 드로잉 모드({\p1}m 0 0 l ...{\p0}) 사이의 좌표도 텍스트가 아니므로 건드리지 않는다.
 _PROTECT_RE = re.compile(r"(\{[^}]*\}|\\[Nnh])")
+_P_MODE_RE = re.compile(r"\\p(\d+)")
+
+
+def _advance_drawing(block: str, drawing: bool) -> bool:
+    """오버라이드 블록 안의 \\p 태그로 드로잉 모드 상태를 갱신 (마지막 것이 이김)."""
+    for m in _P_MODE_RE.finditer(block):
+        drawing = m.group(1) != "0"
+    return drawing
 
 
 def _sub_text_only(pat, repl, text):
-    """{…} 블록과 줄바꿈 이스케이프 바깥의 텍스트에만 pat.sub. (new_text, count)."""
+    """{…} 블록·이스케이프·드로잉 좌표 바깥의 텍스트에만 pat.sub. (new_text, count).
+
+    치환 문자열이 잘못된 정규식 템플릿이면 ValueError. 결과에 실제 개행 문자가
+    생기면 \\N 으로 바꿔 Dialogue 줄이 쪼개지지 않게 한다.
+    """
     parts = _PROTECT_RE.split(text)
     total = 0
-    for i in range(0, len(parts), 2):  # 짝수 인덱스 = 보호 토큰 바깥
-        parts[i], n = pat.subn(repl, parts[i])
+    drawing = False
+    for i, part in enumerate(parts):
+        if i % 2:  # 보호 토큰
+            if part.startswith("{"):
+                drawing = _advance_drawing(part, drawing)
+            continue
+        if drawing:
+            continue
+        try:
+            parts[i], n = pat.subn(repl, part)
+        except re.error as e:
+            raise ValueError(f"바꿀 문자열 오류: {e}")
         total += n
-    return "".join(parts), total
+    out = "".join(parts).replace("\r", "").replace("\n", "\\N")
+    return out, total
 
 
 def _search_text_only(pat, text) -> bool:
     parts = _PROTECT_RE.split(text)
-    return any(pat.search(parts[i]) for i in range(0, len(parts), 2))
+    drawing = False
+    for i, part in enumerate(parts):
+        if i % 2:
+            if part.startswith("{"):
+                drawing = _advance_drawing(part, drawing)
+            continue
+        if not drawing and pat.search(part):
+            return True
+    return False
 
 
 class _AiSyncWorker(QObject):
@@ -432,6 +467,9 @@ class MainWindow(QMainWindow):
         # Keyboard timing state
         self._timing_mode = False  # True when marking start/end via keyboard
         self._timing_start_ms: int | None = None
+
+        # 찾기/바꾸기 '선택 줄만' 스코프 스냅샷 (다이얼로그 열 때 리셋)
+        self._find_scope_snapshot: list[str] | None = None
 
         # Autosave
         self._autosave_timer = QTimer(self)
@@ -840,8 +878,7 @@ class MainWindow(QMainWindow):
 
     def _on_open_video(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "영상 파일 열기", self._last_dir(),
-            "영상 파일 (*.mp4 *.mkv *.avi *.webm *.mov *.flv *.ts *.m2ts *.mts);;모든 파일 (*)",
+            self, "영상 파일 열기", self._last_dir(), _VIDEO_FILTER,
         )
         if path:
             self._remember_dir(path)
@@ -1111,24 +1148,31 @@ class MainWindow(QMainWindow):
             if clicked is btn_accept:
                 self._apply_suggestions(pending)
         try:
-            events = self._track_mgr.export_events_for_ass(self._main_track_id)
-            script_info = dict(self._db.get_script_info() or {}) if self._db else {}
-            # Aegisub 호환 — 영상을 함께 저장해서 자막만 다시 열어도 영상이 따라오게 함.
-            if self._video_path:
-                abs_video = os.path.abspath(self._video_path)
-                ass_dir = os.path.dirname(os.path.abspath(path))
-                try:
-                    rel_video = os.path.relpath(abs_video, ass_dir)
-                except ValueError:
-                    rel_video = abs_video  # 다른 드라이브 (Windows)
-                script_info["Video File"] = rel_video
-            save_ass_file(path, self._shadow, self._styles, events, script_info or None)
+            self._write_ass_document(path, video_ref=True)
             self._subtitle_path = path
             self.cmd_bus.mark_clean()  # this save point is the new clean baseline
-            self._modified = False
             self._update_title()
         except Exception as exc:
             QMessageBox.critical(self, "저장 실패", str(exc))
+
+    def _write_ass_document(self, path: str, video_ref: bool = False) -> None:
+        """현재 DB 상태를 .ass 로 직렬화해 path 에 기록.
+
+        저장/자동저장/라이브 미리보기가 같은 직렬화 경로를 타도록 하는 단일
+        지점. video_ref=True 면 Aegisub 호환 'Video File:' 키를 넣는다
+        (자막만 다시 열어도 영상이 따라오게).
+        """
+        events = self._track_mgr.export_events_for_ass(self._main_track_id)
+        script_info = dict(self._db.get_script_info() or {}) if self._db else {}
+        if video_ref and self._video_path:
+            abs_video = os.path.abspath(self._video_path)
+            ass_dir = os.path.dirname(os.path.abspath(path))
+            try:
+                rel_video = os.path.relpath(abs_video, ass_dir)
+            except ValueError:
+                rel_video = abs_video  # 다른 드라이브 (Windows)
+            script_info["Video File"] = rel_video
+        save_ass_file(path, self._shadow, self._styles, events, script_info or None)
 
     # ============================================================
     # Editing
@@ -1382,6 +1426,7 @@ class MainWindow(QMainWindow):
 
     def _on_duplicate_lines(self) -> None:
         """선택한 줄들을 마지막 선택 줄 바로 뒤에 복제."""
+        self.inspector.flush_pending()
         sel = self._selected_rows_sorted()
         if not sel:
             return
@@ -1397,6 +1442,7 @@ class MainWindow(QMainWindow):
 
     def _on_join_lines(self) -> None:
         """선택한 여러 줄을 한 줄로 — 시간은 전체 범위, 텍스트는 \\N 으로 연결."""
+        self.inspector.flush_pending()
         sel = self._selected_rows_sorted()
         if len(sel) < 2:
             self.statusBar().showMessage("합칠 줄을 2개 이상 선택하세요.", 4000)
@@ -1418,6 +1464,7 @@ class MainWindow(QMainWindow):
 
     def _on_split_line(self) -> None:
         """선택한 한 줄을 현재 재생 위치에서 둘로 나눔 (범위 밖이면 시간 중앙)."""
+        self.inspector.flush_pending()
         ids = self.grid.selected_event_ids()
         if len(ids) != 1:
             self.statusBar().showMessage("나눌 줄 하나만 선택하세요.", 4000)
@@ -1454,6 +1501,8 @@ class MainWindow(QMainWindow):
             self._find_dlg.find_next.connect(self._find_next)
             self._find_dlg.replace_one.connect(self._replace_one)
             self._find_dlg.replace_all.connect(self._replace_all)
+        # 다시 열 때마다 '선택 줄만' 스코프 스냅샷을 리셋해 현재 선택 기준으로.
+        self._find_scope_snapshot = None
         # 검색 시작 텍스트 = 선택 줄의 텍스트 일부
         self._find_dlg.show()
         self._find_dlg.raise_()
@@ -1479,8 +1528,15 @@ class MainWindow(QMainWindow):
             return []
         events = self._db.get_events(self._main_track_id)
         if opts.get("selected_only"):
-            sel = set(self.grid.selected_event_ids())
+            # 첫 스코프 계산 시점의 선택을 스냅샷 — 찾은 줄로 이동하면서
+            # select_by_id 가 다중 선택을 지워도 스코프가 한 줄로 무너지지 않게.
+            # 다이얼로그를 다시 열면 스냅샷이 리셋된다.
+            if self._find_scope_snapshot is None:
+                self._find_scope_snapshot = list(self.grid.selected_event_ids())
+            sel = set(self._find_scope_snapshot)
             events = [e for e in events if e.id in sel]
+        else:
+            self._find_scope_snapshot = None
         return [(e.id, e.text) for e in events]
 
     def _find_next(self, opts: dict) -> None:
@@ -1511,20 +1567,34 @@ class MainWindow(QMainWindow):
                 return
         self.statusBar().showMessage("일치하는 줄이 없습니다.", 3000)
 
+    @staticmethod
+    def _literal_repl(opts: dict) -> str:
+        """정규식 모드가 아니면 치환 문자열의 백슬래시를 이스케이프해
+        '\\N' 같은 입력이 정규식 템플릿(bad escape)으로 해석되지 않게 한다."""
+        repl = opts.get("replace", "")
+        if not opts.get("regex"):
+            repl = repl.replace("\\", "\\\\")
+        return repl
+
     def _replace_one(self, opts: dict) -> None:
         if not self._db:
             return
+        self.inspector.flush_pending()
         try:
             pat = self._make_matcher(opts)
         except ValueError as e:
             self.statusBar().showMessage(str(e), 5000)
             return
         ids = self.grid.selected_event_ids()
-        repl = opts.get("replace", "")
+        repl = self._literal_repl(opts)
         if ids:
             ev = self._db.get_event(ids[-1])
             if ev and _search_text_only(pat, ev.text or ""):
-                new_text, _ = _sub_text_only(pat, repl, ev.text or "")
+                try:
+                    new_text, _ = _sub_text_only(pat, repl, ev.text or "")
+                except ValueError as e:
+                    self.statusBar().showMessage(str(e), 5000)
+                    return
                 from app.commands.edit_commands import UpdateEventCommand
                 self.cmd_bus.execute(UpdateEventCommand(self._db, ev.id, {"text": new_text}))
                 self._mark_modified()
@@ -1535,6 +1605,7 @@ class MainWindow(QMainWindow):
     def _replace_all(self, opts: dict) -> None:
         if not self._db or not self._main_track_id:
             return
+        self.inspector.flush_pending()
         try:
             pat = self._make_matcher(opts)
         except ValueError as e:
@@ -1542,23 +1613,28 @@ class MainWindow(QMainWindow):
             return
         if not opts.get("find"):
             return
-        repl = opts.get("replace", "")
+        repl = self._literal_repl(opts)
         scope = self._find_scope_ids(opts)
-        from app.commands.edit_commands import CompositeCommand, UpdateEventCommand
-        cmds = []
+        from app.commands.edit_commands import BulkUpdateTextsCommand
+        updates: list[tuple[str, str]] = []
         count = 0
-        for eid, text in scope:
-            new_text, n = _sub_text_only(pat, repl, text or "")
-            if n:
-                cmds.append(UpdateEventCommand(self._db, eid, {"text": new_text}))
-                count += n
-        if not cmds:
+        try:
+            for eid, text in scope:
+                new_text, n = _sub_text_only(pat, repl, text or "")
+                if n:
+                    updates.append((eid, new_text))
+                    count += n
+        except ValueError as e:
+            self.statusBar().showMessage(str(e), 5000)
+            return
+        if not updates:
             self.statusBar().showMessage("바꿀 내용이 없습니다.", 3000)
             return
-        self.cmd_bus.execute(CompositeCommand(cmds, f"모두 바꾸기 ({len(cmds)}줄)"))
+        self.cmd_bus.execute(BulkUpdateTextsCommand(
+            self._db, updates, f"모두 바꾸기 ({len(updates)}줄)"))
         self._mark_modified()
         self._refresh_all()
-        self.statusBar().showMessage(f"{count}곳 바꿈 ({len(cmds)}줄)", 5000)
+        self.statusBar().showMessage(f"{count}곳 바꿈 ({len(updates)}줄)", 5000)
 
     def _on_select_lines(self) -> None:
         if not self._db or not self._main_track_id:
@@ -1569,8 +1645,21 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         crit = dlg.criteria()
+        # 텍스트 조건은 찾기/바꾸기와 같은 _make_matcher 로 한 번만 컴파일 —
+        # 매칭 의미(이스케이프/대소문자) 일관 + 이벤트마다 재컴파일 방지.
+        text_pat = None
+        if crit.get("text"):
+            try:
+                text_pat = self._make_matcher({
+                    "find": crit["text"],
+                    "regex": crit.get("regex", False),
+                    "case": crit.get("case", False),
+                })
+            except ValueError as e:
+                self.statusBar().showMessage(str(e), 5000)
+                return
         events = self._db.get_events(self._main_track_id)
-        matched = [e.id for e in events if self._line_matches(e, crit)]
+        matched = [e.id for e in events if self._line_matches(e, crit, text_pat)]
         mode = crit["mode"]
         cur = set(self.grid.selected_event_ids())
         if mode == "new":
@@ -1582,22 +1671,9 @@ class MainWindow(QMainWindow):
         self.grid.select_by_ids(result)
         self.statusBar().showMessage(f"{len(matched)}줄 일치 — 선택 {len(result)}줄", 5000)
 
-    def _line_matches(self, e, crit: dict) -> bool:
-        import re as _re
-        if crit.get("text"):
-            txt = e.text or ""
-            if crit.get("regex"):
-                try:
-                    if not _re.search(crit["text"], txt,
-                                      0 if crit.get("case") else _re.IGNORECASE):
-                        return False
-                except _re.error:
-                    return False
-            else:
-                hay = txt if crit.get("case") else txt.lower()
-                needle = crit["text"] if crit.get("case") else crit["text"].lower()
-                if needle not in hay:
-                    return False
+    def _line_matches(self, e, crit: dict, text_pat=None) -> bool:
+        if text_pat is not None and not text_pat.search(e.text or ""):
+            return False
         if crit.get("style") and e.style_id != crit["style"]:
             return False
         if crit.get("min_ms") is not None and e.start_ms < crit["min_ms"]:
@@ -1634,6 +1710,7 @@ class MainWindow(QMainWindow):
             self.video_player.play_around(ev.end_ms)
 
     def _on_karaoke_timing(self) -> None:
+        self.inspector.flush_pending()
         ev = self._selected_one()
         if ev is None:
             self.statusBar().showMessage("가라오케 타이밍할 줄을 선택하세요.", 4000)
@@ -1686,6 +1763,9 @@ class MainWindow(QMainWindow):
 
     def _after_timeline_edit(self, event_id: str) -> None:
         self._mark_modified()
+        # 인스펙터의 디바운스 대기 텍스트를 먼저 커밋한 뒤 행을 읽어야
+        # load_event 가 타이핑 직전 스냅샷으로 에디터를 되돌리지 않는다.
+        self.inspector.flush_pending()
         ev = self._db.get_event(event_id)
         if ev:
             self.grid.update_event(ev)
@@ -1714,17 +1794,35 @@ class MainWindow(QMainWindow):
         )
 
     def _on_set_time_to_current(self, edge: str) -> None:
-        """인스펙터 버튼 — 선택한 줄의 start/end 를 현재 재생 위치로 설정."""
+        """인스펙터 버튼 — 인스펙터에 표시 중인 줄의 start/end 를 현재 재생 위치로.
+
+        다중 선택 시 selected_ids[0] 은 인스펙터가 보여주는 줄과 다를 수 있으므로
+        반드시 인스펙터의 이벤트를 대상으로 한다. 반대쪽 경계와 뒤집히면
+        (start > end) 반대쪽도 같이 밀어 음수 duration 이 저장되지 않게 한다.
+        """
         if not self._db:
             return
-        ids = self.grid.selected_event_ids()
-        if not ids:
+        target = self.inspector.current_event_id()
+        if not target:
+            ids = self.grid.selected_event_ids()
+            if not ids:
+                return
+            target = ids[-1]
+        ev = self._db.get_event(target)
+        if ev is None:
             return
-        pos = self.video_player.get_position_ms()
-        field = "start_ms" if edge == "start" else "end_ms"
+        pos = max(0, self.video_player.get_position_ms())
+        if edge == "start":
+            changes = {"start_ms": pos}
+            if pos > ev.end_ms:
+                changes["end_ms"] = pos + 1000  # 뒤집힘 방지 — 기본 1초 길이
+        else:
+            changes = {"end_ms": pos}
+            if pos < ev.start_ms:
+                changes["start_ms"] = max(0, pos - 1000)
         from app.commands.edit_commands import UpdateEventCommand
-        self.cmd_bus.execute(UpdateEventCommand(self._db, ids[0], {field: pos}))
-        self._after_timeline_edit(ids[0])
+        self.cmd_bus.execute(UpdateEventCommand(self._db, target, changes))
+        self._after_timeline_edit(target)
         self._refresh_timeline_events()
 
     # ============================================================
@@ -2058,14 +2156,15 @@ class MainWindow(QMainWindow):
     # ============================================================
 
     def _play_res(self) -> tuple[int, int]:
-        """[Script Info] 의 PlayResX/Y. 없으면 1920x1080."""
+        """[Script Info] 의 PlayResX/Y. 없거나 0 이하(레거시 '미지정')면 1920x1080."""
         info = self._db.get_script_info() if self._db else {}
 
         def _int(key: str, default: int) -> int:
             try:
-                return int(float(info.get(key, default)))
+                v = int(float(info.get(key, default)))
             except (TypeError, ValueError):
                 return default
+            return v if v > 0 else default  # 'PlayResX: 0' → 미지정으로 취급
 
         return _int("PlayResX", 1920), _int("PlayResY", 1080)
 
@@ -2212,9 +2311,7 @@ class MainWindow(QMainWindow):
             os.makedirs(autosave_dir, exist_ok=True)
             name = Path(self._subtitle_path).stem if self._subtitle_path else "untitled"
             autosave_path = os.path.join(autosave_dir, f"{name}_autosave.ass")
-            events = self._track_mgr.export_events_for_ass(self._main_track_id)
-            script_info = self._db.get_script_info() if self._db else None
-            save_ass_file(autosave_path, self._shadow, self._styles, events, script_info)
+            self._write_ass_document(autosave_path)
             log.info("Autosave: %s", autosave_path)
         except Exception:
             log.exception("Autosave failed")
@@ -2243,9 +2340,7 @@ class MainWindow(QMainWindow):
         path = self._preview_paths[self._preview_idx]
         self._preview_idx ^= 1  # 다음엔 다른 경로 — mpv 의 동일-경로 캐시 회피
         try:
-            events = self._track_mgr.export_events_for_ass(self._main_track_id)
-            script_info = dict(self._db.get_script_info() or {}) if self._db else {}
-            save_ass_file(path, self._shadow, self._styles, events, script_info or None)
+            self._write_ass_document(path)
         except Exception:
             log.exception("라이브 미리보기 렌더 실패")
             return
@@ -2342,7 +2437,7 @@ class MainWindow(QMainWindow):
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             ext = Path(path).suffix.lower()
-            if ext in {".mp4", ".mkv", ".avi", ".webm", ".mov", ".flv", ".ts", ".m2ts", ".mts"}:
+            if ext in _VIDEO_EXTS:
                 if not self._confirm_discard():
                     return
                 self._remember_dir(path)

@@ -64,6 +64,50 @@ class UpdateEventCommand(Command):
         return "이벤트 수정"
 
 
+class BulkUpdateTextsCommand(Command):
+    """여러 이벤트의 text 를 한 트랜잭션(커밋 1회)으로 갱신.
+
+    '모두 바꾸기'처럼 수백 줄을 건드리는 작업이 줄당 commit(fsync) 하지
+    않도록 executemany + 단일 commit 으로 처리한다. Undo 는 이전 텍스트 복원.
+    """
+
+    def __init__(self, db: ProjectDB, updates: list[tuple[str, str]],
+                 description: str = "일괄 텍스트 수정") -> None:
+        self._db = db
+        self._updates = updates            # [(event_id, new_text)]
+        self._old: list[tuple[str, str]] = []  # [(event_id, old_text)]
+        self._description = description
+
+    def execute(self) -> None:
+        if not self._updates:
+            return
+        ids = [eid for eid, _ in self._updates]
+        marks = ",".join("?" * len(ids))
+        rows = self._db.conn.execute(
+            f"SELECT id, text FROM events WHERE id IN ({marks})", ids
+        ).fetchall()
+        old_by_id = {r["id"]: r["text"] for r in rows}
+        self._old = [(eid, old_by_id[eid]) for eid, _ in self._updates
+                     if eid in old_by_id]
+        self._db.conn.executemany(
+            "UPDATE events SET text=? WHERE id=?",
+            [(text, eid) for eid, text in self._updates],
+        )
+        self._db.conn.commit()
+
+    def undo(self) -> None:
+        if not self._old:
+            return
+        self._db.conn.executemany(
+            "UPDATE events SET text=? WHERE id=?",
+            [(text, eid) for eid, text in self._old],
+        )
+        self._db.conn.commit()
+
+    def description(self) -> str:
+        return self._description
+
+
 class InsertEventCommand(Command):
     """Insert a new event into a track."""
 

@@ -279,6 +279,10 @@ class InspectorPanel(QWidget):
         마지막 키 입력(<500ms)이 저장에서 빠지지 않게 한다."""
         self._flush_text()
 
+    def current_event_id(self) -> str | None:
+        """지금 인스펙터에 표시 중인 이벤트 id (없으면 None)."""
+        return self._event_id
+
     def _on_lock_radio(self, checked: bool, state: LockState) -> None:
         if not checked or self._updating or not self._event_id:
             return
