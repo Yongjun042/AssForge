@@ -999,7 +999,9 @@ class MainWindow(QMainWindow):
             self._shadow = ShadowDocument()
             self._shadow.load_from_file(path)
 
-            # Reset DB
+            # Reset DB — 비주얼 편집 패널이 떠 있으면 먼저 닫는다. 패널은 load()
+            # 시점의 db 참조를 쥐고 있어서, 닫힌 db 로 '적용'하면 크래시한다.
+            self._exit_visual_edit()
             if self._db:
                 self._db.close()
             db_path = os.path.join(tempfile.gettempdir(), f"assforge_{uuid.uuid4().hex[:8]}.db")
@@ -2181,6 +2183,7 @@ class MainWindow(QMainWindow):
     def _on_ai_edit(self) -> None:
         if not self._db:
             return
+        self.inspector.flush_pending()
         events = self._selected_events()
         if not events:
             QMessageBox.information(self, "AI 편집", "편집할 자막 줄을 먼저 선택하세요.")
@@ -2223,6 +2226,7 @@ class MainWindow(QMainWindow):
         """현재 프레임 스냅샷 위에서 선택 줄의 \\pos 를 드래그로 편집."""
         if not self._db:
             return
+        self.inspector.flush_pending()
         ids = self.grid.selected_event_ids()
         if not ids:
             QMessageBox.information(self, "위치 편집", "편집할 자막 줄을 먼저 선택하세요.")
@@ -2256,7 +2260,7 @@ class MainWindow(QMainWindow):
             "비주얼 편집 모드 — 드래그로 위치/회전/배율/색/클립, '적용' 또는 '닫기'", 0)
 
     def _on_visual_edit_committed(self, command) -> None:
-        eid = self._edit_panel._event_id
+        eid = self._edit_panel.current_event_id()
         self.cmd_bus.execute(command)
         self._after_timeline_edit(eid)
         self._refresh_timeline_events()

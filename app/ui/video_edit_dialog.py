@@ -14,7 +14,6 @@ UpdateEventCommand(단일 undo)로 처리한다(원본 태그/애니메이션 �
 from __future__ import annotations
 
 import math
-import re
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
@@ -26,43 +25,62 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from app.commands.bus import Command
 from app.commands.edit_commands import UpdateEventCommand
-from core.ass.tag_tokenizer import remove_tag, rgb_to_ass_color, upsert_tag
+from core.ass.tag_tokenizer import (
+    ass_color_to_rgb, find_tag, remove_tag, rgb_to_ass_color, strip_tags,
+    upsert_tag,
+)
 from core.project.project_db import ProjectDB
 from core.typeset import (
     clear_clip, effective_position, get_rotation, set_clip_rect, set_position,
     set_rotation,
 )
 
-_AN_RE = re.compile(r"\\an([1-9])")
-_TAG_RE = re.compile(r"\{[^}]*\}")
-_MOVE_RE = re.compile(r"\\move\s*\(")
-_ANIM_RE = re.compile(r"\\t\s*\(")
-_FSCX_RE = re.compile(r"\\fscx(-?\d+(?:\.\d+)?)")
-_FSCY_RE = re.compile(r"\\fscy(-?\d+(?:\.\d+)?)")
-_C1_RE = re.compile(r"\\1?c&H([0-9A-Fa-f]{6})&")
+# 태그 읽기는 전부 tag_tokenizer 기반 — 정규식으로 원문을 훑으면 \t(...) 인자
+# 속 태그를 정적 값으로 오독한다 (CLAUDE.md: ASS 태그 작업은 토크나이저에 근거).
+
+# SSA 레거시 \a → \an 넘패드 변환 (docs/ass-format-reference.md: 1–3=하단,
+# 5–7=상단, 9–11=중단)
+_LEGACY_A_TO_AN = {1: 1, 2: 2, 3: 3, 5: 7, 6: 8, 7: 9, 9: 4, 10: 5, 11: 6}
 
 
 def _plain(text: str) -> str:
-    return _TAG_RE.sub("", text).replace("\\N", " ").replace("\\n", " ").strip()
+    return strip_tags(text).strip()
+
+
+def _tag_num(text: str, name: str, default: float) -> float:
+    t = find_tag(text, name)
+    if t is None:
+        return default
+    try:
+        return float(t.args.strip() or default)
+    except (TypeError, ValueError):
+        return default
 
 
 def _alignment(text: str) -> int:
-    m = _AN_RE.search(text)
-    return int(m.group(1)) if m else 2
-
-
-def _num(rx, text, default):
-    m = rx.search(text)
-    return float(m.group(1)) if m else default
+    an = find_tag(text, "an")
+    if an is not None:
+        try:
+            v = int(an.args.strip())
+            if 1 <= v <= 9:
+                return v
+        except (TypeError, ValueError):
+            pass
+    a = find_tag(text, "a")
+    if a is not None:
+        try:
+            return _LEGACY_A_TO_AN.get(int(a.args.strip()), 2)
+        except (TypeError, ValueError):
+            pass
+    return 2
 
 
 def _initial_color(text: str) -> QColor:
-    m = _C1_RE.search(text)
-    if m:
-        bb, gg, rr = m.group(1)[0:2], m.group(1)[2:4], m.group(1)[4:6]
-        return QColor(int(rr, 16), int(gg, 16), int(bb, 16))
+    t = find_tag(text, "1c") or find_tag(text, "c")
+    if t is not None and t.args.strip():
+        r, g, b = ass_color_to_rgb(t.args)
+        return QColor(r, g, b)
     return QColor("#FFFFFF")
 
 
@@ -306,6 +324,10 @@ class VideoEditPanel(QWidget):
         ctl2.addWidget(close_btn)
         root.addLayout(ctl2)
 
+    def current_event_id(self) -> str | None:
+        """지금 편집 중인 이벤트 id — MainWindow 가 커밋 후 UI 갱신에 사용."""
+        return self._event_id
+
     @staticmethod
     def _spin(lo, hi, val, dec) -> QDoubleSpinBox:
         s = QDoubleSpinBox()
@@ -320,14 +342,19 @@ class VideoEditPanel(QWidget):
         self._db = db
         self._event_id = event_id
         self._rx, self._ry = play_res
-        row = db.conn.execute("SELECT text FROM events WHERE id=?", (event_id,)).fetchone()
-        self._orig_text = row["text"] if row else ""
+        ev = db.get_event(event_id)
+        self._orig_text = ev.text if ev else ""
+        # 이전 세션에서 '클립 그리기'만 누르고 닫았을 때 armed 상태가 새 세션의
+        # 첫 드래그를 클립으로 오인하지 않도록 리셋.
+        self._view.clip_mode = False
+        self._view.setCursor(Qt.CursorShape.ArrowCursor)
 
         pix = QPixmap(frame_path) if frame_path else QPixmap()
         if pix.isNull():
             pix = QPixmap(self._rx, self._ry)
             pix.fill(QColor("#222"))
-        self._img_w, self._img_h = pix.width(), pix.height()
+        # 0 나눗셈 방어 — 손상된 프레임/비정상 PlayRes 에도 좌표 환산이 죽지 않게.
+        self._img_w, self._img_h = max(1, pix.width()), max(1, pix.height())
 
         self._scene.clear()
         self._clip_item = None
@@ -339,8 +366,8 @@ class VideoEditPanel(QWidget):
         vx, vy = effective_position(self._orig_text, align, self._rx, self._ry)
         self._anchor = _AnchorItem(_plain(self._orig_text), align, self._img_h * 0.045)
         self._anchor.rotation_deg = get_rotation(self._orig_text)
-        self._anchor.scale_x = _num(_FSCX_RE, self._orig_text, 100.0)
-        self._anchor.scale_y = _num(_FSCY_RE, self._orig_text, 100.0)
+        self._anchor.scale_x = _tag_num(self._orig_text, "fscx", 100.0)
+        self._anchor.scale_y = _tag_num(self._orig_text, "fscy", 100.0)
         self._anchor.color = _initial_color(self._orig_text)
         self._anchor.setPos(self._vid_to_img(vx, vy))
         self._anchor.moved.connect(self._on_moved)
@@ -365,7 +392,8 @@ class VideoEditPanel(QWidget):
         self._scale_dirty = False
         self._color_dirty = False
         self._clip_dirty = False
-        has_anim = bool(_MOVE_RE.search(self._orig_text) or _ANIM_RE.search(self._orig_text))
+        has_anim = bool(find_tag(self._orig_text, "move")
+                        or find_tag(self._orig_text, "t"))
         self._warn.setText("⚠ \\move/\\t 애니메이션 — 드래그 적용 시 고정 위치로 대체됨"
                            if has_anim else "")
         self._view.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -471,7 +499,19 @@ class VideoEditPanel(QWidget):
         if self._db is None or self._anchor is None:
             self.closed.emit()
             return
-        text = self._orig_text
+        # 패널이 열려 있는 동안 메인 창은 계속 조작 가능하다(undo/바꾸기/인스펙터).
+        # load() 시점 스냅샷이 아니라 지금 DB 의 텍스트를 베이스로 태그를 얹어야
+        # 그 사이의 편집을 덮어쓰지 않는다. 줄이 삭제됐으면 조용히 닫는다.
+        try:
+            cur = self._db.get_event(self._event_id) if self._event_id else None
+        except Exception:  # 닫힌/교체된 DB — 프로젝트가 바뀐 경우
+            cur = None
+        if cur is None:
+            self._warn.setText("⚠ 편집하던 줄이 삭제되어 적용할 수 없습니다.")
+            self.closed.emit()
+            return
+        base_text = cur.text
+        text = base_text
         if self._clear_pos:
             text = remove_tag(text, "pos")
             text = remove_tag(text, "move")
@@ -494,7 +534,7 @@ class VideoEditPanel(QWidget):
                 x1, y1 = self._img_to_vid(r.topLeft())
                 x2, y2 = self._img_to_vid(r.bottomRight())
                 text = set_clip_rect(text, round(x1), round(y1), round(x2), round(y2))
-        if text != self._orig_text:
+        if text != base_text:
             self.committed.emit(
                 UpdateEventCommand(self._db, self._event_id, {"text": text}))
         else:
