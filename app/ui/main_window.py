@@ -500,14 +500,12 @@ class MainWindow(QMainWindow):
         self._autosave_timer.timeout.connect(self._do_autosave)
 
         # 라이브 영상 미리보기 — 편집을 임시 .ass 로 직렬화해 mpv 에 다시 로드.
-        # 같은 경로면 mpv 가 캐시할 수 있어 두 경로를 번갈아(ping-pong) 쓴다.
-        # 디바운스해 매 키 입력마다 재로드하지 않는다.
-        _ph = uuid.uuid4().hex[:8]
+        # 동일-경로 재로드는 MpvPlayer.load_subtitle 이 sub-reload 로 처리하므로
+        # 경로 하나면 충분하다. 디바운스해 매 키 입력마다 재로드하지 않는다.
         self._preview_paths = [
-            os.path.join(tempfile.gettempdir(), f"assforge_preview_{_ph}_a.ass"),
-            os.path.join(tempfile.gettempdir(), f"assforge_preview_{_ph}_b.ass"),
+            os.path.join(tempfile.gettempdir(),
+                         f"assforge_preview_{uuid.uuid4().hex[:8]}.ass"),
         ]
-        self._preview_idx = 0
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(220)
@@ -2393,8 +2391,7 @@ class MainWindow(QMainWindow):
                 and self._main_track_id):
             return
         self.inspector.flush_pending()
-        path = self._preview_paths[self._preview_idx]
-        self._preview_idx ^= 1  # 다음엔 다른 경로 — mpv 의 동일-경로 캐시 회피
+        path = self._preview_paths[0]
         try:
             self._write_ass_document(path)
         except Exception:

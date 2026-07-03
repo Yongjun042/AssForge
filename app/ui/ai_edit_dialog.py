@@ -295,8 +295,9 @@ class AiEditDialog(QDialog):
             self._show_proposal(payload)
 
     def reject(self) -> None:
-        # 실행 중인 CLI 를 먼저 죽여야 wait() 가 CLI 타임아웃(수 분)까지
-        # GUI 를 붙잡지 않는다.
+        # CLI 백엔드는 cancel() 로 프로세스가 죽는다. Ollama 처럼 HTTP 블로킹
+        # 중이라 취소가 안 통하는 경우도 있으므로 wait() 대신 release() —
+        # 스레드를 고아로 넘기고 즉시 닫아 GUI 가 얼지 않게 한다.
         self._runner.cancel()
-        self._runner.wait()
+        self._runner.release()
         super().reject()

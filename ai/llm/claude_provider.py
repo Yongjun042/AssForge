@@ -30,11 +30,15 @@ class ClaudeProvider(LLMProvider):
     def is_available(self) -> tuple[bool, str]:
         if not self._exe():
             return False, "claude CLI 미설치 (Claude Code 설치 후 `claude` 가 PATH 에 있어야 함)"
-        return True, f"claude CLI 사용 ({self.model or '기본 모델'})"
+        # 바이너리 존재만 확인 — 로그인 여부는 첫 호출에서 드러난다.
+        # (프리플라이트로 CLI 를 실제 실행하면 수 초씩 걸려 설정 UI 가 느려짐)
+        return True, f"claude CLI 사용 ({self.model or '기본 모델'}) — 로그인은 첫 실행 시 확인"
 
     def complete(
         self, system, user, *, temperature=0.2, max_tokens=2048, force_json=False,
     ) -> LLMResponse:
+        # NOTE: claude CLI 는 temperature/max_tokens 노브를 노출하지 않는다 —
+        # 두 인자는 시그니처 호환용으로 받되 적용되지 않는다 (ollama 만 적용).
         exe = self._exe()
         if not exe:
             raise LLMUnavailable("claude CLI 미설치")
@@ -62,6 +66,13 @@ class ClaudeProvider(LLMProvider):
 
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "").strip()
+            low = err.lower()
+            if "login" in low or "api key" in low or "unauthorized" in low \
+                    or "authentication" in low:
+                raise LLMResponseError(
+                    "claude CLI 인증 필요 — 터미널에서 `claude` 실행 후 "
+                    f"/login 으로 로그인하세요. (원문: {err[:200]})"
+                )
             raise LLMResponseError(
                 f"claude CLI 오류(코드 {proc.returncode}): {err[:300] or '출력 없음'}"
             )

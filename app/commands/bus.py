@@ -25,6 +25,22 @@ class Command(ABC):
         """Human-readable description for the undo menu."""
 
 
+# is_clean 의 도달 불가 기준점 — 히스토리 트림으로 저장/로드 시점의 상태로
+# 되돌아갈 수 없게 되면 이 센티널이 marker 가 되어 어떤 top 과도 일치하지 않는다.
+class _UnreachableMarker(Command):
+    def execute(self) -> None:  # pragma: no cover - 실행되지 않음
+        pass
+
+    def undo(self) -> None:  # pragma: no cover
+        pass
+
+    def description(self) -> str:  # pragma: no cover
+        return ""
+
+
+_CLEAN_UNREACHABLE = _UnreachableMarker()
+
+
 class CommandBus:
     """Dispatches commands and manages undo/redo history."""
 
@@ -44,7 +60,12 @@ class CommandBus:
         self._undo_stack.append(cmd)
         self._redo_stack.clear()
         if len(self._undo_stack) > self._max_history:
-            self._undo_stack.pop(0)
+            trimmed = self._undo_stack.pop(0)
+            # 트림된 편집은 undo 로 되돌릴 수 없다 — 저장 기준점이 빈 스택
+            # (None) 이거나 방금 트림된 커맨드였다면, 전부 undo 해서 스택이
+            # 비어도 문서에는 트림된 편집이 남아 있으므로 결코 clean 이 아니다.
+            if self._clean_marker is None or self._clean_marker is trimmed:
+                self._clean_marker = _CLEAN_UNREACHABLE
         self._notify()
 
     def undo(self) -> bool:

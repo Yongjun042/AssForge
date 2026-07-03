@@ -77,6 +77,7 @@ class MpvPlayer(QWidget):
         self._position_ms = 0
         self._seeking = False
         self._play_until_ms: int | None = None  # 구간 재생 시 멈출 지점
+        self._sub_path: str | None = None       # 현재 로드된 자막 경로
 
         self._build_ui()
 
@@ -285,6 +286,8 @@ class MpvPlayer(QWidget):
             return
         self._duration_ms = 0
         self._position_ms = 0
+        self._play_until_ms = None  # 이전 영상의 구간 재생 경계가 새 영상을 멈추지 않게
+        self._sub_path = None       # 새 파일에는 자막 트랙이 없다 — reload 폴백 방지
         self._lbl_time.setText(f"{_fmt(0)} / {_fmt(0)}")
         try:
             self._mpv.play(str(path))
@@ -321,6 +324,8 @@ class MpvPlayer(QWidget):
         self._poll.stop()
         self._duration_ms = 0
         self._position_ms = 0
+        self._play_until_ms = None
+        self._sub_path = None
         self._lbl_time.setText(f"{_fmt(0)} / {_fmt(0)}")
         self._slider.blockSignals(True)
         self._slider.setValue(0)
@@ -334,16 +339,29 @@ class MpvPlayer(QWidget):
         self.position_changed.emit(0)
 
     def load_subtitle(self, path: str) -> None:
-        """Load (or reload) a subtitle file into mpv."""
+        """Load (or reload) a subtitle file into mpv.
+
+        같은 경로를 다시 주면 sub-reload 로 디스크에서 다시 읽는다 — mpv 가
+        동일 경로 sub-add 를 캐시할 수 있어, 호출자가 경로를 번갈아 쓰는
+        우회(핑퐁) 없이도 라이브 미리보기 갱신이 동작한다.
+        """
         if self._mpv is None:
             return
+        path = str(path)
+        if path == self._sub_path:
+            try:
+                self._mpv.command("sub-reload")
+                return
+            except Exception:
+                pass  # 트랙이 없어졌거나 미지원 — 아래 remove+add 로 폴백
         try:
             # Remove existing subtitle tracks first
             self._mpv.command("sub-remove")
         except Exception:
             pass
         try:
-            self._mpv.command("sub-add", str(path), "select")
+            self._mpv.command("sub-add", path, "select")
+            self._sub_path = path
         except Exception:
             log.exception("Failed to load subtitle: %s", path)
 
@@ -365,6 +383,11 @@ class MpvPlayer(QWidget):
         except Exception:
             # No file loaded / not seekable yet — mpv raises MPV_ERROR_COMMAND.
             return
+        # 캐시를 목표 위치로 즉시 갱신 — 시킹 직후 F3(시작 마킹)/탭 타이밍이
+        # 폴링(40ms) 전의 낡은 위치를 읽지 않게 한다.
+        if self._duration_ms > 0:
+            ms = min(ms, self._duration_ms)
+        self._position_ms = max(0, int(ms))
         # Poll immediately to update UI
         QTimer.singleShot(50, self._poll_position)
 

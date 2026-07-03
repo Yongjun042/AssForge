@@ -36,6 +36,15 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
 }
 
 
+# SDK 시절(API 직접 호출) 저장값 → CLI 시절 값 마이그레이션.
+# 옛 llm.json 의 모델명이 그대로 CLI 에 넘어가면 codex 가 거부한다
+# (예: `codex exec -m gpt-4o-mini` → 400 unsupported model).
+_LEGACY_MODEL_MIGRATION: dict[str, dict[str, str]] = {
+    "openai": {"gpt-4o-mini": "", "gpt-4o": "", "gpt-4.1-mini": ""},
+    "claude": {"claude-sonnet-4-6": "sonnet", "claude-3-5-sonnet-latest": "sonnet"},
+}
+
+
 def _fresh_defaults() -> dict[str, dict[str, Any]]:
     return {k: dict(v) for k, v in _DEFAULTS.items()}
 
@@ -57,10 +66,21 @@ class LLMConfig:
                 return cfg
             cfg.active_provider = data.get("active_provider", cfg.active_provider)
             stored = data.get("providers", {})
+            migrated = False
             for name, defaults in _DEFAULTS.items():
                 merged = dict(defaults)
                 merged.update(stored.get(name, {}))
+                # SDK 시절 모델명이 남아 있으면 CLI 별칭으로 치환 (거부 방지)
+                legacy = _LEGACY_MODEL_MIGRATION.get(name, {})
+                if merged.get("model") in legacy:
+                    merged["model"] = legacy[merged["model"]]
+                    migrated = True
                 cfg.providers[name] = merged
+            if migrated:
+                try:
+                    cfg.save()  # 다음 로드부터는 마이그레이션 불필요
+                except OSError:
+                    pass
         return cfg
 
     def save(self) -> None:

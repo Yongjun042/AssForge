@@ -5,7 +5,7 @@ import math
 from typing import Optional, Sequence
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush, QColor, QPainter, QPainterPath, QPen, QPolygonF,
     QWheelEvent, QMouseEvent, QPaintEvent, QResizeEvent, QFont,
@@ -61,6 +61,12 @@ class TimelinePanel(QWidget):
         self._drag_orig_end = 0        # move/edge: 원래 값
         self._drag_committed = False   # 실제로 움직였는지 (클릭 vs 드래그 구분)
         self._region: tuple[int, int] | None = None  # 선택 구간 (start_ms, end_ms)
+
+        # 스크럽 시크 스로틀 — mpv 정밀 시크를 40ms 당 1회로 제한
+        self._scrub_pending_ms: int | None = None
+        self._scrub_timer = QTimer(self)
+        self._scrub_timer.setInterval(40)
+        self._scrub_timer.timeout.connect(self._flush_scrub)
 
         self._hbar = QScrollBar(Qt.Orientation.Horizontal, self)
         self._hbar.valueChanged.connect(self._on_scroll)
@@ -368,7 +374,12 @@ class TimelinePanel(QWidget):
             ms = self._x_to_ms(x)
             self._position_ms = ms
             self.update()
-            self.position_clicked.emit(ms)
+            # 시크는 ~40ms 로 스로틀 — 매 move 마다 mpv 정밀(hr) 시크를 쏘면
+            # 무거운 소스(.m2ts)에서 커서가 영상보다 한참 앞서 나간다.
+            # 마지막 위치는 release 에서 확정 시크한다.
+            self._scrub_pending_ms = ms
+            if not self._scrub_timer.isActive():
+                self._scrub_timer.start()
             return
 
         if mode == "region":
@@ -392,17 +403,38 @@ class TimelinePanel(QWidget):
             break
         self.update()
 
+    def _flush_scrub(self) -> None:
+        """스로틀 틱마다 가장 최근 스크럽 위치 하나만 시크로 내보낸다."""
+        if self._drag_mode != "scrub" or self._scrub_pending_ms is None:
+            self._scrub_timer.stop()
+            return
+        ms, self._scrub_pending_ms = self._scrub_pending_ms, None
+        self.position_clicked.emit(ms)
+
     def mouseReleaseEvent(self, ev: QMouseEvent) -> None:
         mode = self._drag_mode
         eid = self._drag_eid
         self._drag_mode = None
         self._drag_eid = None
 
+        if mode == "scrub":
+            # 스로틀에 걸려 아직 안 나간 마지막 위치를 확정 시크.
+            self._scrub_timer.stop()
+            if self._scrub_pending_ms is not None:
+                pending, self._scrub_pending_ms = self._scrub_pending_ms, None
+                self.position_clicked.emit(pending)
+            return
+
         if mode == "region":
             if self._region is not None:
                 a, b = sorted(self._region)
                 if b - a >= 20:  # 너무 짧은 드래그는 무시
                     self.region_selected.emit(a, b)
+                else:
+                    # Shift+클릭/초미세 드래그 — 반투명 밴드가 세션 내내
+                    # 남지 않도록 오버레이를 지운다.
+                    self._region = None
+                    self.update()
             return
 
         if not self._drag_committed:

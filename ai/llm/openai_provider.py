@@ -35,11 +35,14 @@ class OpenAIProvider(LLMProvider):
     def is_available(self) -> tuple[bool, str]:
         if not self._exe():
             return False, "codex CLI 미설치 (`npm i -g @openai/codex` 후 PATH 확인)"
-        return True, f"codex CLI 사용 ({self.model or 'codex 기본 모델'})"
+        # 바이너리 존재만 확인 — 로그인 여부는 첫 호출에서 드러난다.
+        return True, f"codex CLI 사용 ({self.model or 'codex 기본 모델'}) — 로그인은 첫 실행 시 확인"
 
     def complete(
         self, system, user, *, temperature=0.2, max_tokens=2048, force_json=False,
     ) -> LLMResponse:
+        # NOTE: codex CLI 는 temperature/max_tokens 노브를 노출하지 않는다 —
+        # 두 인자는 시그니처 호환용으로 받되 적용되지 않는다 (ollama 만 적용).
         exe = self._exe()
         if not exe:
             raise LLMUnavailable("codex CLI 미설치")
@@ -82,6 +85,19 @@ class OpenAIProvider(LLMProvider):
 
             if proc.returncode != 0 and not text:
                 err = (proc.stderr or "").strip()
+                low = err.lower()
+                if "login" in low or "unauthorized" in low or "authentication" in low \
+                        or "not logged in" in low:
+                    raise LLMResponseError(
+                        "codex CLI 인증 필요 — 터미널에서 `codex login` 을 "
+                        f"실행하세요. (원문: {err[:200]})"
+                    )
+                if "not supported" in low and "model" in low:
+                    raise LLMResponseError(
+                        f"codex 가 모델 '{self.model}' 을 지원하지 않습니다 — "
+                        "LLM 설정에서 모델을 비우면 codex 기본 모델을 씁니다. "
+                        f"(원문: {err[:200]})"
+                    )
                 raise LLMResponseError(
                     f"codex CLI 오류(코드 {proc.returncode}): {err[:300] or '출력 없음'}"
                 )

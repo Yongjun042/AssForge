@@ -85,6 +85,22 @@ AI 워크플로를 위한 ASS 자막 저작 도구. Python + PySide6 + mpv + FFm
       AI 메뉴 "AI 편집 (자연어/효과)..."(Ctrl+Shift+E).
 - 모든 LLM 결과는 미리보기 → 사용자 '적용' 후에만 cmd_bus 로 반영(suggestion-only, 단일 undo).
 
+### 코드 리뷰 후속 (2026-07-03) — 검증된 33건 전부 수정
+- **데이터 손실/파일 손상**: 그리드 재정렬이 저장에 반영(serializer 순서 매핑),
+  카라오케 \N 보존, 찾기/바꾸기 \\N 이스케이프·개행 살균·\p 드로잉 보호·
+  '선택 줄만' 스코프 스냅샷, flush_pending 누락 6곳, ⏱ 버튼 타깃/클램프.
+- **비주얼 편집**: 적용이 최신 DB 텍스트에 리베이스(스테일 덮어쓰기 제거),
+  닫힌 DB 크래시/clip_mode 누수/레거시 \a/\t 내부 태그 오독/색상 폼 수정.
+- **AI 동기화**: 취소 버튼 실동작(demucs kill + 단계 경계 중단), 클립 필터가
+  명시 선택을 제외하지 않음, demucs 무출력 행 감시(리더 스레드), 프로젝트
+  교체 시 결과 폐기, 이중 실행 차단, 클립 오디오 1패스 추출.
+- **LLM**: SDK 시절 llm.json 모델명 마이그레이션(codex 400 방지), Ollama 취소
+  시 GUI 프리즈 제거(release), 인증 오류 친절 메시지.
+- **mpv/타임라인/버스**: 구간재생 경계 리셋, sub-reload 로 핑퐁 제거, 스크럽
+  40ms 스로틀, 영역 밴드 잔류 제거, is_clean 트림 센티널, seek 즉시 캐시 갱신.
+- **정리**: kill_tree 공용화(core/subproc), 직렬화 단일화(_write_ass_document),
+  BulkUpdateTextsCommand(단일 커밋), select_by_ids 단일 QItemSelection 등.
+
 ## 마지막 업데이트
 - **날짜**: 2026-06-04
 - **상태**: Stage 3 핵심 골격 + Stage 4 코어 + LLM 편집(3 프로바이더) 구현 완료.
