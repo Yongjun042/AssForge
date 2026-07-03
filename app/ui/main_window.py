@@ -106,7 +106,7 @@ class _AiSyncWorker(QObject):
 
     Signals:
         progress(float, str): 0~1, 상태 메시지
-        finished(object, str): SyncResult 또는 None, 에러 메시지
+        finished(object, str): SyncResult 또는 None, 에러 메시지 (취소면 둘 다 빈 값)
     """
     progress = Signal(float, str)
     finished = Signal(object, str)
@@ -118,10 +118,19 @@ class _AiSyncWorker(QObject):
         self._track_id = track_id
         self._audio_source = audio_source
         self._options = options
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        """취소 요청 — 진행 다이얼로그의 '취소'에서 호출 (스레드 안전)."""
+        self._cancel.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
 
     def run(self) -> None:
         """별도 DB 연결로 sync 실행 (메인 스레드 DB 와 충돌 회피)."""
-        from ai.sync_service import run_sync
+        from ai.sync_service import SyncCancelled, run_sync
         from core.project.project_db import ProjectDB
         try:
             db = ProjectDB(self._db_path)
@@ -130,10 +139,14 @@ class _AiSyncWorker(QObject):
                 result = run_sync(
                     db, self._track_id, self._audio_source, self._options,
                     progress=lambda f, m: self.progress.emit(f, m),
+                    cancel_event=self._cancel,
                 )
             finally:
                 db.close()
             self.finished.emit(result, "")
+        except SyncCancelled:
+            log.info("AI sync 취소됨")
+            self.finished.emit(None, "")
         except Exception as exc:
             log.exception("AI sync failed")
             self.finished.emit(None, str(exc))
@@ -413,6 +426,16 @@ class _AiSyncOptionsDialog(QDialog):
         form.addRow(bb)
 
     def accept(self) -> None:
+        # 범위가 켜져 있는데 끝 <= 시작이면 조용히 무시(전체 전사)하지 말고
+        # 바로잡게 한다 — 사용자는 범위가 적용됐다고 믿게 되기 때문.
+        if self._clip_on.isChecked():
+            s = int(self._clip_start.value() * 1000)
+            e = int(self._clip_end.value() * 1000)
+            if e <= s:
+                QMessageBox.warning(
+                    self, "시간 범위 오류",
+                    "범위의 끝이 시작보다 커야 합니다. 값을 확인하세요.")
+                return
         self._settings.setValue("aiSyncLanguage", self._lang.currentData() or "")
         self._settings.setValue("aiSyncModel", self._model.currentText())
         if self._vocals.isEnabled():
@@ -1963,6 +1986,14 @@ class MainWindow(QMainWindow):
     def _run_ai_sync(self, only_selected: bool) -> None:
         if not self._db or not self._main_track_id:
             return
+        # 이전 sync 가 아직 도는 중이면 재시작 금지 — self._ai_thread 를
+        # 덮어쓰면 실행 중인 QThread 의 마지막 참조가 사라져 GC 시
+        # 'QThread: Destroyed while thread is still running' 크래시가 난다.
+        if (getattr(self, "_ai_thread", None) is not None
+                and self._ai_thread.isRunning()):
+            QMessageBox.information(self, "AI 동기화",
+                "이미 AI 동기화가 실행 중입니다. 완료(또는 취소) 후 다시 시도하세요.")
+            return
         if not self._video_path:
             QMessageBox.information(self, "AI 동기화",
                 "비디오/오디오 파일을 먼저 열어주세요.")
@@ -1977,11 +2008,13 @@ class MainWindow(QMainWindow):
         # 선택 재정렬이면 선택 줄들의 시간 범위를 기본값으로 넘긴다.
         sel_range = None
         if only_selected and only_ids and self._db:
-            sel_evs = [self._db.get_event(i) for i in only_ids]
-            sel_evs = [e for e in sel_evs if e is not None]
-            if sel_evs:
-                sel_range = (min(e.start_ms for e in sel_evs),
-                             max(e.end_ms for e in sel_evs))
+            marks = ",".join("?" * len(only_ids))
+            row = self._db.conn.execute(
+                f"SELECT MIN(start_ms) AS s, MAX(end_ms) AS e "
+                f"FROM events WHERE id IN ({marks})", only_ids,
+            ).fetchone()
+            if row is not None and row["s"] is not None:
+                sel_range = (int(row["s"]), int(row["e"]))
 
         from ai.sync_service import SyncOptions
         opt_dlg = _AiSyncOptionsDialog(self._settings, self, sel_range=sel_range)
@@ -2013,16 +2046,25 @@ class MainWindow(QMainWindow):
             self._db.db_path, self._main_track_id, self._video_path, options
         )
         self._ai_worker.moveToThread(self._ai_thread)
+        # 완료 시 어느 프로젝트에 결과를 쓸지 검증하기 위한 참조 — 그 사이
+        # 다른 파일을 열었으면(_db 교체) 결과를 버린다.
+        self._ai_db_ref = self._db
 
         self._ai_thread.started.connect(self._ai_worker.run)
         self._ai_worker.progress.connect(self._on_ai_progress)
         self._ai_worker.finished.connect(self._on_ai_finished)
         self._ai_worker.finished.connect(self._ai_thread.quit)
+        # '취소' → 워커에 취소 요청 (demucs 는 즉시 kill, whisper 는 다음
+        # 단계 경계에서 중단). 결과는 _on_ai_finished 에서 버려진다.
+        self._ai_progress.canceled.connect(self._ai_worker.cancel)
 
         self._ai_thread.start()
 
     def _on_ai_progress(self, frac: float, msg: str) -> None:
         if hasattr(self, "_ai_progress") and self._ai_progress is not None:
+            # 취소를 눌러 닫힌 다이얼로그를 setValue 가 되살리지 않게.
+            if self._ai_progress.wasCanceled():
+                return
             self._ai_progress.setLabelText(msg)
             self._ai_progress.setValue(int(frac * 100))
 
@@ -2030,6 +2072,16 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_ai_progress") and self._ai_progress is not None:
             self._ai_progress.close()
             self._ai_progress = None
+
+        # 취소했거나, 완료 전에 다른 프로젝트를 연 경우 결과를 버린다 —
+        # 엉뚱한 프로젝트의 undo 스택/dirty 플래그를 건드리지 않게.
+        worker = getattr(self, "_ai_worker", None)
+        if worker is not None and worker.cancelled:
+            self.statusBar().showMessage("AI 동기화 취소됨", 4000)
+            return
+        if getattr(self, "_ai_db_ref", None) is not self._db:
+            log.info("AI sync 결과 폐기 — 완료 전에 프로젝트가 바뀜")
+            return
 
         if error:
             QMessageBox.critical(self, "AI 동기화 실패", error)
@@ -2421,6 +2473,19 @@ class MainWindow(QMainWindow):
             t.quit()
         for t, _w in list(self._load_jobs):
             t.wait()
+        # 실행 중인 AI 동기화가 있으면 취소 요청(demucs 는 즉시 kill) 후
+        # 잠깐 기다린다. whisper 전사 중이면 중간 취소가 안 되므로 3초까지만 —
+        # 프로세스 종료가 나머지를 정리한다.
+        ai_worker = getattr(self, "_ai_worker", None)
+        ai_thread = getattr(self, "_ai_thread", None)
+        if ai_worker is not None and ai_thread is not None and ai_thread.isRunning():
+            try:
+                ai_worker.finished.disconnect()
+            except Exception:
+                pass
+            ai_worker.cancel()
+            ai_thread.quit()
+            ai_thread.wait(3000)
         self.video_player.close()
         if self._db:
             self._db.close()

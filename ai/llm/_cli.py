@@ -11,11 +11,10 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import sys
 import threading
 
-# Windows 에서 콘솔 창이 깜빡이지 않도록.
-_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+from core.subproc import CREATE_NO_WINDOW as _CREATE_NO_WINDOW
+from core.subproc import kill_tree as _kill_tree
 
 
 def find_cli(names: list[str]) -> str | None:
@@ -25,25 +24,6 @@ def find_cli(names: list[str]) -> str | None:
         if path:
             return path
     return None
-
-
-def _kill_tree(proc: subprocess.Popen) -> None:
-    """프로세스와 그 자식들까지 종료.
-
-    Windows 의 .CMD 셸은 실제 작업(node 등)을 자식으로 띄우므로 proc.kill()
-    만으로는 자식이 파이프를 쥔 채 살아남아 communicate() 가 계속 블록된다.
-    taskkill /T 로 트리 전체를 끊는다.
-    """
-    try:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True, creationflags=_CREATE_NO_WINDOW,
-            )
-        else:
-            proc.kill()
-    except Exception:
-        pass
 
 
 class CliCancelToken:

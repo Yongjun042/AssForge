@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -24,6 +25,15 @@ from core.project.project_db import EventRow, LockState, ProjectDB
 from media.ffmpeg_utils import cache_is_fresh, cache_key_for_source, extract_audio
 
 log = logging.getLogger(__name__)
+
+
+class SyncCancelled(RuntimeError):
+    """사용자 취소로 중단 — 실패가 아니므로 UI 는 에러 대신 조용히 정리한다."""
+
+
+def _check_cancel(cancel_event: Optional[threading.Event]) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise SyncCancelled("사용자가 취소했습니다.")
 
 
 @dataclass(slots=True)
@@ -54,6 +64,7 @@ def run_sync(
     audio_source: str,
     options: SyncOptions = SyncOptions(),
     progress: Optional[Callable[[float, str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> SyncResult:
     """AI 동기화 실행.
 
@@ -100,7 +111,14 @@ def run_sync(
             continue
         in_target = (target_set is None) or (ev.id in target_set) or is_locked
         if clip and not (ev.start_ms < clip_e and ev.end_ms > clip_s):
-            in_target = False  # 구간과 겹치지 않는 줄은 제외
+            # 구간과 겹치지 않는 줄은 제외 — 단, 사용자가 명시적으로 선택한
+            # unlocked 줄은 남긴다(시간이 어긋나 있어 이 구간으로 고치려는
+            # 것이므로 현재 시간으로 거르면 재정렬 자체가 불가능해진다).
+            # 구간 밖 LOCKED 앵커는 부분 transcript 에 어긋난 기준을 주므로 제외.
+            explicitly_selected = (target_set is not None and ev.id in target_set
+                                   and not is_locked)
+            if not explicitly_selected:
+                in_target = False
         if not in_target:
             n_off_target += 1
             continue
@@ -140,17 +158,23 @@ def run_sync(
             )
         raise RuntimeError(f"AI 동기화 중단: {reason}")
 
-    # 2) 오디오 준비 — 구간이 지정되면 그 부분만 추출(선택 영역 재정렬)
+    # 2) 오디오 준비 — 구간이 지정되면 그 부분만 추출(선택 영역 재정렬).
+    # 보컬 분리를 쓸 때만 44.1k 스테레오 중간 파일이 필요하다. 분리를 안 쓰면
+    # 16k mono 를 한 번에 추출해 ffmpeg 2중 디코드를 피한다.
     _p(0.02, "오디오 준비 중...")
+    _check_cancel(cancel_event)
     offset_ms = clip_s if clip else 0
+    sep_input = audio_source
     if clip:
-        clip_src = _extract_clip_source(audio_source, clip_s, clip_e)
-        if not clip_src:
-            raise RuntimeError("구간 오디오 추출에 실패했습니다 (FFmpeg 확인).")
-        sep_input = clip_src
-        wav_path = _to_whisper_wav(clip_src)
+        if options.separate_vocals:
+            clip_src = _extract_clip_source(audio_source, clip_s, clip_e)
+            if not clip_src:
+                raise RuntimeError("구간 오디오 추출에 실패했습니다 (FFmpeg 확인).")
+            sep_input = clip_src
+            wav_path = _to_whisper_wav(clip_src)
+        else:
+            wav_path = _extract_clip_wav_16k(audio_source, clip_s, clip_e)
     else:
-        sep_input = audio_source
         wav_path = _ensure_audio_wav(audio_source)
     if not wav_path:
         raise RuntimeError("오디오 추출에 실패했습니다 (FFmpeg 설치 확인).")
@@ -158,13 +182,16 @@ def run_sync(
     # 2.5) 보컬 분리 (선택) — 반주를 제거한 보컬 트랙으로 전사
     t0 = 0.05
     if options.separate_vocals:
+        _check_cancel(cancel_event)
         from ai.vocal_separation import is_available, separate_vocals
         ok, why = is_available()
         if not ok:
             raise RuntimeError(f"보컬 분리를 사용할 수 없습니다: {why}")
         vocals = separate_vocals(
             sep_input, progress=lambda f, m: _p(0.03 + 0.32 * f, m),
+            cancel_event=cancel_event,
         )
+        _check_cancel(cancel_event)
         if not vocals:
             raise RuntimeError(
                 "보컬 분리에 실패했습니다 (로그 확인). "
@@ -174,7 +201,8 @@ def run_sync(
         wav_path = vocals
         t0 = 0.35
 
-    # 3) 전사
+    # 3) 전사 (faster-whisper 는 중간 취소가 안 되므로 앞뒤 경계에서 확인)
+    _check_cancel(cancel_event)
     _p(t0, "Whisper 모델 준비 중...")
     try:
         result: TranscriptionResult = transcribe(
@@ -202,9 +230,9 @@ def run_sync(
              len(result.segments), offset_ms)
 
     # 4) 정렬 — DTW
+    _check_cancel(cancel_event)
     _p(0.78, "가사 정렬 중...")
-    audio_dur_ms = (_audio_duration_ms(wav_path) + offset_ms) if offset_ms \
-        else _audio_duration_ms(wav_path)
+    audio_dur_ms = _audio_duration_ms(wav_path) + offset_ms
     alignments = align_lines_to_transcript(
         align_input, result, language=detected_lang, audio_duration_ms=audio_dur_ms,
     )
@@ -232,7 +260,13 @@ def run_sync(
             s_ms = max(clip_s, min(s_ms, clip_e))
             e_ms = max(clip_s, min(e_ms, clip_e))
             if e_ms <= s_ms:
-                e_ms = min(clip_e, s_ms + 100)
+                # 상한 경계에 눌린 경우 시작을 뒤로 밀어 최소 100ms 를 확보 —
+                # 길이 0 제안은 수락 시 렌더되지 않는 이벤트가 된다.
+                if clip_e - clip_s >= 100:
+                    s_ms = max(clip_s, min(s_ms, clip_e - 100))
+                    e_ms = s_ms + 100
+                else:
+                    s_ms, e_ms = clip_s, clip_e
         conf = line_confidence(al)
         suggestions.append((al.event_id, s_ms, e_ms, conf))
         confs.append(conf)
@@ -282,6 +316,18 @@ def _extract_clip_source(path: str, start_ms: int, end_ms: int) -> Optional[str]
     if cache_is_fresh(str(out), path):
         return str(out)
     ok = extract_audio(str(path), str(out), sample_rate=44100, mono=False,
+                       start_ms=int(start_ms), end_ms=int(end_ms))
+    return str(out) if ok else None
+
+
+def _extract_clip_wav_16k(path: str, start_ms: int, end_ms: int) -> Optional[str]:
+    """[start,end] 구간을 Whisper 용 16k mono 로 한 번에 추출 (보컬 분리 미사용 시)."""
+    cache = Path(tempfile.gettempdir()) / "assforge_cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    out = cache / f"{cache_key_for_source(path)}_clip16k_{int(start_ms)}_{int(end_ms)}.wav"
+    if cache_is_fresh(str(out), path):
+        return str(out)
+    ok = extract_audio(str(path), str(out), sample_rate=16000, mono=True,
                        start_ms=int(start_ms), end_ms=int(end_ms))
     return str(out) if ok else None
 

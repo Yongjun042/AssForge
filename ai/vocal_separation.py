@@ -14,21 +14,22 @@ from __future__ import annotations
 
 import importlib.util
 import logging
-import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from core.subproc import CREATE_NO_WINDOW as _CREATE_NO_WINDOW
+from core.subproc import kill_tree as _kill_tree
 from media.ffmpeg_utils import cache_is_fresh, cache_key_for_source, extract_audio
 
 log = logging.getLogger(__name__)
-
-_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 # tqdm 진행 표시에서 % 추출 (demucs 는 stderr 에 \r 갱신으로 출력)
 _PCT_RE = re.compile(r"(\d{1,3})%\|")
@@ -41,24 +42,12 @@ def is_available() -> tuple[bool, str]:
     return True, "demucs 사용 가능"
 
 
-def _kill_tree(proc: subprocess.Popen) -> None:
-    try:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True, creationflags=_CREATE_NO_WINDOW,
-            )
-        else:
-            proc.kill()
-    except Exception:
-        pass
-
-
 def separate_vocals(
     source_path: str,
     progress: Optional[Callable[[float, str], None]] = None,
     model: str = "htdemucs",
     timeout_s: float = 3600.0,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Optional[str]:
     """source 의 보컬만 담긴 mono 16k WAV 경로를 반환. 실패 시 None.
 
@@ -108,19 +97,46 @@ def separate_vocals(
             text=True, encoding="utf-8", errors="replace",
             creationflags=_CREATE_NO_WINDOW,
         )
+        # 출력은 리더 스레드가 큐로 밀어 넣는다 — 메인 루프는 큐를 타임아웃
+        # 폴링하므로 demucs 가 아무 출력도 안 내고 멈춰도(모델 다운로드 정지 등)
+        # 데드라인/취소가 확실히 동작한다. 블로킹 read 후에만 데드라인을 보던
+        # 이전 구조에선 무출력 정지 시 timeout_s 가 영원히 발화하지 않았다.
         deadline = time.monotonic() + timeout_s
         tail: list[str] = []
         buf = ""
-        # tqdm 은 \r 로 갱신하므로 read(1) 단위로 \r/\n 분리해 % 를 뽑는다.
         assert proc.stdout is not None
+        chunks: "queue.Queue[str | None]" = queue.Queue()
+
+        def _reader() -> None:
+            try:
+                while True:
+                    c = proc.stdout.read(256)
+                    if not c:
+                        break
+                    chunks.put(c)
+            except Exception:
+                pass
+            finally:
+                chunks.put(None)  # EOF 표시
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
+
         while True:
-            chunk = proc.stdout.read(256)
-            if not chunk:
-                break
+            if cancel_event is not None and cancel_event.is_set():
+                _kill_tree(proc)
+                log.info("demucs 취소됨")
+                return None
             if time.monotonic() > deadline:
                 _kill_tree(proc)
                 log.error("demucs 시간 초과 (%.0fs)", timeout_s)
                 return None
+            try:
+                chunk = chunks.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if chunk is None:
+                break  # EOF
             buf += chunk
             while True:
                 cut = min(
