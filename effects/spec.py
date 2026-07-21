@@ -25,7 +25,7 @@ class ParamSpec:
     choices: tuple[str, ...] = ()
 
 
-# 11개 프리미티브 — 모두 결정적. slide 는 좌표 없으면 fade 로 강등,
+# 12개 프리미티브 — 모두 결정적. slide 는 좌표 없으면 fade 로 강등,
 # perspective 는 회전값이 모두 0 이면 무변화. (docs/ass-format-reference.md 근거)
 PRIMITIVES: dict[str, dict[str, Any]] = {
     "fade": {
@@ -117,6 +117,15 @@ PRIMITIVES: dict[str, dict[str, Any]] = {
     "outline_only": {
         "label": "외곽선만(채움 숨김)",
         "params": {},
+    },
+    # 회전 진입 — \frz<angle> 에서 \t 로 0°까지 풀리며 들어온다 (모션그래픽 스핀).
+    "spin": {
+        "label": "회전 진입(스핀)",
+        "params": {
+            "angle": ParamSpec("float", 180.0, "시작 각도(도)", -720, 720),
+            "duration_ms": ParamSpec("int", 400, "회전 시간(ms)", 50, 10000),
+            "fade": ParamSpec("bool", True, "페이드 인 동반"),
+        },
     },
 }
 

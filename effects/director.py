@@ -1,0 +1,252 @@
+"""자동 효과 연출(디렉터) — 자막 줄 목록에 모션그래픽풍 효과를 자동 배정.
+
+순수 코어 모듈: effects/ 프리미티브와 core/(typeset·tokenizer)만 사용, LLM/UI 무관.
+결정적이다 — 같은 입력(줄 목록·테마·강도)이면 항상 같은 연출이 나온다
+(난수 없이 줄 순번 기반 사이클 + 텍스트 휴리스틱).
+
+설계:
+  - 테마 = 레시피(효과 묶음 생성 함수) 사이클 + 색 팔레트.
+  - 줄마다: 주석/빈 줄은 건너뜀 → 특수 규칙(짧은 줄, 느낌표, 기존 \\k) →
+    아니면 사이클의 다음 레시피 적용.
+  - 이동(slide)은 좌표가 필요하므로 core.typeset.effective_position 으로
+    각 줄의 정렬 기반 기본 위치를 계산해 넣는다.
+적용은 UI 가 apply_specs → BulkUpdateTextsCommand(단일 undo)로 수행한다.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+
+from core.ass.tag_tokenizer import find_tag, strip_tags
+from core.typeset import effective_position
+from effects.spec import EffectSpec
+
+# SSA 레거시 \a → \an (video_edit_dialog 와 동일 매핑)
+_LEGACY_A_TO_AN = {1: 1, 2: 2, 3: 3, 5: 7, 6: 8, 7: 9, 9: 4, 10: 5, 11: 6}
+_EXCLAIM_RE = re.compile(r"[!！?？]")
+
+
+@dataclass(slots=True)
+class LineInput:
+    """연출 대상 줄 1개 — UI 가 EventRow 에서 추려서 전달."""
+    event_id: str
+    text: str
+    start_ms: int
+    end_ms: int
+    is_comment: bool = False
+
+    @property
+    def duration_ms(self) -> int:
+        return max(0, self.end_ms - self.start_ms)
+
+
+@dataclass(slots=True)
+class DirectedLine:
+    """줄 1개에 대한 연출 결과."""
+    event_id: str
+    specs: list[EffectSpec] = field(default_factory=list)
+    summary: str = ""
+
+
+def _alignment_of(text: str) -> int:
+    an = find_tag(text, "an")
+    if an is not None:
+        try:
+            v = int(an.args.strip())
+            if 1 <= v <= 9:
+                return v
+        except (TypeError, ValueError):
+            pass
+    a = find_tag(text, "a")
+    if a is not None:
+        try:
+            return _LEGACY_A_TO_AN.get(int(a.args.strip()), 2)
+        except (TypeError, ValueError):
+            pass
+    return 2
+
+
+def _has_karaoke(text: str) -> bool:
+    return any(find_tag(text, k) is not None for k in ("k", "kf", "ko", "kt", "K"))
+
+
+def _pos_of(line: LineInput, play_res: tuple[int, int]) -> tuple[int, int]:
+    rx, ry = play_res
+    vx, vy = effective_position(line.text, _alignment_of(line.text), rx, ry)
+    return round(vx), round(vy)
+
+
+def _scale(base: float, k: float, floor: float = 100.0) -> float:
+    """강도 k 로 (floor 기준) 진폭을 늘리거나 줄인다."""
+    return floor + (base - floor) * k
+
+
+# ---- 레시피 빌더 ------------------------------------------------------
+# 각 레시피는 (line, i, palette_color, k, play_res) -> (specs, summary)
+
+def _r_slide_color(line, i, color, k, play_res):
+    x, y = _pos_of(line, play_res)
+    direction = "left" if i % 2 == 0 else "right"
+    dur = min(400, max(200, line.duration_ms // 4))
+    return [
+        EffectSpec("slide", {"direction": direction, "distance": int(180 * k),
+                             "duration_ms": dur, "mode": "in", "x": x, "y": y}),
+        EffectSpec("karaoke_fill", {"from_color": color, "to_color": "#FFFFFF",
+                                    "duration_ms": 0}),
+    ], "슬라이드 인 + 색 스윕"
+
+
+def _r_pop_glow(line, i, color, k, play_res):
+    return [
+        EffectSpec("emphasis", {"scale": _scale(135, k), "attack_ms": 120}),
+        EffectSpec("glow", {"color": color, "blur": 5 * k, "bord": 2}),
+    ], "팝 강조 + 글로우"
+
+
+def _r_spin_color(line, i, color, k, play_res):
+    ang = (160 if i % 2 == 0 else -160) * k
+    return [
+        EffectSpec("spin", {"angle": ang, "duration_ms": 420, "fade": True}),
+        EffectSpec("karaoke_fill", {"from_color": color, "to_color": "#FFFFFF",
+                                    "duration_ms": 0}),
+    ], "회전 진입 + 색 스윕"
+
+
+def _r_bounce_fade(line, i, color, k, play_res):
+    return [
+        EffectSpec("bounce", {"amplitude": 22 * k, "cycles": 3, "duration_ms": 500}),
+        EffectSpec("fade", {"fade_in_ms": 150, "fade_out_ms": 250}),
+    ], "바운스 + 페이드"
+
+
+def _r_ghost(line, i, color, k, play_res):
+    return [
+        EffectSpec("fade_complex", {"start_alpha": 255, "mid_alpha": 0,
+                                    "end_alpha": 255, "fade_in_ms": 500,
+                                    "fade_out_ms": 600}),
+    ], "부드러운 등장/퇴장"
+
+
+def _r_soft_glow(line, i, color, k, play_res):
+    return [
+        EffectSpec("fade", {"fade_in_ms": 450, "fade_out_ms": 450}),
+        EffectSpec("glow", {"color": color, "blur": 3 * k, "bord": 1.5}),
+    ], "페이드 + 은은한 글로우"
+
+
+def _r_sweep_fade(line, i, color, k, play_res):
+    return [
+        EffectSpec("karaoke_fill", {"from_color": color, "to_color": "#FFFFFF",
+                                    "duration_ms": 0}),
+        EffectSpec("fade", {"fade_in_ms": 350, "fade_out_ms": 350}),
+    ], "색 스윕 + 페이드"
+
+
+def _r_tilt_fade(line, i, color, k, play_res):
+    return [
+        EffectSpec("perspective", {"frx": 10 * k, "fry": (8 if i % 2 else -8) * k,
+                                   "frz": 0}),
+        EffectSpec("fade", {"fade_in_ms": 400, "fade_out_ms": 400}),
+    ], "3D 기울기 + 페이드"
+
+
+def _r_big_pop_shake(line, i, color, k, play_res):
+    return [
+        EffectSpec("emphasis", {"scale": _scale(170, k), "attack_ms": 90}),
+        EffectSpec("shake", {"amplitude": 4 * k, "cycles": 8, "duration_ms": 600}),
+        EffectSpec("glow", {"color": color, "blur": 6 * k, "bord": 2.5}),
+    ], "큰 팝 + 흔들림 + 글로우"
+
+
+def _r_spin_full(line, i, color, k, play_res):
+    ang = (300 if i % 2 == 0 else -300) * k
+    return [
+        EffectSpec("spin", {"angle": ang, "duration_ms": 500, "fade": True}),
+        EffectSpec("glow", {"color": color, "blur": 5 * k, "bord": 2}),
+    ], "풀 스핀 + 글로우"
+
+
+def _r_fade_only(line, i, color, k, play_res):
+    return [EffectSpec("fade", {"fade_in_ms": 250, "fade_out_ms": 250})], "페이드"
+
+
+# ---- 테마 -------------------------------------------------------------
+
+THEMES: dict[str, dict] = {
+    "dynamic_pop": {
+        "label": "다이내믹 팝 (뮤직비디오)",
+        "palette": ["#33E0FF", "#FF66AA", "#FFD447", "#7CFF6B"],
+        "cycle": [_r_slide_color, _r_pop_glow, _r_spin_color, _r_bounce_fade],
+        "exclaim": _r_big_pop_shake,   # 느낌표/물음표 줄
+    },
+    "elegant": {
+        "label": "엘레강트 (잔잔한 발라드)",
+        "palette": ["#CFE8FF", "#FFE3F0", "#EDE6FF"],
+        "cycle": [_r_ghost, _r_soft_glow, _r_sweep_fade, _r_tilt_fade],
+        "exclaim": None,
+    },
+    "energetic": {
+        "label": "에너제틱 (강렬)",
+        "palette": ["#FF4D4D", "#FFB300", "#33E0FF", "#FF66AA"],
+        "cycle": [_r_big_pop_shake, _r_spin_full, _r_slide_color, _r_pop_glow],
+        "exclaim": _r_big_pop_shake,
+    },
+    "minimal": {
+        "label": "미니멀 (절제)",
+        "palette": ["#FFFFFF"],
+        "cycle": [_r_fade_only],
+        "exclaim": None,
+    },
+}
+
+
+def theme_names() -> list[tuple[str, str]]:
+    """[(key, label)] — UI 콤보 채우기용."""
+    return [(k, v["label"]) for k, v in THEMES.items()]
+
+
+def direct_effects(
+    lines: list[LineInput],
+    theme: str,
+    play_res: tuple[int, int] = (1920, 1080),
+    intensity: float = 1.0,
+) -> list[DirectedLine]:
+    """줄 목록에 테마 연출을 배정한다. 주석/빈 줄은 결과에서 제외.
+
+    intensity 0.5~1.5 — 진폭/각도/블러 스케일. 기존 \\k 카라오케 줄은
+    타이밍 태그와 충돌하지 않도록 은은한 글로우+페이드만 얹는다.
+    """
+    meta = THEMES.get(theme)
+    if meta is None:
+        raise ValueError(f"알 수 없는 테마: {theme!r}")
+    k = max(0.5, min(1.5, float(intensity)))
+    palette: list[str] = meta["palette"]
+    cycle = meta["cycle"]
+    exclaim = meta["exclaim"]
+
+    out: list[DirectedLine] = []
+    slot = 0  # 효과가 실제 배정된 줄 수 기준 사이클 위치
+    for line in lines:
+        if line.is_comment:
+            continue
+        plain = strip_tags(line.text).strip()
+        if not plain:
+            continue
+        color = palette[slot % len(palette)]
+
+        if _has_karaoke(line.text):
+            specs, summary = _r_soft_glow(line, slot, color, k, play_res)
+            summary += " (카라오케 보존)"
+        elif exclaim is not None and _EXCLAIM_RE.search(plain):
+            specs, summary = exclaim(line, slot, color, k, play_res)
+        elif line.duration_ms and line.duration_ms < 900:
+            # 아주 짧은 줄 — 큰 모션은 과하다.
+            specs, summary = _r_fade_only(line, slot, color, k, play_res)
+        else:
+            recipe = cycle[slot % len(cycle)]
+            specs, summary = recipe(line, slot, color, k, play_res)
+
+        out.append(DirectedLine(event_id=line.event_id, specs=specs,
+                                summary=summary))
+        slot += 1
+    return out

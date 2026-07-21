@@ -77,6 +77,17 @@ AI 워크플로를 위한 ASS 자막 저작 도구. Python + PySide6 + mpv + FFm
 - [x] **LLM Intent Parser** — `ai/effect_author.py`(자연어→EffectSpec),
       `ai/nl_commands.py`(자연어→EditOp), `app/commands/nl_apply.py`(→Command).
 
+### 자동 효과 연출 (모션그래픽) — 2026-07-03
+- [x] **spin 프리미티브** — 회전 진입(\\frz→\\t→0 + 선택 페이드). 12 프리미티브/16 프리셋.
+- [x] **effects/director.py** — 결정적 테마 엔진 4종(다이내믹 팝/엘레강트/에너제틱/미니멀):
+      줄 순번 사이클 + 팔레트 + 휴리스틱(짧은 줄→페이드, 느낌표→강조, \\k→은은한 보존),
+      slide 는 core.typeset.effective_position 으로 실좌표 \\move 생성. 강도 0.5~1.5.
+- [x] **ai/effect_director.py** — LLM 연출 모드: 전체 줄 목록+분위기 지시 → 줄별
+      EffectSpec 배정(JSON), 화이트리스트 검증, slide 좌표 자동 주입.
+- [x] **app/ui/auto_fx_dialog.py** — AI 메뉴 "자동 효과 연출 (모션그래픽)..."(Ctrl+Shift+X):
+      범위(전체/선택)·모드(테마/LLM)·강도·미리보기 표 → BulkUpdateTextsCommand 단일 undo.
+      _남음_: 테마 사용자 정의(팔레트/사이클 편집), 줄별 미리보기에서 개별 제외.
+
 ### LLM 통합 (3 프로바이더: Codex/Claude/Ollama)
 - [x] Provider 추상화 `ai/llm/`(base/registry/config + 3 구현, is_available 보고형).
 - [x] 설정 영속화 `ai/llm/config.py`(~/.assforge/llm.json, 환경변수 키 우선).

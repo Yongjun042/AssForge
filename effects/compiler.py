@@ -231,6 +231,17 @@ def _c_outline_only(p: dict[str, Any], ctx: EffectContext) -> CompiledEffect:
     return CompiledEffect(lead_block="{\\1a&HFF&}")
 
 
+def _c_spin(p: dict[str, Any], ctx: EffectContext) -> CompiledEffect:
+    ang = float(p["angle"])
+    dur = int(p["duration_ms"])
+    if ang == 0.0:
+        return CompiledEffect(notes=["시작 각도가 0 — 스핀 없음"])
+    parts = [f"\\frz{_num(ang)}", f"\\t(0,{dur},\\frz0)"]
+    if p["fade"]:
+        parts.append(f"\\fad({dur},0)")
+    return CompiledEffect(lead_block="{" + "".join(parts) + "}")
+
+
 _COMPILERS: dict[str, Callable[[dict[str, Any], EffectContext], CompiledEffect]] = {
     "fade": _c_fade,
     "emphasis": _c_emphasis,
@@ -243,6 +254,7 @@ _COMPILERS: dict[str, Callable[[dict[str, Any], EffectContext], CompiledEffect]]
     "fade_complex": _c_fade_complex,
     "perspective": _c_perspective,
     "outline_only": _c_outline_only,
+    "spin": _c_spin,
 }
 
 

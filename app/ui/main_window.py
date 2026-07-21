@@ -651,6 +651,7 @@ class MainWindow(QMainWindow):
         # AI
         am = mb.addMenu("AI(&I)")
         self._add_action(am, "AI 편집 (자연어/효과)...", "Ctrl+Shift+E", self._on_ai_edit)
+        self._add_action(am, "자동 효과 연출 (모션그래픽)...", "Ctrl+Shift+X", self._on_auto_fx)
         self._add_action(am, "LLM 설정...", "", self._on_llm_settings)
         am.addSeparator()
         self._add_action(am, "AI 동기화 실행 (전체)", "Ctrl+Shift+A", self._on_ai_sync_all)
@@ -2271,6 +2272,36 @@ class MainWindow(QMainWindow):
         self.cmd_bus.execute(CompositeCommand(cmds, "스타일 편집"))
         self._mark_modified()
         self._refresh_all()
+
+    def _on_auto_fx(self) -> None:
+        """모션그래픽풍 효과를 전체/선택 줄에 자동 배정 (테마 또는 LLM 연출)."""
+        if not self._db or not self._main_track_id:
+            return
+        self.inspector.flush_pending()
+        from app.ui.auto_fx_dialog import AutoFxDialog
+        from effects.director import LineInput
+        events = self._db.get_events(self._main_track_id)
+        if not events:
+            QMessageBox.information(self, "자동 효과 연출", "자막 줄이 없습니다.")
+            return
+        lines = [LineInput(event_id=e.id, text=e.text or "",
+                           start_ms=e.start_ms, end_ms=e.end_ms,
+                           is_comment=e.is_comment)
+                 for e in events]
+        selected = set(self.grid.selected_event_ids())
+        dlg = AutoFxDialog(lines, selected, self._play_res(), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        updates = dlg.result_updates()
+        if not updates:
+            return
+        from app.commands.edit_commands import BulkUpdateTextsCommand
+        self.cmd_bus.execute(BulkUpdateTextsCommand(
+            self._db, updates, f"자동 효과 연출 ({len(updates)}줄)"))
+        self._mark_modified()
+        self._refresh_all()
+        self.statusBar().showMessage(
+            f"자동 효과 적용: {len(updates)}줄 (Ctrl+Z 로 전체 취소)", 6000)
 
     def _on_video_edit(self) -> None:
         """현재 프레임 스냅샷 위에서 선택 줄의 \\pos 를 드래그로 편집."""

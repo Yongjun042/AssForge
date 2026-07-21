@@ -24,6 +24,7 @@ PRESETS: dict[str, tuple[str, EffectSpec]] = {
     "ghost_fade": ("고스트(반투명 유지)", EffectSpec("fade_complex", {"start_alpha": 255, "mid_alpha": 96, "end_alpha": 255, "fade_in_ms": 300, "fade_out_ms": 300})),
     "tilt_3d": ("3D 기울기", EffectSpec("perspective", {"frx": 18, "fry": -12, "frz": 0})),
     "outline_only": ("외곽선만", EffectSpec("outline_only", {})),
+    "spin_in": ("회전 진입", EffectSpec("spin", {"angle": 180, "duration_ms": 400, "fade": True})),
 }
 
 
