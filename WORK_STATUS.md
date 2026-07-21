@@ -82,11 +82,17 @@ AI 워크플로를 위한 ASS 자막 저작 도구. Python + PySide6 + mpv + FFm
 - [x] **effects/director.py** — 결정적 테마 엔진 4종(다이내믹 팝/엘레강트/에너제틱/미니멀):
       줄 순번 사이클 + 팔레트 + 휴리스틱(짧은 줄→페이드, 느낌표→강조, \\k→은은한 보존),
       slide 는 core.typeset.effective_position 으로 실좌표 \\move 생성. 강도 0.5~1.5.
+      + **direct_from_video()**: 장면 색/모션/밝기(LineScene)로 효과 선택.
+- [x] **media/video_analysis.py** — 영상 구간 1패스 저해상도(160x90, 2fps) 디코드 →
+      줄 구간별 지배색(채도 가중)·모션(프레임 차)·밝기. numpy, ffmpeg rawvideo 파이프.
+- [x] **영상 분석 모드** — 줄별 시간 구간 프레임을 분석해 색·움직임에 맞는 효과 자동 생성:
+      격한 장면=스핀/큰 팝/흔들림, 보통=슬라이드/팝, 잔잔=색 스윕/페이드, 어두우면 글로우 보강.
+      영상이 열려 있으면 기본 모드. 백그라운드(LLMTaskRunner) 실행·취소.
 - [x] **ai/effect_director.py** — LLM 연출 모드: 전체 줄 목록+분위기 지시 → 줄별
       EffectSpec 배정(JSON), 화이트리스트 검증, slide 좌표 자동 주입.
 - [x] **app/ui/auto_fx_dialog.py** — AI 메뉴 "자동 효과 연출 (모션그래픽)..."(Ctrl+Shift+X):
-      범위(전체/선택)·모드(테마/LLM)·강도·미리보기 표 → BulkUpdateTextsCommand 단일 undo.
-      _남음_: 테마 사용자 정의(팔레트/사이클 편집), 줄별 미리보기에서 개별 제외.
+      범위(전체/선택)·모드(영상 분석/테마/LLM)·강도·미리보기 표 → BulkUpdateTextsCommand 단일 undo.
+      _남음_: 테마 사용자 정의, 줄별 개별 제외, 장면 전환 경계 정렬(자막↔컷).
 
 ### LLM 통합 (3 프로바이더: Codex/Claude/Ollama)
 - [x] Provider 추상화 `ai/llm/`(base/registry/config + 3 구현, is_available 보고형).

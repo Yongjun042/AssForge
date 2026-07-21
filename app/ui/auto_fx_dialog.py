@@ -23,16 +23,43 @@ from effects import EffectContext, apply_specs
 from effects.director import DirectedLine, LineInput, direct_effects, theme_names
 
 
+def _analyze_and_direct(targets, video_path, play_res, intensity):
+    """(백그라운드) 영상 구간을 분석해 줄별 효과를 배정. (directed, 상태문구) 반환."""
+    from effects.director import LineScene, direct_from_video
+    from media.video_analysis import analyze_line_windows
+    if not video_path:
+        return [], "영상이 열려 있지 않습니다."
+    windows = [(t.start_ms, t.end_ms) for t in targets]
+    visuals = analyze_line_windows(video_path, windows)
+    scenes: dict[str, LineScene] = {}
+    ok_count = 0
+    if visuals:
+        for t, v in zip(targets, visuals):
+            ok = v.sampled > 0
+            ok_count += 1 if ok else 0
+            scenes[t.event_id] = LineScene(colors=v.dominant_colors,
+                                           motion=v.motion,
+                                           brightness=v.brightness, ok=ok)
+    directed = direct_from_video(targets, scenes, play_res=play_res,
+                                 intensity=intensity)
+    if not visuals:
+        note = "영상 분석 실패(FFmpeg 확인) — 기본 연출로 대체"
+    else:
+        note = f"영상 분석 완료 — {ok_count}/{len(targets)}줄 장면 반영"
+    return directed, note
+
+
 class AutoFxDialog(QDialog):
     def __init__(self, lines: list[LineInput], selected_ids: set[str],
-                 play_res: tuple[int, int],
+                 play_res: tuple[int, int], video_path: str | None = None,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("자동 효과 연출 (모션그래픽)")
-        self.resize(760, 620)
+        self.resize(760, 640)
         self._lines = lines
         self._selected_ids = selected_ids
         self._play_res = play_res
+        self._video_path = video_path
         self._updates: list[tuple[str, str]] = []
         self._runner = LLMTaskRunner(self)
         self._runner.done.connect(self._on_llm_done)
@@ -58,16 +85,22 @@ class AutoFxDialog(QDialog):
         # -- 모드 --
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("모드:"))
+        self._mode_video = QRadioButton("영상 분석 (장면 색·움직임)")
         self._mode_theme = QRadioButton("테마 (오프라인·즉시)")
-        self._mode_llm = QRadioButton("LLM 연출 (가사 분위기 분석)")
-        self._mode_theme.setChecked(True)
+        self._mode_llm = QRadioButton("LLM 연출 (가사 분위기)")
         g2 = QButtonGroup(self)
-        g2.addButton(self._mode_theme)
-        g2.addButton(self._mode_llm)
-        mode_row.addWidget(self._mode_theme)
-        mode_row.addWidget(self._mode_llm)
+        for b in (self._mode_video, self._mode_theme, self._mode_llm):
+            g2.addButton(b)
+            mode_row.addWidget(b)
         mode_row.addStretch(1)
         root.addLayout(mode_row)
+        # 영상이 있으면 영상 분석을 기본값으로 (요청의 핵심).
+        if video_path:
+            self._mode_video.setChecked(True)
+        else:
+            self._mode_video.setEnabled(False)
+            self._mode_video.setToolTip("영상을 먼저 열어야 분석할 수 있습니다.")
+            self._mode_theme.setChecked(True)
 
         # -- 테마 옵션 --
         theme_row = QHBoxLayout()
@@ -98,11 +131,12 @@ class AutoFxDialog(QDialog):
         root.addLayout(llm_row)
 
         def _sync_mode() -> None:
-            theme_on = self._mode_theme.isChecked()
-            self._theme.setEnabled(theme_on)
-            self._intensity.setEnabled(theme_on)
-            self._mood.setEnabled(not theme_on)
-        self._mode_theme.toggled.connect(_sync_mode)
+            self._theme.setEnabled(self._mode_theme.isChecked())
+            # 강도는 테마·영상 모드에서 유효, LLM 모드에선 무시.
+            self._intensity.setEnabled(not self._mode_llm.isChecked())
+            self._mood.setEnabled(self._mode_llm.isChecked())
+        for b in (self._mode_video, self._mode_theme, self._mode_llm):
+            b.toggled.connect(_sync_mode)
         _sync_mode()
 
         # -- 미리보기 --
@@ -126,8 +160,10 @@ class AutoFxDialog(QDialog):
         root.addWidget(self._table, 1)
 
         hint = QLabel(
-            "효과는 각 줄 맨 앞에 태그 블록으로 추가됩니다(기존 태그/텍스트 보존). "
-            "카라오케(\\k) 줄은 은은한 효과만 적용됩니다. 적용 후 Ctrl+Z 한 번으로 전체 취소.")
+            "영상 분석 모드는 각 줄 구간의 장면 색·움직임을 읽어 색/모션을 맞춥니다"
+            "(격한 장면=스핀·흔들림, 잔잔=페이드, 어두우면 글로우). "
+            "효과는 줄 맨 앞 태그로 추가되고 기존 태그/텍스트·카라오케(\\k)는 보존됩니다. "
+            "적용 후 Ctrl+Z 한 번으로 전체 취소.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#9aa0a6;")
         root.addWidget(hint)
@@ -155,18 +191,24 @@ class AutoFxDialog(QDialog):
         if not targets:
             self._status.setText("대상 줄이 없습니다.")
             return
+        k = self._intensity.value() / 100.0
         if self._mode_theme.isChecked():
-            directed = direct_effects(
+            self._fill_preview(direct_effects(
                 targets, self._theme.currentData(),
-                play_res=self._play_res,
-                intensity=self._intensity.value() / 100.0,
-            )
-            self._fill_preview(directed)
+                play_res=self._play_res, intensity=k))
+        elif self._mode_video.isChecked():
+            self._preview_btn.setEnabled(False)
+            self._status.setText("영상 분석 중... (구간 프레임 샘플링)")
+            path, res = self._video_path, self._play_res
+
+            def _job(targets=targets, path=path, res=res, k=k):
+                return _analyze_and_direct(targets, path, res, k)
+
+            self._runner.start(_job)
         else:
             self._preview_btn.setEnabled(False)
             self._status.setText("LLM 연출 생성 중... (수십 초 걸릴 수 있음)")
-            mood = self._mood.text()
-            res = self._play_res
+            mood, res = self._mood.text(), self._play_res
 
             def _job(targets=targets, mood=mood, res=res):
                 from ai.effect_director import direct_with_llm
@@ -178,6 +220,16 @@ class AutoFxDialog(QDialog):
         self._preview_btn.setEnabled(True)
         if error:
             self._status.setText(f"실패: {error}")
+            return
+        # 영상 분석 모드는 (directed, note) 튜플, LLM 모드는 DirectorProposal.
+        if isinstance(result, tuple):
+            directed, note = result
+            if not directed:
+                self._status.setText(note or "분석 결과가 없습니다.")
+                return
+            if note:
+                self._status.setText(note)
+            self._fill_preview(directed)
             return
         if result is None or result.errors:
             msg = "; ".join(result.errors) if result is not None else "결과 없음"

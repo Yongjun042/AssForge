@@ -2289,7 +2289,8 @@ class MainWindow(QMainWindow):
                            is_comment=e.is_comment)
                  for e in events]
         selected = set(self.grid.selected_event_ids())
-        dlg = AutoFxDialog(lines, selected, self._play_res(), self)
+        dlg = AutoFxDialog(lines, selected, self._play_res(),
+                           video_path=self._video_path, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         updates = dlg.result_updates()

@@ -205,6 +205,87 @@ def theme_names() -> list[tuple[str, str]]:
     return [(k, v["label"]) for k, v in THEMES.items()]
 
 
+@dataclass(slots=True)
+class LineScene:
+    """줄 구간의 영상 분석 결과 (media.video_analysis.LineVisual 에서 옮겨 담음).
+
+    effects/ 는 media/ 에 의존하지 않으므로(레이어링) 필요한 필드만 받는다.
+    """
+    colors: list[str] = field(default_factory=list)
+    motion: float = 0.0       # 0~1
+    brightness: float = 0.5   # 0~1
+    ok: bool = False          # 분석 성공 여부
+
+
+def direct_from_video(
+    lines: list[LineInput],
+    scenes: dict[str, "LineScene"],
+    play_res: tuple[int, int] = (1920, 1080),
+    intensity: float = 1.0,
+) -> list[DirectedLine]:
+    """영상 분석(scenes[event_id])에 맞춰 줄별 효과를 배정한다.
+
+    - 색: 장면 지배색을 자막 색 스윕/글로우에 사용(대비를 위해 →흰색으로 스윕).
+    - 모션: 격한 장면(>0.55)은 스핀/흔들림, 중간은 슬라이드/팝, 잔잔하면 페이드.
+    - 밝기: 어두운 장면은 글로우를 얹어 가독성 확보.
+    분석 실패 줄(ok=False)은 dynamic_pop 사이클로 폴백.
+    짧은 줄/느낌표/카라오케 규칙은 테마 모드와 동일하게 적용.
+    """
+    k = max(0.5, min(1.5, float(intensity)))
+    fallback = THEMES["dynamic_pop"]
+    out: list[DirectedLine] = []
+    slot = 0
+    for line in lines:
+        if line.is_comment:
+            continue
+        plain = strip_tags(line.text).strip()
+        if not plain:
+            continue
+        sc = scenes.get(line.event_id)
+        color = (sc.colors[0] if sc and sc.colors else
+                 fallback["palette"][slot % len(fallback["palette"])])
+
+        if _has_karaoke(line.text):
+            specs, summary = _r_soft_glow(line, slot, color, k, play_res)
+            summary += " (카라오케 보존)"
+        elif line.duration_ms and line.duration_ms < 900:
+            specs, summary = _r_fade_only(line, slot, color, k, play_res)
+        elif sc is None or not sc.ok:
+            recipe = fallback["cycle"][slot % len(fallback["cycle"])]
+            specs, summary = recipe(line, slot, color, k, play_res)
+            summary += " (분석 실패→기본)"
+        else:
+            motion, bright = sc.motion, sc.brightness
+            has_excl = bool(_EXCLAIM_RE.search(plain))
+            if motion > 0.55 or has_excl:
+                # 격한 장면 — 스핀/큰 팝, 모션 비례로 강도 부스트
+                boost = k * (1.0 + min(0.5, motion))
+                if slot % 2 == 0:
+                    specs, summary = _r_spin_color(line, slot, color, boost, play_res)
+                else:
+                    specs, summary = _r_big_pop_shake(line, slot, color, boost, play_res)
+                summary = f"[격한 장면] {summary}"
+            elif motion > 0.25:
+                if slot % 2 == 0:
+                    specs, summary = _r_slide_color(line, slot, color, k, play_res)
+                else:
+                    specs, summary = _r_pop_glow(line, slot, color, k, play_res)
+                summary = f"[보통 장면] {summary}"
+            else:
+                specs, summary = _r_sweep_fade(line, slot, color, k, play_res)
+                summary = f"[잔잔한 장면] {summary}"
+            # 어두운 장면엔 글로우 보강 (이미 글로우면 중복 안 함)
+            if bright < 0.3 and not any(s.primitive == "glow" for s in specs):
+                specs.append(EffectSpec("glow", {"color": color, "blur": 4 * k,
+                                                 "bord": 2}))
+                summary += " +가독 글로우"
+
+        out.append(DirectedLine(event_id=line.event_id, specs=specs,
+                                summary=summary))
+        slot += 1
+    return out
+
+
 def direct_effects(
     lines: list[LineInput],
     theme: str,
