@@ -1,11 +1,13 @@
 """영상 분석 — 자막 줄별 시간 구간의 장면 색·모션을 추출한다 (자동 효과 연출용).
 
-한 번의 ffmpeg 디코드(저해상도·저fps rawvideo 파이프)로 필요한 구간 전체를
-샘플링하고, numpy 로 프레임을 줄 구간에 배정해:
-  - dominant_colors: 채도 가중 히스토그램 상위 색 (자막 색이 장면과 어울리게)
-  - motion: 인접 샘플 프레임 평균 절대차 0~1 (격한 장면 판별)
-  - brightness: 평균 루마 0~1 (어두운 장면 → 글로우로 가독성 확보)
-를 계산한다. 순수 분석 모듈 — 효과 배정은 effects.director 가 한다.
+한 번의 ffmpeg 디코드로 필요한 구간 전체를 **영상 원본 프레임레이트**로
+샘플링한다(저해상도 rawvideo 파이프). 프레임 수가 많으므로 전부 쌓지 않고
+스트리밍으로 각 줄 창(window)에 누적한다:
+  - dominant_colors / color_start / color_end: 채도 가중 색 히스토그램
+  - motion: 인접 프레임 평균 절대차(초당 정규화) 0~1
+  - brightness: 평균 루마 0~1
+  - 그래픽(돌출 영역) 중심의 프레임별 궤적 → 시작/끝 위치·이동
+순수 분석 모듈 — 효과 배정은 effects.director 가 한다.
 """
 from __future__ import annotations
 
@@ -16,13 +18,17 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from core.subproc import CREATE_NO_WINDOW, kill_tree
-from media.ffmpeg_utils import find_ffmpeg
+from media.ffmpeg_utils import find_ffmpeg, get_video_info
 
 log = logging.getLogger(__name__)
 
 _W, _H = 160, 90          # 분석 해상도 — 색/모션엔 충분, 디코드 빠름
-_FPS = 2.0                # 초당 2프레임 샘플
 _FRAME_BYTES = _W * _H * 3
+_MAX_FPS = 60.0           # 이 이상은 분석 이득이 없다
+_FALLBACK_FPS = 23.976    # fps 프로브 실패 시 (BD 표준)
+_ENDPOINT_MS = 150.0      # 경로 끝점 = 창 앞/뒤 150ms 중앙값 (노이즈 억제)
+
+_YS, _XS = np.mgrid[0:_H, 0:_W]
 
 
 @dataclass(slots=True)
@@ -39,76 +45,80 @@ class LineVisual:
     drift_y: float = 0.0
     salient: float = 0.0      # 돌출 영역 비중 0~1 (0이면 그래픽 감지 실패)
     # 시작→끝 경로/색 (구간 내 변화를 그대로 따라가기 위한 끝점들)
-    gx0: float = 0.5          # 구간 시작 시점 중심
+    gx0: float = 0.5
     gy0: float = 0.5
-    gx1: float = 0.5          # 구간 끝 시점 중심
+    gx1: float = 0.5
     gy1: float = 0.5
     color_start: str = "#FFFFFF"   # 구간 앞 1/3 지배색
     color_end: str = "#FFFFFF"     # 구간 뒤 1/3 지배색
 
 
-def _saliency_centroids(sub: np.ndarray) -> tuple[float, float, float, float, float]:
-    """프레임 묶음에서 돌출(그래픽) 영역의 평균 중심과 구간 이동을 추정.
+class _ColorAcc:
+    """512-bin 양자화 색 누적기 — 프레임을 쌓지 않고 지배색을 구한다."""
 
-    돌출 가중치 = 채도 + 고휘도 보정 — 색 있는 모션그래픽은 채도로,
-    흰 자막/로고는 고휘도로 잡힌다. 반환: (gx, gy, drift_x, drift_y, salient)
-    """
-    n, h, w, _ = sub.shape
-    px = sub.astype(np.int16)
-    mx = px.max(axis=3)
-    mn = px.min(axis=3)
-    sat = (mx - mn).astype(np.float64)                    # (N,H,W)
-    luma = px.mean(axis=3)
-    weight = sat + np.maximum(0.0, luma - 200.0) * 1.5    # 흰 텍스트 보정
-    ys, xs = np.mgrid[0:h, 0:w]
-    cxs, cys, mass = [], [], []
-    for i in range(n):
-        wsum = float(weight[i].sum())
-        if wsum <= 1e-6:
-            continue
-        cxs.append(float((weight[i] * xs).sum() / wsum) / max(1, w - 1))
-        cys.append(float((weight[i] * ys).sum() / wsum) / max(1, h - 1))
-        # 상위 가중 픽셀 비중 — 배경 대비 그래픽이 얼마나 도드라지는지
-        thr = weight[i].mean() + weight[i].std() * 2.0
-        mass.append(float((weight[i] > thr).mean()))
-    if not cxs:
-        return 0.5, 0.5, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5
-    gx = float(np.mean(cxs))
-    gy = float(np.mean(cys))
-    dx = float(cxs[-1] - cxs[0]) if len(cxs) > 1 else 0.0
-    dy = float(cys[-1] - cys[0]) if len(cys) > 1 else 0.0
-    return (gx, gy, max(-1.0, min(1.0, dx)), max(-1.0, min(1.0, dy)),
-            float(np.mean(mass)),
-            float(cxs[0]), float(cys[0]), float(cxs[-1]), float(cys[-1]))
+    __slots__ = ("whist", "rsum", "gsum", "bsum", "cnt")
+
+    def __init__(self) -> None:
+        self.whist = np.zeros(512)
+        self.rsum = np.zeros(512)
+        self.gsum = np.zeros(512)
+        self.bsum = np.zeros(512)
+        self.cnt = np.zeros(512)
+
+    def add(self, bins: np.ndarray, weight: np.ndarray, px: np.ndarray) -> None:
+        self.whist += np.bincount(bins, weights=weight, minlength=512)
+        self.rsum += np.bincount(bins, weights=px[:, 0], minlength=512)
+        self.gsum += np.bincount(bins, weights=px[:, 1], minlength=512)
+        self.bsum += np.bincount(bins, weights=px[:, 2], minlength=512)
+        self.cnt += np.bincount(bins, minlength=512)
+
+    def top_colors(self, top: int = 2) -> list[str]:
+        out: list[str] = []
+        for b in np.argsort(self.whist)[::-1]:
+            if self.whist[b] <= 0 or len(out) >= top:
+                break
+            c = max(1.0, self.cnt[b])
+            r, g, bl = (int(self.rsum[b] / c), int(self.gsum[b] / c),
+                        int(self.bsum[b] / c))
+            if max(r, g, bl) < 40:      # 거의 검정 — 자막 색으로 부적합
+                continue
+            peak = max(r, g, bl)
+            if peak < 120:              # 너무 어두우면 보이도록 끌어올림
+                k = 150 / max(1, peak)
+                r, g, bl = (min(255, int(r * k)), min(255, int(g * k)),
+                            min(255, int(bl * k)))
+            out.append(f"#{r:02X}{g:02X}{bl:02X}")
+        return out or ["#FFFFFF"]
 
 
-def _dominant_colors(frames: np.ndarray, top: int = 2) -> list[str]:
-    """프레임 묶음에서 채도 가중 상위 색상. 회색/검정 배경에 지지 않게 한다."""
-    px = frames.reshape(-1, 3).astype(np.int32)
-    # 3bit/채널 양자화 → 512 bins
-    q = (px >> 5)
-    bins = (q[:, 0] << 6) | (q[:, 1] << 3) | q[:, 2]
-    mx = px.max(axis=1)
-    mn = px.min(axis=1)
-    sat = (mx - mn).astype(np.float64)          # 대략적 채도
-    weight = sat + 8.0                           # 무채색도 약간의 표는 갖는다
-    hist = np.bincount(bins, weights=weight, minlength=512)
-    out: list[str] = []
-    for b in np.argsort(hist)[::-1]:
-        if hist[b] <= 0 or len(out) >= top:
-            break
-        mask = bins == b
-        r, g, bl = px[mask].mean(axis=0).astype(int)
-        # 거의 검정은 자막 색으로 부적합 — 건너뜀
-        if max(r, g, bl) < 40:
-            continue
-        # 너무 어두우면 보이도록 끌어올린다
-        peak = max(r, g, bl)
-        if peak < 120:
-            k = 150 / max(1, peak)
-            r, g, bl = min(255, int(r * k)), min(255, int(g * k)), min(255, int(bl * k))
-        out.append(f"#{r:02X}{g:02X}{bl:02X}")
-    return out or ["#FFFFFF"]
+class _WinAcc:
+    """줄 창 하나의 스트리밍 누적기."""
+
+    __slots__ = ("s_ms", "e_ms", "n", "bright", "motion", "mcount", "sal",
+                 "cents", "full", "early", "late")
+
+    def __init__(self, s_ms: int, e_ms: int) -> None:
+        self.s_ms = s_ms
+        self.e_ms = max(e_ms, s_ms + 1)
+        self.n = 0
+        self.bright = 0.0
+        self.motion = 0.0
+        self.mcount = 0
+        self.sal = 0.0
+        self.cents: list[tuple[float, float, float]] = []  # (ts, cx, cy)
+        self.full = _ColorAcc()
+        self.early = _ColorAcc()
+        self.late = _ColorAcc()
+
+
+def _probe_fps(video_path: str) -> float:
+    try:
+        fps = float(get_video_info(video_path).get("fps") or 0.0)
+    except Exception:
+        fps = 0.0
+    if fps <= 0.5:
+        fps = _FALLBACK_FPS
+    return min(_MAX_FPS, fps)
 
 
 def analyze_line_windows(
@@ -118,7 +128,7 @@ def analyze_line_windows(
 ) -> list[LineVisual] | None:
     """windows[i]=(start_ms,end_ms) 각 구간의 LineVisual 목록. 실패 시 None.
 
-    [min(start), max(end)] 구간만 저해상도로 1패스 디코드한다.
+    [min(start), max(end)] 구간을 영상 원본 fps(최대 60)로 1패스 디코드한다.
     cancel_check(): True 를 돌려주면 중단하고 None.
     """
     ffmpeg = find_ffmpeg()
@@ -129,14 +139,28 @@ def analyze_line_windows(
     if span_e <= span_s:
         return None
 
+    fps = _probe_fps(video_path)
+    frame_ms = 1000.0 / fps
+    log.info("영상 분석: %.3f~%.3fs @ %.3ffps (원본 프레임 단위)",
+             span_s, span_e, fps)
+
     args = [
         ffmpeg, "-v", "error",
         "-ss", f"{span_s:.3f}", "-to", f"{span_e:.3f}",
         "-i", video_path,
-        "-vf", f"fps={_FPS},scale={_W}:{_H}",
+        "-vf", f"fps={fps:.6f},scale={_W}:{_H}",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ]
-    frames: list[np.ndarray] = []
+
+    # 창 누적기 — 시작시간 순으로 훑되 결과는 원래 순서로 돌려준다.
+    accs = [_WinAcc(s, e) for s, e in windows]
+    order = sorted(range(len(accs)), key=lambda i: accs[i].s_ms)
+    next_ptr = 0
+    active: list[_WinAcc] = []
+
+    prev: np.ndarray | None = None
+    frame_i = 0
+    got_any = False
     try:
         proc = subprocess.Popen(
             args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -150,47 +174,109 @@ def analyze_line_windows(
             buf = proc.stdout.read(_FRAME_BYTES)
             if len(buf) < _FRAME_BYTES:
                 break
-            frames.append(
-                np.frombuffer(buf, dtype=np.uint8).reshape(_H, _W, 3))
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape(_H, _W, 3)
+            ts = span_s * 1000.0 + frame_i * frame_ms
+            frame_i += 1
+            got_any = True
+
+            # 활성 창 갱신
+            while next_ptr < len(order) and accs[order[next_ptr]].s_ms <= ts:
+                active.append(accs[order[next_ptr]])
+                next_ptr += 1
+            if active:
+                active = [a for a in active if ts < a.e_ms]
+            if not active and next_ptr >= len(order):
+                kill_tree(proc)   # 남은 창 없음 — 조기 종료
+                break
+            # 이 프레임이 어느 창에도 안 속하면 diff 기준만 갱신
+            if not active:
+                prev = frame.astype(np.int16)
+                continue
+
+            px16 = frame.astype(np.int16)
+            flat = px16.reshape(-1, 3)
+            mx = flat.max(axis=1)
+            mn = flat.min(axis=1)
+            sat_flat = (mx - mn).astype(np.float64)
+            luma_flat = flat.mean(axis=1)
+            bright = float(luma_flat.mean() / 255.0)
+
+            diff = 0.0
+            has_diff = prev is not None
+            if has_diff:
+                diff = float(np.abs(px16 - prev).mean())
+            prev = px16
+
+            # 돌출(그래픽) 가중 — 채도 + 고휘도 보정
+            wmap = sat_flat + np.maximum(0.0, luma_flat - 200.0) * 1.5
+            wsum = float(wmap.sum())
+            if wsum > 1e-6:
+                w2d = wmap.reshape(_H, _W)
+                cx = float((w2d * _XS).sum() / wsum) / max(1, _W - 1)
+                cy = float((w2d * _YS).sum() / wsum) / max(1, _H - 1)
+                thr = wmap.mean() + wmap.std() * 2.0
+                mass = float((wmap > thr).mean())
+            else:
+                cx, cy, mass = 0.5, 0.5, 0.0
+
+            # 색 히스토그램 (양자화 3bit/채널)
+            q = (flat >> 5)
+            bins = ((q[:, 0] << 6) | (q[:, 1] << 3) | q[:, 2]).astype(np.int64)
+            weight = sat_flat + 8.0
+
+            for a in active:
+                a.n += 1
+                a.bright += bright
+                if has_diff:
+                    a.motion += diff
+                    a.mcount += 1
+                a.sal += mass
+                a.cents.append((ts, cx, cy))
+                a.full.add(bins, weight, flat)
+                t_frac = (ts - a.s_ms) / (a.e_ms - a.s_ms)
+                if t_frac < 1 / 3:
+                    a.early.add(bins, weight, flat)
+                elif t_frac > 2 / 3:
+                    a.late.add(bins, weight, flat)
         proc.wait(timeout=10)
     except Exception:
         log.exception("영상 분석 디코드 실패")
         return None
-    if not frames:
+    if not got_any:
         return None
 
-    stack = np.stack(frames)                       # (N, H, W, 3)
-    # 프레임 i 의 타임스탬프(ms) — 디코드 시작(span_s) 기준
-    ts = span_s * 1000.0 + np.arange(len(frames)) * (1000.0 / _FPS)
-    # 인접 프레임 평균 절대차 (0~255) — 전역 정규화용 스케일
-    diffs = np.zeros(len(frames))
-    if len(frames) > 1:
-        d = np.abs(stack[1:].astype(np.int16) - stack[:-1].astype(np.int16))
-        diffs[1:] = d.mean(axis=(1, 2, 3))
-
     out: list[LineVisual] = []
-    for s_ms, e_ms in windows:
-        idx = np.where((ts >= s_ms) & (ts < max(e_ms, s_ms + 1)))[0]
-        if idx.size == 0:
-            # 구간이 샘플 간격보다 짧음 — 가장 가까운 프레임 1장
-            near = int(np.argmin(np.abs(ts - (s_ms + e_ms) / 2)))
-            idx = np.array([near])
-        sub = stack[idx]
-        gx, gy, dx, dy, sal, gx0, gy0, gx1, gy1 = _saliency_centroids(sub)
-        # 구간 앞/뒤 1/3 의 지배색 — 그래픽 색 변화도 그대로 따라가게
-        n3 = max(1, len(idx) // 3)
-        c_start = _dominant_colors(stack[idx[:n3]])
-        c_end = _dominant_colors(stack[idx[-n3:]])
-        vis = LineVisual(
-            dominant_colors=_dominant_colors(sub),
-            # 25 이상의 평균차는 '격한' 장면으로 포화
-            motion=float(min(1.0, diffs[idx].mean() / 25.0)) if idx.size else 0.0,
-            brightness=float(sub.mean() / 255.0),
-            sampled=int(idx.size),
-            gx=gx, gy=gy, drift_x=dx, drift_y=dy, salient=sal,
+    for a in accs:
+        if a.n == 0:
+            out.append(LineVisual(sampled=0))
+            continue
+        colors = a.full.top_colors()
+        c_start = (a.early.top_colors() if a.early.cnt.sum() else colors)[0]
+        c_end = (a.late.top_colors() if a.late.cnt.sum() else colors)[0]
+
+        cents = a.cents
+        gx = float(np.mean([c[1] for c in cents]))
+        gy = float(np.mean([c[2] for c in cents]))
+        # 끝점 = 창 앞/뒤 _ENDPOINT_MS 구간의 중앙값 (프레임 노이즈 억제)
+        head = [c for c in cents if c[0] <= a.s_ms + _ENDPOINT_MS] or [cents[0]]
+        tail = [c for c in cents if c[0] >= a.e_ms - _ENDPOINT_MS] or [cents[-1]]
+        gx0 = float(np.median([c[1] for c in head]))
+        gy0 = float(np.median([c[2] for c in head]))
+        gx1 = float(np.median([c[1] for c in tail]))
+        gy1 = float(np.median([c[2] for c in tail]))
+
+        # 초당 변화량으로 정규화 — 50/s 이상이면 '격한' 장면으로 포화
+        motion_ps = (a.motion / a.mcount) * fps if a.mcount else 0.0
+        out.append(LineVisual(
+            dominant_colors=colors,
+            motion=float(min(1.0, motion_ps / 50.0)),
+            brightness=a.bright / a.n,
+            sampled=a.n,
+            gx=gx, gy=gy,
+            drift_x=max(-1.0, min(1.0, gx1 - gx0)),
+            drift_y=max(-1.0, min(1.0, gy1 - gy0)),
+            salient=a.sal / a.n,
             gx0=gx0, gy0=gy0, gx1=gx1, gy1=gy1,
-            color_start=c_start[0] if c_start else "#FFFFFF",
-            color_end=c_end[0] if c_end else "#FFFFFF",
-        )
-        out.append(vis)
+            color_start=c_start, color_end=c_end,
+        ))
     return out
