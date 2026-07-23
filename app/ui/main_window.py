@@ -2616,10 +2616,14 @@ _PASTE_SPLIT_RE = re.compile(r"\n[ \t]*\n+")
 
 
 def _split_paste_lines(text: str) -> list[str]:
-    """빈 줄(엔터 두 번 이상)으로 분리. 양 끝 공백/빈 청크는 제거."""
+    """빈 줄(엔터 두 번 이상)으로 분리. 양 끝 공백/빈 청크는 제거.
+
+    청크 안의 단일 개행은 ASS 하드 개행(\\N)으로 바꾼다 — 리터럴 개행이
+    DB/파일로 흘러가면 Dialogue 가 물리 두 줄로 쪼개져 내용이 유실된다.
+    """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     parts = _PASTE_SPLIT_RE.split(text)
-    return [p.strip() for p in parts if p.strip()]
+    return [p.strip().replace("\n", "\\N") for p in parts if p.strip()]
 
 
 class _PasteLinesDialog(QDialog):

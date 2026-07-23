@@ -31,6 +31,37 @@ _KO_RANGES = (
 # 한자(중국어 공유)
 _CN_RANGES = ((0x4E00, 0x9FFF),)
 
+# 루비 표기: 漢字（かな/カナ）— 가사엔 표기+읽기가 같이 있지만 가수는 읽기만
+# 부르므로(Whisper 전사엔 읽기만 존재) 읽기 쪽만 남긴다.
+_RUBY_RE = re.compile(
+    r"[一-鿿々〆]+[（(]([ぁ-んァ-ヶー・]+)[）)]"
+)
+
+_kakasi = None
+_kakasi_failed = False
+
+
+def _to_hiragana(text: str) -> str:
+    """가능하면 전체를 히라가나로 (pykakasi) — 한자 이형(赦/許)과 표기 차이를
+    발음 공간에서 흡수한다. pykakasi 미설치면 가타카나 폴드만 수행."""
+    global _kakasi, _kakasi_failed
+    if _kakasi is None and not _kakasi_failed:
+        try:
+            import pykakasi
+            _kakasi = pykakasi.kakasi()
+        except Exception:
+            _kakasi_failed = True
+    if _kakasi is not None:
+        try:
+            text = "".join(item["hira"] for item in _kakasi.convert(text))
+        except Exception:
+            pass
+    # 가타카나 → 히라가나 폴드 (カルマ ≡ かるま)
+    return "".join(
+        chr(ord(ch) - 0x60) if 0x30A1 <= ord(ch) <= 0x30F6 else ch
+        for ch in text
+    )
+
 
 def strip_ass_text(text: str) -> str:
     """ASS override tag 와 hard newline 제거."""
@@ -104,7 +135,16 @@ def tokenize(text: str, language: str = "") -> list[str]:
     if not language:
         language = detect_language(text)
 
-    if language in ("ja", "ko", "zh"):
+    if language == "ja":
+        # 일본어는 발음(히라가나) 공간에서 매칭한다:
+        #   · 루비 因業（カルマ） → 읽기(カルマ)만 (가수는 읽기만 부른다)
+        #   · 한자 → 읽기 (Whisper 가 赦 대신 許 를 골라도 발음은 같다)
+        #   · 가타카나 → 히라가나 폴드
+        text = _RUBY_RE.sub(r"\1", text)
+        text = _to_hiragana(text)
+        return [ch for ch in text if unicodedata.category(ch)[0] in ("L", "N")]
+
+    if language in ("ko", "zh"):
         # 문자 단위 — 문자(L*)/숫자(N*)만 토큰으로. 구두점(…—「」)은 물론
         # 기호(♪☆♡ 등, S*)도 제외해야 매칭 불가 잡음 토큰이 안 생긴다.
         return [ch for ch in text if unicodedata.category(ch)[0] in ("L", "N")]

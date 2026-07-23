@@ -199,6 +199,10 @@ def parse_event_line(format_fields: list[str], line_text: str) -> ParsedEvent:
 def serialize_event_line(event: ParsedEvent, format_fields: list[str]) -> str:
     """Serialize a ParsedEvent back to 'Dialogue: ...' or 'Comment: ...'."""
     prefix = "Comment" if event.is_comment else "Dialogue"
+    # 텍스트 속 리터럴 개행은 ASS 하드 개행(\N)으로 — 그대로 쓰면 Dialogue 가
+    # 물리 두 줄로 쪼개져, 다시 열 때 개행 뒤 내용이 통째로 사라진다.
+    safe_text = (event.text or "").replace("\r\n", "\\N") \
+        .replace("\r", "\\N").replace("\n", "\\N")
     field_map = {
         "Layer": str(event.layer),
         "Start": ms_to_ass_time(event.start_ms),
@@ -209,7 +213,7 @@ def serialize_event_line(event: ParsedEvent, format_fields: list[str]) -> str:
         "MarginR": str(event.margin_r),
         "MarginV": str(event.margin_v),
         "Effect": event.effect,
-        "Text": event.text,
+        "Text": safe_text,
     }
     parts = []
     for fname in format_fields:

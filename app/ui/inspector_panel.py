@@ -272,7 +272,10 @@ class InspectorPanel(QWidget):
             return
         self._text_timer.stop()
         self._text_dirty = False
-        self._emit({"text": self._text.toPlainText()})
+        # 엔터로 입력한 개행은 ASS 하드 개행(\N)으로 저장 — 리터럴 개행이
+        # DB 에 들어가면 저장 시 Dialogue 가 두 줄로 쪼개져 내용이 유실된다.
+        text = self._text.toPlainText().replace("\r\n", "\\N").replace("\n", "\\N")
+        self._emit({"text": text})
 
     def flush_pending(self) -> None:
         """디바운스 대기 중인 텍스트 편집을 즉시 커밋 — 저장 직전에 호출해

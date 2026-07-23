@@ -32,6 +32,45 @@ class LineVisual:
     motion: float = 0.0       # 0(정지)~1(격함)
     brightness: float = 0.5   # 0(암전)~1(백색)
     sampled: int = 0          # 배정된 샘플 프레임 수 (0 = 분석 실패/구간 밖)
+    # 화면 내 그래픽(채도·밝기 돌출 영역)의 위치/이동 — 모션그래픽 미러링용
+    gx: float = 0.5           # 그래픽 중심 x (0~1)
+    gy: float = 0.5           # 그래픽 중심 y (0~1)
+    drift_x: float = 0.0      # 구간 동안 중심 이동 (프레임 폭 대비 -1~1)
+    drift_y: float = 0.0
+    salient: float = 0.0      # 돌출 영역 비중 0~1 (0이면 그래픽 감지 실패)
+
+
+def _saliency_centroids(sub: np.ndarray) -> tuple[float, float, float, float, float]:
+    """프레임 묶음에서 돌출(그래픽) 영역의 평균 중심과 구간 이동을 추정.
+
+    돌출 가중치 = 채도 + 고휘도 보정 — 색 있는 모션그래픽은 채도로,
+    흰 자막/로고는 고휘도로 잡힌다. 반환: (gx, gy, drift_x, drift_y, salient)
+    """
+    n, h, w, _ = sub.shape
+    px = sub.astype(np.int16)
+    mx = px.max(axis=3)
+    mn = px.min(axis=3)
+    sat = (mx - mn).astype(np.float64)                    # (N,H,W)
+    luma = px.mean(axis=3)
+    weight = sat + np.maximum(0.0, luma - 200.0) * 1.5    # 흰 텍스트 보정
+    ys, xs = np.mgrid[0:h, 0:w]
+    cxs, cys, mass = [], [], []
+    for i in range(n):
+        wsum = float(weight[i].sum())
+        if wsum <= 1e-6:
+            continue
+        cxs.append(float((weight[i] * xs).sum() / wsum) / max(1, w - 1))
+        cys.append(float((weight[i] * ys).sum() / wsum) / max(1, h - 1))
+        # 상위 가중 픽셀 비중 — 배경 대비 그래픽이 얼마나 도드라지는지
+        thr = weight[i].mean() + weight[i].std() * 2.0
+        mass.append(float((weight[i] > thr).mean()))
+    if not cxs:
+        return 0.5, 0.5, 0.0, 0.0, 0.0
+    gx = float(np.mean(cxs))
+    gy = float(np.mean(cys))
+    dx = float(cxs[-1] - cxs[0]) if len(cxs) > 1 else 0.0
+    dy = float(cys[-1] - cys[0]) if len(cys) > 1 else 0.0
+    return gx, gy, max(-1.0, min(1.0, dx)), max(-1.0, min(1.0, dy)), float(np.mean(mass))
 
 
 def _dominant_colors(frames: np.ndarray, top: int = 2) -> list[str]:
@@ -128,12 +167,14 @@ def analyze_line_windows(
             near = int(np.argmin(np.abs(ts - (s_ms + e_ms) / 2)))
             idx = np.array([near])
         sub = stack[idx]
+        gx, gy, dx, dy, sal = _saliency_centroids(sub)
         vis = LineVisual(
             dominant_colors=_dominant_colors(sub),
             # 25 이상의 평균차는 '격한' 장면으로 포화
             motion=float(min(1.0, diffs[idx].mean() / 25.0)) if idx.size else 0.0,
             brightness=float(sub.mean() / 255.0),
             sampled=int(idx.size),
+            gx=gx, gy=gy, drift_x=dx, drift_y=dy, salient=sal,
         )
         out.append(vis)
     return out

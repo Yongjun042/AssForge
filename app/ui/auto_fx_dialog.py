@@ -23,9 +23,13 @@ from effects import EffectContext, apply_specs
 from effects.director import DirectedLine, LineInput, direct_effects, theme_names
 
 
-def _analyze_and_direct(targets, video_path, play_res, intensity):
-    """(백그라운드) 영상 구간을 분석해 줄별 효과를 배정. (directed, 상태문구) 반환."""
-    from effects.director import LineScene, direct_from_video
+def _analyze_and_direct(targets, video_path, play_res, intensity, mimic=False):
+    """(백그라운드) 영상 구간을 분석해 줄별 효과를 배정. (directed, 상태문구) 반환.
+
+    mimic=True 면 분위기 연출이 아니라 화면 속 기존 모션그래픽을
+    미러링한다(색·위치·이동 방향 그대로).
+    """
+    from effects.director import LineScene, direct_from_video, direct_mimic
     from media.video_analysis import analyze_line_windows
     if not video_path:
         return [], "영상이 열려 있지 않습니다."
@@ -37,11 +41,18 @@ def _analyze_and_direct(targets, video_path, play_res, intensity):
         for t, v in zip(targets, visuals):
             ok = v.sampled > 0
             ok_count += 1 if ok else 0
-            scenes[t.event_id] = LineScene(colors=v.dominant_colors,
-                                           motion=v.motion,
-                                           brightness=v.brightness, ok=ok)
-    directed = direct_from_video(targets, scenes, play_res=play_res,
-                                 intensity=intensity)
+            scenes[t.event_id] = LineScene(
+                colors=v.dominant_colors, motion=v.motion,
+                brightness=v.brightness, ok=ok,
+                gx=v.gx, gy=v.gy,
+                drift_x=v.drift_x, drift_y=v.drift_y, salient=v.salient,
+            )
+    if mimic:
+        directed = direct_mimic(targets, scenes, play_res=play_res,
+                                intensity=intensity)
+    else:
+        directed = direct_from_video(targets, scenes, play_res=play_res,
+                                     intensity=intensity)
     if not visuals:
         note = "영상 분석 실패(FFmpeg 확인) — 기본 연출로 대체"
     else:
@@ -85,21 +96,26 @@ class AutoFxDialog(QDialog):
         # -- 모드 --
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("모드:"))
+        self._mode_mimic = QRadioButton("모션그래픽 미러링 (화면 속 그래픽 따라)")
         self._mode_video = QRadioButton("영상 분석 (장면 색·움직임)")
         self._mode_theme = QRadioButton("테마 (오프라인·즉시)")
         self._mode_llm = QRadioButton("LLM 연출 (가사 분위기)")
         g2 = QButtonGroup(self)
-        for b in (self._mode_video, self._mode_theme, self._mode_llm):
+        for b in (self._mode_mimic, self._mode_video, self._mode_theme,
+                  self._mode_llm):
             g2.addButton(b)
             mode_row.addWidget(b)
         mode_row.addStretch(1)
         root.addLayout(mode_row)
-        # 영상이 있으면 영상 분석을 기본값으로 (요청의 핵심).
+        # 영상이 있으면 미러링을 기본값으로 — BD 처럼 화면에 이미 모션그래픽이
+        # 있는 소재에서 자막이 그 그래픽의 색·위치·움직임을 따라간다.
         if video_path:
-            self._mode_video.setChecked(True)
+            self._mode_mimic.setChecked(True)
         else:
-            self._mode_video.setEnabled(False)
-            self._mode_video.setToolTip("영상을 먼저 열어야 분석할 수 있습니다.")
+            for b, tip in ((self._mode_mimic, "영상을 먼저 열어야 합니다."),
+                           (self._mode_video, "영상을 먼저 열어야 분석할 수 있습니다.")):
+                b.setEnabled(False)
+                b.setToolTip(tip)
             self._mode_theme.setChecked(True)
 
         # -- 테마 옵션 --
@@ -132,10 +148,11 @@ class AutoFxDialog(QDialog):
 
         def _sync_mode() -> None:
             self._theme.setEnabled(self._mode_theme.isChecked())
-            # 강도는 테마·영상 모드에서 유효, LLM 모드에선 무시.
+            # 강도는 테마·영상·미러링 모드에서 유효, LLM 모드에선 무시.
             self._intensity.setEnabled(not self._mode_llm.isChecked())
             self._mood.setEnabled(self._mode_llm.isChecked())
-        for b in (self._mode_video, self._mode_theme, self._mode_llm):
+        for b in (self._mode_mimic, self._mode_video, self._mode_theme,
+                  self._mode_llm):
             b.toggled.connect(_sync_mode)
         _sync_mode()
 
@@ -196,13 +213,14 @@ class AutoFxDialog(QDialog):
             self._fill_preview(direct_effects(
                 targets, self._theme.currentData(),
                 play_res=self._play_res, intensity=k))
-        elif self._mode_video.isChecked():
+        elif self._mode_mimic.isChecked() or self._mode_video.isChecked():
             self._preview_btn.setEnabled(False)
             self._status.setText("영상 분석 중... (구간 프레임 샘플링)")
             path, res = self._video_path, self._play_res
+            mimic = self._mode_mimic.isChecked()
 
-            def _job(targets=targets, path=path, res=res, k=k):
-                return _analyze_and_direct(targets, path, res, k)
+            def _job(targets=targets, path=path, res=res, k=k, mimic=mimic):
+                return _analyze_and_direct(targets, path, res, k, mimic=mimic)
 
             self._runner.start(_job)
         else:
