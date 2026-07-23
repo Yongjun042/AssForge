@@ -221,6 +221,13 @@ class LineScene:
     drift_x: float = 0.0
     drift_y: float = 0.0
     salient: float = 0.0
+    # 시작→끝 경로/색 — 구간 내 그래픽의 변화를 그대로 따라간다
+    gx0: float = 0.5
+    gy0: float = 0.5
+    gx1: float = 0.5
+    gy1: float = 0.5
+    color_start: str = ""
+    color_end: str = ""
 
 
 def direct_from_video(
@@ -324,47 +331,38 @@ def direct_mimic(
                 summary="분석 실패 — 페이드만"))
             continue
 
-        color = sc.colors[0] if sc.colors else "#FFFFFF"
+        c_start = sc.color_start or (sc.colors[0] if sc.colors else "#FFFFFF")
+        c_end = sc.color_end or c_start
         specs: list[EffectSpec] = []
         parts: list[str] = []
 
-        # ① 색 미러링 — 그래픽 색을 글자색으로 (from==to 스윕 = 고정 틴트)
+        # ① 색 미러링 — 그래픽 색을 글자색으로. 구간 동안 그래픽 색이 변하면
+        #    같은 변화를 줄 전체에 걸쳐 스윕한다 (같으면 고정 틴트).
         specs.append(EffectSpec("karaoke_fill", {
-            "from_color": color, "to_color": color, "duration_ms": 0}))
-        parts.append("그래픽 색 틴트")
+            "from_color": c_start, "to_color": c_end, "duration_ms": 0}))
+        parts.append("색 틴트" if c_start == c_end else "색 변화 추적")
 
         detected = sc.salient > 0.003  # 돌출 영역이 실재할 때만 위치/모션 미러링
         if not _has_karaoke(line.text) and detected:
-            # ② 위치 미러링 — 그래픽 아래 12% 지점, 안전 영역으로 클램프
-            px = round(min(0.92, max(0.08, sc.gx)) * rx)
-            py = round(min(0.90, max(0.10, sc.gy + 0.12)) * ry)
-            # ③ 모션 미러링 — 그래픽 이동 방향으로 슬라이드 진입
-            adx, ady = abs(sc.drift_x), abs(sc.drift_y)
-            if max(adx, ady) > 0.03:
-                if adx >= ady:
-                    direction = "right" if sc.drift_x > 0 else "left"
-                    dist = int(min(320, max(80, adx * rx)) * k)
-                else:
-                    direction = "down" if sc.drift_y > 0 else "up"
-                    dist = int(min(240, max(60, ady * ry)) * k)
-                dur = min(450, max(200, line.duration_ms // 4))
-                specs.append(EffectSpec("slide", {
-                    "direction": direction, "distance": dist,
-                    "duration_ms": dur, "mode": "in", "x": px, "y": py}))
-                parts.append(f"그래픽 이동 미러({direction})")
-            else:
-                # 정적 그래픽 — 같은 자리에 잔잔히 등장
-                specs.append(EffectSpec("slide", {
-                    "direction": "up", "distance": int(40 * k),
-                    "duration_ms": 280, "mode": "in", "x": px, "y": py}))
-                parts.append("그래픽 옆 배치")
+            # ② 경로 미러링 — 구간 시작 시점의 그래픽 위치에서 끝 시점 위치로,
+            #    줄 전체에 걸쳐 함께 이동한다 (그래픽 바로 아래 12%, 안전 클램프).
+            def _pt(nx: float, ny: float) -> tuple[int, int]:
+                return (round(min(0.92, max(0.08, nx)) * rx),
+                        round(min(0.90, max(0.10, ny + 0.12)) * ry))
+            x0, y0 = _pt(sc.gx0, sc.gy0)
+            x1, y1 = _pt(sc.gx1, sc.gy1)
+            moved = (abs(sc.gx1 - sc.gx0) + abs(sc.gy1 - sc.gy0)) > 0.02
+            specs.append(EffectSpec("follow", {
+                "x0": x0, "y0": y0, "x1": x1, "y1": y1}))
+            specs.append(EffectSpec("fade", {"fade_in_ms": 150, "fade_out_ms": 200}))
+            parts.append("그래픽 경로 추적" if moved else "그래픽 옆 배치")
         else:
             specs.append(EffectSpec("fade", {"fade_in_ms": 200, "fade_out_ms": 250}))
             parts.append("카라오케 보존" if _has_karaoke(line.text) else "위치 유지")
 
         # ④ 같은 색 글로우로 그래픽과 톤 일치 (+어두우면 가독성)
         blur = 5 * k if sc.brightness < 0.35 else 3 * k
-        specs.append(EffectSpec("glow", {"color": color, "blur": blur, "bord": 2}))
+        specs.append(EffectSpec("glow", {"color": c_start, "blur": blur, "bord": 2}))
         parts.append("동색 글로우")
 
         out.append(DirectedLine(event_id=line.event_id, specs=specs,

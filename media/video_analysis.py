@@ -33,11 +33,18 @@ class LineVisual:
     brightness: float = 0.5   # 0(암전)~1(백색)
     sampled: int = 0          # 배정된 샘플 프레임 수 (0 = 분석 실패/구간 밖)
     # 화면 내 그래픽(채도·밝기 돌출 영역)의 위치/이동 — 모션그래픽 미러링용
-    gx: float = 0.5           # 그래픽 중심 x (0~1)
-    gy: float = 0.5           # 그래픽 중심 y (0~1)
+    gx: float = 0.5           # 그래픽 중심 x (0~1, 구간 평균)
+    gy: float = 0.5           # 그래픽 중심 y (0~1, 구간 평균)
     drift_x: float = 0.0      # 구간 동안 중심 이동 (프레임 폭 대비 -1~1)
     drift_y: float = 0.0
     salient: float = 0.0      # 돌출 영역 비중 0~1 (0이면 그래픽 감지 실패)
+    # 시작→끝 경로/색 (구간 내 변화를 그대로 따라가기 위한 끝점들)
+    gx0: float = 0.5          # 구간 시작 시점 중심
+    gy0: float = 0.5
+    gx1: float = 0.5          # 구간 끝 시점 중심
+    gy1: float = 0.5
+    color_start: str = "#FFFFFF"   # 구간 앞 1/3 지배색
+    color_end: str = "#FFFFFF"     # 구간 뒤 1/3 지배색
 
 
 def _saliency_centroids(sub: np.ndarray) -> tuple[float, float, float, float, float]:
@@ -65,12 +72,14 @@ def _saliency_centroids(sub: np.ndarray) -> tuple[float, float, float, float, fl
         thr = weight[i].mean() + weight[i].std() * 2.0
         mass.append(float((weight[i] > thr).mean()))
     if not cxs:
-        return 0.5, 0.5, 0.0, 0.0, 0.0
+        return 0.5, 0.5, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5
     gx = float(np.mean(cxs))
     gy = float(np.mean(cys))
     dx = float(cxs[-1] - cxs[0]) if len(cxs) > 1 else 0.0
     dy = float(cys[-1] - cys[0]) if len(cys) > 1 else 0.0
-    return gx, gy, max(-1.0, min(1.0, dx)), max(-1.0, min(1.0, dy)), float(np.mean(mass))
+    return (gx, gy, max(-1.0, min(1.0, dx)), max(-1.0, min(1.0, dy)),
+            float(np.mean(mass)),
+            float(cxs[0]), float(cys[0]), float(cxs[-1]), float(cys[-1]))
 
 
 def _dominant_colors(frames: np.ndarray, top: int = 2) -> list[str]:
@@ -167,7 +176,11 @@ def analyze_line_windows(
             near = int(np.argmin(np.abs(ts - (s_ms + e_ms) / 2)))
             idx = np.array([near])
         sub = stack[idx]
-        gx, gy, dx, dy, sal = _saliency_centroids(sub)
+        gx, gy, dx, dy, sal, gx0, gy0, gx1, gy1 = _saliency_centroids(sub)
+        # 구간 앞/뒤 1/3 의 지배색 — 그래픽 색 변화도 그대로 따라가게
+        n3 = max(1, len(idx) // 3)
+        c_start = _dominant_colors(stack[idx[:n3]])
+        c_end = _dominant_colors(stack[idx[-n3:]])
         vis = LineVisual(
             dominant_colors=_dominant_colors(sub),
             # 25 이상의 평균차는 '격한' 장면으로 포화
@@ -175,6 +188,9 @@ def analyze_line_windows(
             brightness=float(sub.mean() / 255.0),
             sampled=int(idx.size),
             gx=gx, gy=gy, drift_x=dx, drift_y=dy, salient=sal,
+            gx0=gx0, gy0=gy0, gx1=gx1, gy1=gy1,
+            color_start=c_start[0] if c_start else "#FFFFFF",
+            color_end=c_end[0] if c_end else "#FFFFFF",
         )
         out.append(vis)
     return out

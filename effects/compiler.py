@@ -242,8 +242,19 @@ def _c_spin(p: dict[str, Any], ctx: EffectContext) -> CompiledEffect:
     return CompiledEffect(lead_block="{" + "".join(parts) + "}")
 
 
+def _c_follow(p: dict[str, Any], ctx: EffectContext) -> CompiledEffect:
+    """경로 추적 — 시간 인자 없는 \\move 는 줄 전체 길이에 걸쳐 이동한다
+    (docs/ass-format-reference.md). 시작=끝이면 고정 \\pos."""
+    x0, y0 = int(p["x0"]), int(p["y0"])
+    x1, y1 = int(p["x1"]), int(p["y1"])
+    if (x0, y0) == (x1, y1):
+        return CompiledEffect(lead_block=f"{{\\pos({x0},{y0})}}")
+    return CompiledEffect(lead_block=f"{{\\move({x0},{y0},{x1},{y1})}}")
+
+
 _COMPILERS: dict[str, Callable[[dict[str, Any], EffectContext], CompiledEffect]] = {
     "fade": _c_fade,
+    "follow": _c_follow,
     "emphasis": _c_emphasis,
     "glow": _c_glow,
     "shake": _c_shake,

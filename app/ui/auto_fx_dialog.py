@@ -46,6 +46,8 @@ def _analyze_and_direct(targets, video_path, play_res, intensity, mimic=False):
                 brightness=v.brightness, ok=ok,
                 gx=v.gx, gy=v.gy,
                 drift_x=v.drift_x, drift_y=v.drift_y, salient=v.salient,
+                gx0=v.gx0, gy0=v.gy0, gx1=v.gx1, gy1=v.gy1,
+                color_start=v.color_start, color_end=v.color_end,
             )
     if mimic:
         directed = direct_mimic(targets, scenes, play_res=play_res,

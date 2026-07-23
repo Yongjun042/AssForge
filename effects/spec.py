@@ -77,6 +77,15 @@ PRIMITIVES: dict[str, dict[str, Any]] = {
             "y": ParamSpec("int", -1, "정착 Y(없으면 -1)", -1, 10000),
         },
     },
+    "follow": {
+        "label": "경로 추적 (줄 전체에 걸쳐 이동)",
+        "params": {
+            "x0": ParamSpec("int", 0, "시작 X", 0, 10000),
+            "y0": ParamSpec("int", 0, "시작 Y", 0, 10000),
+            "x1": ParamSpec("int", 0, "끝 X", 0, 10000),
+            "y1": ParamSpec("int", 0, "끝 Y", 0, 10000),
+        },
+    },
     "karaoke_fill": {
         "label": "색 스윕",
         "params": {

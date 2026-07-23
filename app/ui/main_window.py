@@ -382,6 +382,13 @@ class _AiSyncOptionsDialog(QDialog):
             self._vocals.setText(f"보컬 분리 후 전사 — {vocals_why}")
         form.addRow(self._vocals)
 
+        self._vad = QCheckBox("무음 필터(VAD) — 대사·나레이션용, 노래는 끄세요")
+        self._vad.setToolTip(
+            "VAD 가 반주 위 가창을 '음성 아님'으로 걸러내 노래 구간 전사가\n"
+            "통째로 비는 사례가 있어 기본 꺼짐입니다. 말 위주 영상이면 켜세요.")
+        self._vad.setChecked(settings.value("aiSyncVad", False, type=bool))
+        form.addRow(self._vad)
+
         # 동영상 시간 범위 제한 (선택 영역 재정렬 시) — 그 구간만 전사
         self._clip_on = QCheckBox("동영상 시간 범위만 전사 (초)")
         self._clip_start = QDoubleSpinBox()
@@ -455,6 +462,7 @@ class _AiSyncOptionsDialog(QDialog):
                 return
         self._settings.setValue("aiSyncLanguage", self._lang.currentData() or "")
         self._settings.setValue("aiSyncModel", self._model.currentText())
+        self._settings.setValue("aiSyncVad", self._vad.isChecked())
         if self._vocals.isEnabled():
             self._settings.setValue("aiSyncSeparateVocals", self._vocals.isChecked())
         super().accept()
@@ -468,6 +476,9 @@ class _AiSyncOptionsDialog(QDialog):
 
     def separate_vocals(self) -> bool:
         return self._vocals.isEnabled() and self._vocals.isChecked()
+
+    def vad_filter(self) -> bool:
+        return self._vad.isChecked()
 
     def clip_range(self) -> "tuple[Optional[int], Optional[int]]":
         """(start_ms, end_ms) 또는 (None, None) — 시간 범위 미사용."""
@@ -2076,6 +2087,7 @@ class MainWindow(QMainWindow):
             model_size=opt_dlg.model_size(),
             language=opt_dlg.language(),
             separate_vocals=opt_dlg.separate_vocals(),
+            vad_filter=opt_dlg.vad_filter(),
             only_event_ids=only_ids,
             clip_start_ms=clip_s,
             clip_end_ms=clip_e,

@@ -56,6 +56,9 @@ class SyncOptions:
     separate_vocals: bool = False  # demucs 로 반주 제거 후 전사
     clip_start_ms: Optional[int] = None  # 지정 시 이 구간만 전사(오디오)
     clip_end_ms: Optional[int] = None
+    # 무음 필터(VAD). 노래는 기본 OFF — Silero VAD 가 반주 위 가창을 '음성
+    # 아님'으로 통째로 걸러내 해당 구간 전사가 0개가 되는 사례가 실측됐다.
+    vad_filter: bool = False
 
 
 def run_sync(
@@ -211,6 +214,7 @@ def run_sync(
             model_size=options.model_size,
             device=options.device,
             compute_type=options.compute_type,
+            vad_filter=options.vad_filter,
             progress=lambda f, m, _t0=t0: _p(_t0 + (0.78 - _t0) * f, m),
         )
     except TranscriptionUnavailable as exc:
