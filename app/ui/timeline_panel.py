@@ -210,6 +210,26 @@ class TimelinePanel(QWidget):
                 p.drawText(rect.adjusted(3, 1, -3, -1),
                           Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, txt)
 
+        # AI 제안 고스트 — 제안 시간(수락 전)을 앰버 블록으로 겹쳐 그려
+        # 현재 타이밍(파랑)과 눈으로 전후 비교할 수 있게 한다.
+        for ev_row in self._events:
+            s = getattr(ev_row, "suggested_start_ms", None)
+            e = getattr(ev_row, "suggested_end_ms", None)
+            if s is None or e is None:
+                continue
+            gx1 = self._ms_to_x(s)
+            gx2 = self._ms_to_x(e)
+            if gx2 < 0 or gx1 > w:
+                continue
+            ghost = QRectF(gx1, block_top - 1,
+                           max(gx2 - gx1, 2), self._BLOCK_H * 0.5)
+            p.fillRect(ghost, QColor(255, 190, 60, 70))
+            pen = QPen(QColor(255, 190, 60, 220), 1)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(ghost)
+
         # Selection region (shift-drag) — translucent band across full height
         if self._region is not None:
             rs, re_ = sorted(self._region)
@@ -388,13 +408,20 @@ class TimelinePanel(QWidget):
             return
 
         # 블록 편집 — 로컬 사본을 즉시 갱신(라이브 미리보기), commit 은 release 에서
+        snap = not (ev.modifiers() & Qt.KeyboardModifier.AltModifier)
         for er in self._events:
             if er.id != self._drag_eid:
                 continue
             if mode == "start":
-                er.start_ms = max(0, min(self._drag_orig_start + delta_ms, er.end_ms))
+                v = max(0, min(self._drag_orig_start + delta_ms, er.end_ms))
+                if snap:
+                    v = min(self._snap_to_keyframe(v), er.end_ms)
+                er.start_ms = v
             elif mode == "end":
-                er.end_ms = max(er.start_ms, self._drag_orig_end + delta_ms)
+                v = max(er.start_ms, self._drag_orig_end + delta_ms)
+                if snap:
+                    v = max(self._snap_to_keyframe(v), er.start_ms)
+                er.end_ms = v
             elif mode == "move":
                 dur = self._drag_orig_end - self._drag_orig_start
                 new_start = max(0, self._drag_orig_start + delta_ms)
@@ -402,6 +429,18 @@ class TimelinePanel(QWidget):
                 er.end_ms = new_start + dur
             break
         self.update()
+
+    def _snap_to_keyframe(self, ms: int, px_threshold: float = 8.0) -> int:
+        """근처 키프레임(장면 전환)으로 스냅 — BD 자막은 컷 경계 타이밍이 기본.
+
+        화면상 px_threshold 픽셀 이내의 키프레임이 있으면 그 시간으로 당긴다.
+        Alt 를 누르고 드래그하면 호출자 쪽에서 스냅을 끈다.
+        """
+        if not self._keyframes:
+            return ms
+        thr_ms = px_threshold / self._pps * 1000.0
+        best = min(self._keyframes, key=lambda k: abs(k - ms))
+        return best if abs(best - ms) <= thr_ms else ms
 
     def _flush_scrub(self) -> None:
         """스로틀 틱마다 가장 최근 스크럽 위치 하나만 시크로 내보낸다."""

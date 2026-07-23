@@ -185,6 +185,7 @@ class GridPanel(QWidget):
     insert_before_requested = Signal()
     insert_after_requested = Signal()
     accept_all_ai_requested = Signal()
+    reject_all_ai_requested = Signal()
     reorder_requested = Signal(list, int)  # (드래그한 event_id 들, 드롭 대상 행)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -287,6 +288,12 @@ class GridPanel(QWidget):
         self._btn_accept_all_ai.setStyleSheet("background: #2A7A35;")
         self._btn_accept_all_ai.clicked.connect(self.accept_all_ai_requested.emit)
         search.addWidget(self._btn_accept_all_ai)
+
+        self._btn_reject_all_ai = QPushButton("✗ AI 전체거절")
+        self._btn_reject_all_ai.setToolTip("모든 AI 제안을 한 번에 거절")
+        self._btn_reject_all_ai.setStyleSheet("background: #7A2A2A;")
+        self._btn_reject_all_ai.clicked.connect(self.reject_all_ai_requested.emit)
+        search.addWidget(self._btn_reject_all_ai)
 
         root.addLayout(search)
 

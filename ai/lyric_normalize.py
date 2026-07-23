@@ -70,10 +70,14 @@ def detect_language(text: str) -> str:
 
 
 def _normalize_token(s: str) -> str:
-    """공통 정규화: NFKC, 소문자, 구두점 제거."""
+    """공통 정규화: NFKC, 소문자, 구두점·기호 제거.
+
+    구두점(P*)만 지우면 ♪☆♡… 같은 기호(S*)가 토큰에 남아 transcript 와
+    절대 매칭되지 않는 잡음이 된다 — 문자(L*)/숫자(N*)만 남긴다.
+    """
     s = unicodedata.normalize("NFKC", s)
     s = s.lower()
-    s = "".join(ch for ch in s if not unicodedata.category(ch).startswith("P"))
+    s = "".join(ch for ch in s if unicodedata.category(ch)[0] in ("L", "N"))
     s = s.strip()
     return s
 
@@ -101,11 +105,9 @@ def tokenize(text: str, language: str = "") -> list[str]:
         language = detect_language(text)
 
     if language in ("ja", "ko", "zh"):
-        # 문자 단위: 분리 문자 건너뛰고 의미 있는 자모/한자만 토큰화
-        tokens = [ch for ch in text if not _is_separator(ch)]
-        # 구두점 제거
-        tokens = [t for t in tokens if not unicodedata.category(t).startswith("P")]
-        return tokens
+        # 문자 단위 — 문자(L*)/숫자(N*)만 토큰으로. 구두점(…—「」)은 물론
+        # 기호(♪☆♡ 등, S*)도 제외해야 매칭 불가 잡음 토큰이 안 생긴다.
+        return [ch for ch in text if unicodedata.category(ch)[0] in ("L", "N")]
 
     # 단어 단위
     raw = re.split(r"\s+", text)

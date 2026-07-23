@@ -328,6 +328,13 @@ class VideoEditPanel(QWidget):
         """지금 편집 중인 이벤트 id — MainWindow 가 커밋 후 UI 갱신에 사용."""
         return self._event_id
 
+    def keyPressEvent(self, ev) -> None:
+        if ev.key() == Qt.Key.Key_Escape:
+            self.closed.emit()
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
+
     @staticmethod
     def _spin(lo, hi, val, dec) -> QDoubleSpinBox:
         s = QDoubleSpinBox()

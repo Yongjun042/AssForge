@@ -342,7 +342,9 @@ class _AiSyncOptionsDialog(QDialog):
     _MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 
     def __init__(self, settings: QSettings, parent: Optional[QWidget] = None,
-                 sel_range: "tuple[int, int] | None" = None) -> None:
+                 sel_range: "tuple[int, int] | None" = None,
+                 get_position=None) -> None:
+        """get_position: () -> ms — 영상 현재 재생 위치 (⏱ 버튼용, 없으면 숨김)."""
         super().__init__(parent)
         self.setWindowTitle("AI 동기화 옵션")
         self._settings = settings
@@ -396,8 +398,23 @@ class _AiSyncOptionsDialog(QDialog):
             self._clip_end.setValue(360000)
         crow = QHBoxLayout()
         crow.addWidget(self._clip_start)
+        # 영상 현재 재생 위치로 채우기 — 모달이어도 mpv 는 계속 돌므로 live 로 읽는다
+        if get_position is not None:
+            b1 = QPushButton("⏱")
+            b1.setFixedWidth(26)
+            b1.setToolTip("시작을 영상 현재 위치로")
+            b1.clicked.connect(
+                lambda: self._clip_start.setValue(max(0, get_position()) / 1000.0))
+            crow.addWidget(b1)
         crow.addWidget(QLabel("~"))
         crow.addWidget(self._clip_end)
+        if get_position is not None:
+            b2 = QPushButton("⏱")
+            b2.setFixedWidth(26)
+            b2.setToolTip("끝을 영상 현재 위치로")
+            b2.clicked.connect(
+                lambda: self._clip_end.setValue(max(0, get_position()) / 1000.0))
+            crow.addWidget(b2)
         cw = QWidget()
         cw.setLayout(crow)
         form.addRow(self._clip_on)
@@ -709,6 +726,7 @@ class MainWindow(QMainWindow):
         self.grid.insert_before_requested.connect(self._on_insert_before)
         self.grid.insert_after_requested.connect(self._on_insert_after)
         self.grid.accept_all_ai_requested.connect(self._on_ai_accept_all)
+        self.grid.reject_all_ai_requested.connect(self._on_ai_reject_all)
         self.grid.reorder_requested.connect(self._on_grid_reorder)
 
         self.inspector.event_edited.connect(self._on_inspector_edit)
@@ -1211,6 +1229,7 @@ class MainWindow(QMainWindow):
         self.cmd_bus.undo()
         self._refresh_all()
         self._restore_selection(sel)
+        self._reload_edit_panel_if_open()
 
     def _on_redo(self) -> None:
         # 타이핑(=새 편집)은 redo 스택을 비우는 것이 표준 동작 — flush 가
@@ -1221,6 +1240,22 @@ class MainWindow(QMainWindow):
         self.cmd_bus.redo()
         self._refresh_all()
         self._restore_selection(sel)
+        self._reload_edit_panel_if_open()
+
+    def _reload_edit_panel_if_open(self) -> None:
+        """비주얼 편집 패널이 떠 있으면 undo/redo 후 최신 텍스트로 리로드.
+
+        안 그러면 문서는 되돌아갔는데 패널은 이전 스냅샷 상태를 계속 보여줘
+        Ctrl+Z 가 안 먹힌 것처럼 보인다. 줄이 사라졌으면 편집 모드 종료.
+        """
+        if self._video_stack.currentWidget() is not self._edit_panel:
+            return
+        eid = self._edit_panel.current_event_id()
+        if not (self._db and eid) or self._db.get_event(eid) is None:
+            self._exit_visual_edit()
+            return
+        self._edit_panel.load(
+            self._db, eid, getattr(self, "_edit_frame_path", None), self._play_res())
 
     def _restore_selection(self, ids: list[str]) -> None:
         """Re-select after a full refresh so the inspector reflects current
@@ -1813,9 +1848,20 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("선택한 구간에 자막 줄이 없습니다.", 4000)
             return
         self.grid.select_by_ids(ids)
-        self.statusBar().showMessage(
-            f"{len(ids)}줄 선택됨 — Ctrl+Alt+A 로 이 구간만 AI 재정렬", 6000,
+        # 구간 안에 미수락 AI 제안이 있으면 드래그→수락/거절 흐름을 안내
+        n_sugg = sum(
+            1 for e in events
+            if e.id in set(ids) and e.suggested_start_ms is not None
         )
+        if n_sugg:
+            self.statusBar().showMessage(
+                f"{len(ids)}줄 선택 (AI 제안 {n_sugg}건) — F8 수락 · F9 거절 · "
+                "Ctrl+Alt+A 재정렬", 8000,
+            )
+        else:
+            self.statusBar().showMessage(
+                f"{len(ids)}줄 선택됨 — Ctrl+Alt+A 로 이 구간만 AI 재정렬", 6000,
+            )
 
     def _on_set_time_to_current(self, edge: str) -> None:
         """인스펙터 버튼 — 인스펙터에 표시 중인 줄의 start/end 를 현재 재생 위치로.
@@ -1915,6 +1961,9 @@ class MainWindow(QMainWindow):
         if modified != self._modified:
             self._modified = modified
             self._update_title()
+        # undo/redo 도 영상 미리보기를 갱신해야 한다 — 안 그러면 문서는
+        # 되돌아갔는데 영상은 그대로라 Ctrl+Z 가 안 먹힌 것처럼 보인다.
+        self._schedule_video_preview()
 
     # ============================================================
     # Keyboard Timing
@@ -2016,7 +2065,10 @@ class MainWindow(QMainWindow):
                 sel_range = (int(row["s"]), int(row["e"]))
 
         from ai.sync_service import SyncOptions
-        opt_dlg = _AiSyncOptionsDialog(self._settings, self, sel_range=sel_range)
+        opt_dlg = _AiSyncOptionsDialog(
+            self._settings, self, sel_range=sel_range,
+            get_position=self.video_player.get_position_ms,
+        )
         if opt_dlg.exec() != QDialog.DialogCode.Accepted:
             return
         clip_s, clip_e = opt_dlg.clip_range()
@@ -2336,6 +2388,7 @@ class MainWindow(QMainWindow):
             return
 
         # 새 창 대신 영상 영역을 편집 패널로 전환 (인라인).
+        self._edit_frame_path = frame_path  # undo/redo 후 패널 리로드에 재사용
         self._edit_panel.load(self._db, ids[0], frame_path, self._play_res())
         self._video_stack.setCurrentWidget(self._edit_panel)
         self.statusBar().showMessage(
