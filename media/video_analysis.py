@@ -161,6 +161,8 @@ def analyze_line_windows(
     prev: np.ndarray | None = None
     frame_i = 0
     got_any = False
+    last_frame: np.ndarray | None = None
+    last_ts = 0.0
     try:
         proc = subprocess.Popen(
             args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -178,18 +180,21 @@ def analyze_line_windows(
             ts = span_s * 1000.0 + frame_i * frame_ms
             frame_i += 1
             got_any = True
+            last_frame, last_ts = frame, ts  # 스트림 끝 0샘플 창 대표용
 
-            # 활성 창 갱신
+            # 활성 창 갱신 — 끝난 창 중 샘플 0개인 것은 이 프레임(최근접)을
+            # 1장 먹인다. 프레임 간격(~42ms)보다 짧은 줄이 프레임 타임스탬프
+            # 사이에 끼면 배정이 0이 되어 영상 기반 효과를 통째로 잃기 때문.
             while next_ptr < len(order) and accs[order[next_ptr]].s_ms <= ts:
                 active.append(accs[order[next_ptr]])
                 next_ptr += 1
-            if active:
-                active = [a for a in active if ts < a.e_ms]
-            if not active and next_ptr >= len(order):
+            ended_empty = [a for a in active if ts >= a.e_ms and a.n == 0]
+            active = [a for a in active if ts < a.e_ms]
+            if not active and not ended_empty and next_ptr >= len(order):
                 kill_tree(proc)   # 남은 창 없음 — 조기 종료
                 break
             # 이 프레임이 어느 창에도 안 속하면 diff 기준만 갱신
-            if not active:
+            if not active and not ended_empty:
                 prev = frame.astype(np.int16)
                 continue
 
@@ -224,6 +229,14 @@ def analyze_line_windows(
             bins = ((q[:, 0] << 6) | (q[:, 1] << 3) | q[:, 2]).astype(np.int64)
             weight = sat_flat + 8.0
 
+            # 초단기(프레임 간격 미만) 창 — 최근접 프레임 1장으로 대표
+            for a in ended_empty:
+                a.n = 1
+                a.bright = bright
+                a.sal = mass
+                a.cents.append((ts, cx, cy))
+                a.full.add(bins, weight, flat)
+
             for a in active:
                 a.n += 1
                 a.bright += bright
@@ -244,6 +257,32 @@ def analyze_line_windows(
         return None
     if not got_any:
         return None
+
+    # 스트림이 끝났는데 샘플 0개인 창(디코드 경계 뒤 등) — 마지막 프레임으로 대표
+    if last_frame is not None and any(a.n == 0 for a in accs):
+        flat = last_frame.astype(np.int16).reshape(-1, 3)
+        sat_flat = (flat.max(axis=1) - flat.min(axis=1)).astype(np.float64)
+        luma_flat = flat.mean(axis=1)
+        wmap = sat_flat + np.maximum(0.0, luma_flat - 200.0) * 1.5
+        wsum = float(wmap.sum())
+        if wsum > 1e-6:
+            w2d = wmap.reshape(_H, _W)
+            cx = float((w2d * _XS).sum() / wsum) / max(1, _W - 1)
+            cy = float((w2d * _YS).sum() / wsum) / max(1, _H - 1)
+            thr = wmap.mean() + wmap.std() * 2.0
+            mass = float((wmap > thr).mean())
+        else:
+            cx, cy, mass = 0.5, 0.5, 0.0
+        q = (flat >> 5)
+        bins = ((q[:, 0] << 6) | (q[:, 1] << 3) | q[:, 2]).astype(np.int64)
+        weight = sat_flat + 8.0
+        for a in accs:
+            if a.n == 0:
+                a.n = 1
+                a.bright = float(luma_flat.mean() / 255.0)
+                a.sal = mass
+                a.cents.append((last_ts, cx, cy))
+                a.full.add(bins, weight, flat)
 
     out: list[LineVisual] = []
     for a in accs:
