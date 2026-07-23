@@ -258,8 +258,14 @@ def analyze_line_windows(
     if not got_any:
         return None
 
-    # 스트림이 끝났는데 샘플 0개인 창(디코드 경계 뒤 등) — 마지막 프레임으로 대표
-    if last_frame is not None and any(a.n == 0 for a in accs):
+    # 스트림이 끝났는데 샘플 0개인 창 — 디코드 '경계 바로 뒤'(마지막 프레임에서
+    # 1프레임 이내 시작)만 마지막 프레임으로 대표한다. 영상 범위를 아예 벗어난
+    # 창(영상 길이 밖 자막 등)까지 먹이면 무관한 프레임으로 '분석됨' 처리되므로
+    # 그런 창은 sampled=0 으로 남겨 폴백 연출을 받게 한다.
+    def _near_tail(a: "_WinAcc") -> bool:
+        return a.s_ms <= last_ts + frame_ms
+
+    if last_frame is not None and any(a.n == 0 and _near_tail(a) for a in accs):
         flat = last_frame.astype(np.int16).reshape(-1, 3)
         sat_flat = (flat.max(axis=1) - flat.min(axis=1)).astype(np.float64)
         luma_flat = flat.mean(axis=1)
@@ -277,7 +283,7 @@ def analyze_line_windows(
         bins = ((q[:, 0] << 6) | (q[:, 1] << 3) | q[:, 2]).astype(np.int64)
         weight = sat_flat + 8.0
         for a in accs:
-            if a.n == 0:
+            if a.n == 0 and _near_tail(a):
                 a.n = 1
                 a.bright = float(luma_flat.mean() / 255.0)
                 a.sal = mass
