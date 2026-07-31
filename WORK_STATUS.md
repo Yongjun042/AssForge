@@ -83,8 +83,10 @@ AI 워크플로를 위한 ASS 자막 저작 도구. Python + PySide6 + mpv + FFm
       줄 순번 사이클 + 팔레트 + 휴리스틱(짧은 줄→페이드, 느낌표→강조, \\k→은은한 보존),
       slide 는 core.typeset.effective_position 으로 실좌표 \\move 생성. 강도 0.5~1.5.
       + **direct_from_video()**: 장면 색/모션/밝기(LineScene)로 효과 선택.
-- [x] **media/video_analysis.py** — 영상 구간 1패스 저해상도(160x90, 2fps) 디코드 →
-      줄 구간별 지배색(채도 가중)·모션(프레임 차)·밝기. numpy, ffmpeg rawvideo 파이프.
+- [x] **media/video_analysis.py** — 영상 구간 1패스 저해상도(160x90) **원본 프레임레이트
+      스트리밍** 디코드 → 줄 구간별 지배색(채도 가중)·시작/끝 색·모션·밝기·그래픽
+      중심 궤적(gx/gy·drift). 서브프레임 창은 최근접 프레임 1장 배정, 구간 밖 창은
+      마지막 프레임으로 오염시키지 않음. numpy, ffmpeg rawvideo 파이프.
 - [x] **영상 분석 모드** — 줄별 시간 구간 프레임을 분석해 색·움직임에 맞는 효과 자동 생성:
       격한 장면=스핀/큰 팝/흔들림, 보통=슬라이드/팝, 잔잔=색 스윕/페이드, 어두우면 글로우 보강.
       영상이 열려 있으면 기본 모드. 백그라운드(LLMTaskRunner) 실행·취소.
@@ -93,6 +95,24 @@ AI 워크플로를 위한 ASS 자막 저작 도구. Python + PySide6 + mpv + FFm
 - [x] **app/ui/auto_fx_dialog.py** — AI 메뉴 "자동 효과 연출 (모션그래픽)..."(Ctrl+Shift+X):
       범위(전체/선택)·모드(영상 분석/테마/LLM)·강도·미리보기 표 → BulkUpdateTextsCommand 단일 undo.
       _남음_: 테마 사용자 정의, 줄별 개별 제외, 장면 전환 경계 정렬(자막↔컷).
+
+### 자동 효과 후속 + AI 싱크 개선 라운드 — 2026-07-03
+- [x] **모션그래픽 모방(mimic) 모드** — 영상 속 그래픽(돌출 영역)의 위치·이동·색
+      변화를 따라가는 연출. 영상 분석이 그래픽 중심 궤적/시작·끝 색을 제공.
+- [x] **일본어 음성학(phonetic) 매칭** — ja 가사 정렬 정확도 개선.
+- [x] **AI 싱크 UX 라운드** — 상태 심볼, 클립 ⏱ 설정, 모두 거부, 고스트 표시,
+      undo 미리보기, 키프레임 스냅. VAD 기본 off(노래 구간을 침묵 처리하던 문제).
+- [x] **멀티라인 데이터 손실 수정** (자막 다중 줄 처리 경로).
+
+### 트레일러 자막 지시서 적용 — 2026-07-03
+- [x] **docs/ema-trailer-spec.md** — 『絵馬に願ひを!』 트레일러 일→한 자막 지시서
+      (v2) 보관: 좌표계·스타일 4클래스·효과 카탈로그 E1~E10·검수 절차.
+      수치 전량 검산(변환식·E3 속도·E8 BGR·E10 알파 역산) 및 AssForge 관련
+      주장 2건(빈 문서 WrapStyle 0, Script Info 새 키 추가 불가) 코드로 확인.
+- [x] **docs/ema-trailer-seed.ass** — §1.5 요구 시드: Script Info §1.4 + 스타일
+      4종 + **98개 검출 그룹 Dialogue 스캐폴드**(센티초 시간·an5 half-up 앵커·
+      실측 \\fad·Name=G##·Effect=씬/모션 힌트·G59 하단 클램프) + 씬 마커 12개.
+      파스→export round-trip·QA·AssForge 로드/저장 사이클 검증 완료.
 
 ### LLM 통합 (3 프로바이더: Codex/Claude/Ollama)
 - [x] Provider 추상화 `ai/llm/`(base/registry/config + 3 구현, is_available 보고형).
@@ -119,12 +139,13 @@ AI 워크플로를 위한 ASS 자막 저작 도구. Python + PySide6 + mpv + FFm
   BulkUpdateTextsCommand(단일 커밋), select_by_ids 단일 QItemSelection 등.
 
 ## 마지막 업데이트
-- **날짜**: 2026-06-04
-- **상태**: Stage 3 핵심 골격 + Stage 4 코어 + LLM 편집(3 프로바이더) 구현 완료.
-  순수 코어(스타일/QA/카라오케/타이프세팅/효과)는 스모크 테스트 통과, UI 다이얼로그 5종
-  (LLM 설정·AI 편집·QA·스타일 매니저·타이프세팅)을 메뉴에 배선하고 offscreen Qt 로 생성 검증.
-  _복잡 항목의 working-v1 한계_: 스타일 라이브 미리보기, 태그 구문 하이라이팅, mpv 드래그
-  오버레이, 카라오케 음절 드래그 UI 는 다음 단계. 실제 비디오로 종단 UI 테스트 남음.
+- **날짜**: 2026-07-03
+- **상태**: Stage 1~4 + LLM 편집 + 자동 효과 연출(테마/LLM/영상 분석/모방) +
+  코드 리뷰 33건 수정 + 트레일러 지시서·시드 적용까지 완료. 다음 실전 작업은
+  docs/ema-trailer-spec.md §6 절차(폰트 캘리브레이션 → 번역 어절 배치 → 모션 수기).
+  _복잡 항목의 working-v1 한계_: 스타일 라이브 미리보기, 태그 구문 하이라이팅,
+  mpv 드래그 오버레이, 카라오케 음절 드래그 UI, 장면 전환 경계 정렬은 다음 단계.
+  실제 비디오 종단 UI 테스트는 트레일러 작업에서 병행.
 - **첫 실행 마찰 완화**: 빈 창 대신 Welcome 화면(최근 파일·열기 버튼·mpv/FFmpeg 의존성
   ✓/✗ 표시)을 QStackedWidget index 0 에 두고, 파일을 열거나 새 프로젝트를 만들면 편집기로
   전환. 파일 메뉴 "최근 파일" 서브메뉴(QSettings recentFiles, 최대 8, 더블클릭 열기),
