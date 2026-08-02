@@ -59,6 +59,10 @@ class SyncOptions:
     # 무음 필터(VAD). 노래는 기본 OFF — Silero VAD 가 반주 위 가창을 '음성
     # 아님'으로 통째로 걸러내 해당 구간 전사가 0개가 되는 사례가 실측됐다.
     vad_filter: bool = False
+    # event_id -> 정렬 기준 원문. 자막이 한국어 번역뿐일 때 사용자가 붙여넣은
+    # 원문 가사(일본어 등)로 정렬하면 발음 공간에서 정확히 매칭된다.
+    # 시간 제안만 바뀌고 표시 텍스트는 그대로다.
+    ref_texts: Optional[dict[str, str]] = None
 
 
 def run_sync(
@@ -108,7 +112,9 @@ def run_sync(
             n_comment += 1
             continue
         is_locked = ev.lock_state == LockState.LOCKED
-        clean = strip_ass_text(ev.text).strip()
+        ref = options.ref_texts.get(ev.id) if options.ref_texts else None
+        align_text = ref if ref else ev.text
+        clean = strip_ass_text(align_text).strip()
         if not clean and not is_locked:
             n_empty += 1
             continue
@@ -125,7 +131,7 @@ def run_sync(
         if not in_target:
             n_off_target += 1
             continue
-        align_input.append((ev.id, ev.text, is_locked, ev.start_ms, ev.end_ms))
+        align_input.append((ev.id, align_text, is_locked, ev.start_ms, ev.end_ms))
         if is_locked:
             n_locked_in_input += 1
 

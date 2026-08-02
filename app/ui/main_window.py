@@ -429,6 +429,26 @@ class _AiSyncOptionsDialog(QDialog):
         self._clip_on.toggled.connect(cw.setEnabled)
         cw.setEnabled(self._clip_on.isChecked())
 
+        # 가사 원문 붙여넣기 — 자막이 한국어 번역뿐일 때, 실제 불리는 원문
+        # (일본어 등)을 주면 그 텍스트로 정렬한다. 원문만 넣으면 대상 줄에
+        # 순서대로 1:1, 원문+한국어 번역을 교차로 넣으면 번역 유사도로
+        # 해당 자막 줄을 자동으로 찾아 연결한다.
+        self._lyrics = QPlainTextEdit()
+        self._lyrics.setPlaceholderText(
+            "(선택) 실제 불리는 가사 원문을 붙여넣으세요 — 한 줄에 한 소절.\n"
+            "원문만 넣으면 대상 줄에 순서대로 연결됩니다.\n"
+            "원문+한국어 번역을 번갈아 넣으면 번역으로 자막 줄을 자동으로 찾습니다:\n"
+            "  夜の因業（カルマ）が…\n"
+            "  밤의 인업(카르마)이…"
+        )
+        self._lyrics.setMaximumHeight(140)
+        self._lyric_info = QLabel("")
+        self._lyric_info.setStyleSheet("color: #888;")
+        self._lyrics.textChanged.connect(self._update_lyric_info)
+        form.addRow(QLabel("가사 원문(선택):"))
+        form.addRow(self._lyrics)
+        form.addRow(self._lyric_info)
+
         hint = QLabel(
             "노래/BGM 은 언어 자동 감지가 자주 틀립니다 — 가사 언어를 직접 지정하세요.\n"
             "모델이 클수록 정확하지만 첫 사용 시 다운로드가 필요합니다\n"
@@ -466,6 +486,26 @@ class _AiSyncOptionsDialog(QDialog):
         if self._vocals.isEnabled():
             self._settings.setValue("aiSyncSeparateVocals", self._vocals.isChecked())
         super().accept()
+
+    def _update_lyric_info(self) -> None:
+        from ai.lyric_text import parse_lyric_pairs
+        pairs = parse_lyric_pairs(self._lyrics.toPlainText())
+        if not pairs:
+            self._lyric_info.setText("")
+            return
+        n_src = sum(1 for p in pairs if p.source)
+        n_tr = sum(1 for p in pairs if p.translation)
+        if n_tr:
+            self._lyric_info.setText(
+                f"가사 {len(pairs)}쌍 감지 (원문 {n_src} · 번역 {n_tr}) — "
+                "번역 유사도로 자막 줄을 찾아 연결합니다.")
+        else:
+            self._lyric_info.setText(
+                f"원문 {len(pairs)}줄 감지 — 대상 줄에 순서대로 1:1 연결합니다.")
+
+    def lyric_text(self) -> str:
+        """붙여넣은 가사 원문 텍스트 (없으면 빈 문자열)."""
+        return self._lyrics.toPlainText().strip()
 
     def language(self) -> Optional[str]:
         """선택된 ISO 코드. 자동 감지는 None."""
@@ -2083,14 +2123,58 @@ class MainWindow(QMainWindow):
         if opt_dlg.exec() != QDialog.DialogCode.Accepted:
             return
         clip_s, clip_e = opt_dlg.clip_range()
+        language = opt_dlg.language()
+
+        # 가사 원문 붙여넣기 — 자막 줄에 연결해 정렬 ref 로 쓴다. 연결된
+        # 줄만 동기화 대상이 된다 (가사를 준 노래 구간만 재정렬).
+        ref_texts = None
+        lyric_raw = opt_dlg.lyric_text()
+        if lyric_raw:
+            from ai.lyric_normalize import detect_language
+            from ai.lyric_text import build_ref_map
+            rows = self._db.get_events(self._main_track_id)
+            sel_set = set(only_ids) if only_ids else None
+            targets = [
+                (r.id, r.text) for r in rows
+                if not r.is_comment and (sel_set is None or r.id in sel_set)
+            ]
+            rm = build_ref_map(lyric_raw, targets)
+            if not rm.matched_ids:
+                QMessageBox.warning(
+                    self, "AI 동기화",
+                    "붙여넣은 가사를 자막 줄에 연결하지 못했습니다.\n"
+                    "원문+번역 형식이면 한국어 줄이 자막 텍스트와 비슷해야 하고,\n"
+                    "원문만 넣을 때는 노래 줄들을 먼저 선택한 뒤 '선택 동기화'를 쓰세요.")
+                return
+            msg = None
+            if rm.by_translation and rm.n_unmatched > 0:
+                msg = (f"가사 {rm.n_pairs}쌍 중 {len(rm.matched_ids)}줄만 연결되었습니다 "
+                       f"(미연결 {rm.n_unmatched}쌍).\n연결된 줄만 동기화할까요?")
+            elif not rm.by_translation and rm.n_pairs != len(targets):
+                msg = (f"원문 {rm.n_pairs}줄을 대상 {len(targets)}줄에 앞에서부터 "
+                       f"순서대로 연결합니다.\n노래 구간만 연결하려면 취소 후 그 줄들을 "
+                       f"선택하고 '선택 동기화'를 사용하세요.\n계속할까요?")
+            if msg and QMessageBox.question(
+                self, "가사 연결", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            ref_texts = rm.ref_texts
+            only_ids = list(rm.matched_ids)
+            # 언어 자동이면 원문 가사에서 감지 — 한국어 자막 때문에 ko 로
+            # 잘못 고정되는 것을 막는다.
+            if language is None and ref_texts:
+                language = detect_language(" ".join(ref_texts.values())) or None
+
         options = SyncOptions(
             model_size=opt_dlg.model_size(),
-            language=opt_dlg.language(),
+            language=language,
             separate_vocals=opt_dlg.separate_vocals(),
             vad_filter=opt_dlg.vad_filter(),
             only_event_ids=only_ids,
             clip_start_ms=clip_s,
             clip_end_ms=clip_e,
+            ref_texts=ref_texts,
         )
 
         # 진행 다이얼로그
