@@ -2158,27 +2158,47 @@ class MainWindow(QMainWindow):
             ]
             rm = build_ref_map(lyric_raw, targets)
             if not rm.matched_ids:
-                QMessageBox.warning(
-                    self, "AI 동기화",
-                    "붙여넣은 가사를 자막 줄에 연결하지 못했습니다.\n"
-                    "원문+번역 형식이면 한국어 줄이 자막 텍스트와 비슷해야 하고,\n"
-                    "원문만 넣을 때는 노래 줄들을 먼저 선택한 뒤 '선택 동기화'를 쓰세요.")
-                return
-            msg = None
-            if rm.by_translation and rm.n_unmatched > 0:
-                msg = (f"가사 {rm.n_pairs}쌍 중 {len(rm.matched_ids)}줄만 연결되었습니다 "
-                       f"(미연결 {rm.n_unmatched}쌍).\n연결된 줄만 동기화할까요?")
-            elif not rm.by_translation and rm.n_pairs != len(targets):
-                msg = (f"원문 {rm.n_pairs}줄을 대상 {len(targets)}줄에 앞에서부터 "
-                       f"순서대로 연결합니다.\n노래 구간만 연결하려면 취소 후 그 줄들을 "
-                       f"선택하고 '선택 동기화'를 사용하세요.\n계속할까요?")
-            if msg and QMessageBox.question(
-                self, "가사 연결", msg,
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            ) != QMessageBox.StandardButton.Yes:
-                return
-            ref_texts = rm.ref_texts
-            only_ids = list(rm.matched_ids)
+                # 자막에 아직 이 노래의 줄이 없는 경우 — 가사로 새 줄을
+                # 만들어 준다 (원문\N독음\N번역 스택, 시간은 AI 제안).
+                from ai.lyric_text import parse_lyric_pairs
+                pairs = [p for p in parse_lyric_pairs(lyric_raw)
+                         if p.source or p.translation]
+                if not any(p.source for p in pairs):
+                    QMessageBox.warning(
+                        self, "AI 동기화",
+                        "붙여넣은 가사에서 원문(일본어 등) 줄을 찾지 못했습니다.\n"
+                        "실제 불리는 원문 가사를 포함해 주세요.")
+                    return
+                if QMessageBox.question(
+                    self, "가사로 줄 만들기",
+                    f"붙여넣은 가사를 기존 자막 줄에 연결하지 못했습니다.\n"
+                    f"가사로 새 줄 {len(pairs)}개를 만들고 동기화할까요?\n"
+                    f"(각 줄 텍스트: 원문+독음+번역, 시간은 AI 제안으로 채워집니다)",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                ) != QMessageBox.StandardButton.Yes:
+                    return
+                ref_texts, only_ids = self._create_events_from_lyrics(
+                    pairs, clip_s if clip_s is not None else 0)
+                if not only_ids:
+                    QMessageBox.warning(self, "AI 동기화",
+                                        "생성할 가사 줄이 없습니다.")
+                    return
+            else:
+                msg = None
+                if rm.by_translation and rm.n_unmatched > 0:
+                    msg = (f"가사 {rm.n_pairs}쌍 중 {len(rm.matched_ids)}줄만 연결되었습니다 "
+                           f"(미연결 {rm.n_unmatched}쌍).\n연결된 줄만 동기화할까요?")
+                elif not rm.by_translation and rm.n_pairs != len(targets):
+                    msg = (f"원문 {rm.n_pairs}줄을 대상 {len(targets)}줄에 앞에서부터 "
+                           f"순서대로 연결합니다.\n노래 구간만 연결하려면 취소 후 그 줄들을 "
+                           f"선택하고 '선택 동기화'를 사용하세요.\n계속할까요?")
+                if msg and QMessageBox.question(
+                    self, "가사 연결", msg,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                ) != QMessageBox.StandardButton.Yes:
+                    return
+                ref_texts = rm.ref_texts
+                only_ids = list(rm.matched_ids)
             # 언어 자동이면 원문 가사에서 감지 — 한국어 자막 때문에 ko 로
             # 잘못 고정되는 것을 막는다.
             if language is None and ref_texts:
@@ -2225,6 +2245,47 @@ class MainWindow(QMainWindow):
         self._ai_progress.canceled.connect(self._ai_worker.cancel)
 
         self._ai_thread.start()
+
+    def _create_events_from_lyrics(
+        self, pairs, start_ms: int,
+    ) -> "tuple[dict[str, str], list[str]]":
+        """가사 쌍으로 새 이벤트 생성 — 텍스트는 원문\\N독음\\N번역 스택.
+
+        시간은 start_ms 부터 2초 간격 placeholder — AI 제안이 채운다.
+        Returns (ref_texts, 동기화 대상 event_ids). 원문 있는 줄만 대상.
+        """
+        events = self._db.get_events(self._main_track_id)
+        order = len(events)
+        new_events: list[EventRow] = []
+        ref_texts: dict[str, str] = {}
+        ids: list[str] = []
+        t = max(0, int(start_ms))
+        for p in pairs:
+            parts = [x for x in (p.source, p.reading, p.translation) if x]
+            if not parts:
+                continue
+            eid = str(uuid.uuid4())
+            new_events.append(EventRow(
+                id=eid,
+                track_id=self._main_track_id,
+                start_ms=t,
+                end_ms=t + 2000,
+                text=r"\N".join(parts),
+                order_index=order + len(new_events),
+            ))
+            if p.source:
+                ref_texts[eid] = p.source
+                ids.append(eid)
+            t += 2000
+        if not new_events:
+            return {}, []
+        from app.commands.edit_commands import BulkInsertEventsCommand
+        self.cmd_bus.execute(BulkInsertEventsCommand(self._db, new_events))
+        self._mark_modified()
+        self._refresh_all()
+        self.statusBar().showMessage(
+            f"가사로 {len(new_events)}줄 생성됨 — AI 동기화 진행 중", 5000)
+        return ref_texts, ids
 
     def _on_ai_progress(self, frac: float, msg: str) -> None:
         if hasattr(self, "_ai_progress") and self._ai_progress is not None:

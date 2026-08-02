@@ -68,12 +68,20 @@ def _hangul_to_roman(text: str) -> str:
 
 
 def _fold_pron(s: str) -> str:
-    """언어별 표기 차이를 발음 근사로 접는다 — 츠(cheu)≈つ(tsu), l≈r 등."""
+    """언어별 표기 차이를 발음 근사로 접는다 — 츠(cheu)≈つ(tsu), l≈r, ざ(za)≈자(ja)."""
     s = re.sub(r"[^a-z]", "", s.lower())
     for a, b in (("sh", "s"), ("ch", "c"), ("ts", "c"), ("l", "r"),
-                 ("f", "h"), ("wo", "o"), ("eu", "u"), ("eo", "o")):
+                 ("f", "h"), ("wo", "o"), ("eu", "u"), ("eo", "o"), ("z", "j")):
         s = s.replace(a, b)
     return re.sub(r"(.)\1+", r"\1", s)
+
+
+def _letters_only(s: str) -> str:
+    """문자/숫자만 남긴다 — ･･･ 같은 기호를 pykakasi 가 반복 부호로
+    오해석해 romaji 를 오염시키는 것을 막는다 (실측: 遠ざかる･･･ →
+    'toozakarukarukarukaru')."""
+    import unicodedata
+    return "".join(ch for ch in s if unicodedata.category(ch)[0] in ("L", "N"))
 
 
 # 2줄(원문/한글) 형식에서 한글 줄을 독음으로 판정하는 임계값. 번역이 외래어를
@@ -84,14 +92,16 @@ _READING_SIM = 0.65
 def _sounds_like(source: str, hangul: str) -> float | None:
     """한글 줄이 source(일본어 등)의 독음처럼 들리는지 — 유사도 0~1.
 
-    로마자 변환 불가(pykakasi 미설치 등)면 None (판단 불가).
+    로마자 변환 불가(pykakasi 미설치 등)거나 비교할 발음이 너무 짧아
+    (folded 4자 미만 — 단일 한자는 kakasi 가 문맥 없이 다른 독음을 고를 수
+    있다: 駈→ku vs 카, 上→ue vs 아) 판단이 무의미하면 None.
     """
-    rom_src = to_romaji(source)
+    rom_src = to_romaji(_letters_only(source))
     if not rom_src:
         return None
     a = _fold_pron(rom_src)
     b = _fold_pron(_hangul_to_roman(hangul))
-    if not a or not b:
+    if not a or not b or len(a) < 4 or len(b) < 4:
         return None
     return SequenceMatcher(None, a, b).ratio()
 
@@ -104,20 +114,34 @@ def parse_lyric_pairs(raw: str) -> list[LyricPair]:
     한글 2줄은 가사/독음/한국어 3줄 형식 — 발음이 원문과 비슷한 첫 줄을
     독음으로 옮기고 둘째 줄을 번역으로 삼는다. 한글 1줄뿐이어도 발음이
     원문과 거의 같으면 번역이 아니라 독음으로 재분류한다.
+
+    빈 줄은 절(verse) 경계 — 한글 줄 없이 빈 줄로 끝난 원문 블록(무대 지시문,
+    영어 머리말 등)은 원문 단독 쌍으로 닫아서 다음 절과 섞이지 않게 한다.
     """
-    lines = [ln.strip() for ln in raw.replace("\r", "").split("\n")]
-    lines = [ln for ln in lines if ln]
-    if not lines:
+    all_lines = [ln.strip() for ln in raw.replace("\r", "").split("\n")]
+    nonempty = [ln for ln in all_lines if ln]
+    if not nonempty:
         return []
-    is_ko = [detect_language(ln) == "ko" for ln in lines]
-    if not any(is_ko):
-        return [LyricPair(ln, None) for ln in lines]
+    if not any(detect_language(ln) == "ko" for ln in nonempty):
+        return [LyricPair(ln, None) for ln in nonempty]
 
     pairs: list[LyricPair] = []
     pending: list[str] = []
     open_pair: LyricPair | None = None  # 직전 원문 블록을 닫은 쌍 (한글 1줄 수용)
-    for ln, ko in zip(lines, is_ko):
-        if not ko:
+
+    def _flush_pending() -> None:
+        nonlocal pending
+        if pending:
+            pairs.append(LyricPair(" ".join(pending), None))
+            pending = []
+
+    for ln in all_lines:
+        if not ln:
+            # 절 경계 — 한글 없이 끝난 원문 블록을 닫고 3줄 수집도 종료.
+            _flush_pending()
+            open_pair = None
+            continue
+        if detect_language(ln) != "ko":
             open_pair = None
             pending.append(ln)
             continue
@@ -128,7 +152,7 @@ def parse_lyric_pairs(raw: str) -> list[LyricPair]:
         elif open_pair is not None:
             # 원문 뒤 두 번째 연속 한글 줄 — 3줄 형식이면 앞 줄이 독음.
             # 발음으로 확인하고(실측: 독음 0.9+, 번역 0.55 이하), 판단
-            # 불가(pykakasi 미설치)면 형식(가사/독음/한국어 순서)을 믿는다.
+            # 불가(초단문·pykakasi 미설치)면 형식 순서를 믿는다.
             first = open_pair.translation
             sim = _sounds_like(open_pair.source, first) if open_pair.source else 0.0
             if sim is None or sim >= _READING_SIM:
@@ -139,8 +163,7 @@ def parse_lyric_pairs(raw: str) -> list[LyricPair]:
             open_pair = None
         else:
             pairs.append(LyricPair(None, ln))
-    if pending:
-        pairs.append(LyricPair(" ".join(pending), None))
+    _flush_pending()
 
     # 원문+한글 1줄 쌍 — 한글이 번역이 아니라 독음인 2줄 형식 가려내기.
     # 독음을 번역으로 두면 자막 텍스트와 유사도 매칭이 어긋나므로 중요하다.
