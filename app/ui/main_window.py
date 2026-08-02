@@ -2160,13 +2160,13 @@ class MainWindow(QMainWindow):
             if not rm.matched_ids:
                 # 자막에 아직 이 노래의 줄이 없는 경우 — 가사로 새 줄을
                 # 만들어 준다 (원문\N독음\N번역 스택, 시간은 AI 제안).
-                from ai.lyric_text import parse_lyric_pairs
+                from ai.lyric_text import creation_sync_targets, parse_lyric_pairs
                 pairs = [p for p in parse_lyric_pairs(lyric_raw)
                          if p.source or p.translation]
-                if not any(p.source for p in pairs):
+                if not creation_sync_targets(pairs):
                     QMessageBox.warning(
                         self, "AI 동기화",
-                        "붙여넣은 가사에서 원문(일본어 등) 줄을 찾지 못했습니다.\n"
+                        "붙여넣은 가사에서 정렬할 원문(일본어 등) 줄을 찾지 못했습니다.\n"
                         "실제 불리는 원문 가사를 포함해 주세요.")
                     return
                 if QMessageBox.question(
@@ -2254,8 +2254,12 @@ class MainWindow(QMainWindow):
         시간은 start_ms 부터 2초 간격 placeholder — AI 제안이 채운다.
         Returns (ref_texts, 동기화 대상 event_ids). 원문 있는 줄만 대상.
         """
+        from ai.lyric_text import creation_sync_targets
         events = self._db.get_events(self._main_track_id)
         order = len(events)
+        # 동기화 대상 판정 — 고립된 원문 블록(머리말·지시문)은 줄은 만들되
+        # 정렬 대상에서 뺀다 (불리는 가사가 아니라 fallback 쓰레기가 된다).
+        sync_set = {id(p) for p in creation_sync_targets(pairs)}
         new_events: list[EventRow] = []
         ref_texts: dict[str, str] = {}
         ids: list[str] = []
@@ -2273,7 +2277,7 @@ class MainWindow(QMainWindow):
                 text=r"\N".join(parts),
                 order_index=order + len(new_events),
             ))
-            if p.source:
+            if id(p) in sync_set:
                 ref_texts[eid] = p.source
                 ids.append(eid)
             t += 2000

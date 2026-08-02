@@ -187,6 +187,19 @@ def _similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+def creation_sync_targets(pairs: list[LyricPair]) -> list[LyricPair]:
+    """새 줄 생성 시 동기화 대상이 될 쌍만 고른다.
+
+    원문이 있어야 하고, 독음/번역이 섞인 형식에서는 한글 짝이 붙은 쌍만 —
+    한글 없이 고립된 원문 블록(영어 머리말·무대 지시문)은 불리는 가사가
+    아니므로 정렬 대상이 되면 쓰레기 fallback 제안만 생긴다.
+    원문만 있는 형식(한글이 전혀 없음)이면 모든 원문 쌍이 대상이다.
+    """
+    mixed = any(p.reading or p.translation for p in pairs)
+    return [p for p in pairs
+            if p.source and (not mixed or p.reading or p.translation)]
+
+
 def build_ref_map(
     raw: str,
     events: list[tuple[str, str]],
