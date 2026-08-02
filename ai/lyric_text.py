@@ -29,11 +29,13 @@ class LyricPair:
 
 @dataclass(slots=True)
 class RefMapResult:
-    """build_ref_map 결과."""
+    """build_ref_map 결과. matched_ids 의 모든 이벤트는 ref_texts 에 원문이
+    있다 — 원문 없는 줄은 동기화 대상에 넣지 않는다 (ref 없이 한국어 텍스트로
+    일본어 transcript 에 정렬하면 무의미한 fallback 제안만 생긴다)."""
     ref_texts: dict[str, str]     # event_id -> 정렬 기준 원문
-    matched_ids: list[str]        # 가사와 연결된 이벤트 (표시 순서)
+    matched_ids: list[str]        # 원문이 연결된 이벤트 (표시 순서)
     n_pairs: int                  # 파싱된 가사 쌍 수
-    n_unmatched: int              # 이벤트를 못 찾은 쌍 수
+    n_unmatched: int              # 원문을 연결하지 못한 쌍 수
     by_translation: bool          # True=번역 유사도 매칭, False=순서 1:1
 
 
@@ -129,9 +131,13 @@ def build_ref_map(
         if idx < 0:
             n_unmatched += 1
             continue
+        cursor = idx + 1
+        if not pair.source:
+            # 원문 없는 번역 단독 줄 — 단조 진행(cursor)에만 반영하고 동기화
+            # 대상에서는 뺀다. ref 없이 재정렬하면 매칭 0 fallback 만 생긴다.
+            n_unmatched += 1
+            continue
         eid = ev_norm[idx][0]
         matched_ids.append(eid)
-        if pair.source:
-            ref_texts[eid] = pair.source
-        cursor = idx + 1
+        ref_texts[eid] = pair.source
     return RefMapResult(ref_texts, matched_ids, len(pairs), n_unmatched, True)
