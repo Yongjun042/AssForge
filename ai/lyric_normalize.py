@@ -63,6 +63,27 @@ def _to_hiragana(text: str) -> str:
     )
 
 
+def to_romaji(text: str) -> str:
+    """일본어 → 헵번 로마자 (pykakasi). 미설치/실패 시 빈 문자열.
+
+    한글 독음(예: '요루노 카루마가')과 일본어 원문을 발음 공간에서 비교할 때
+    쓴다 — lyric_text._sounds_like 참고.
+    """
+    global _kakasi, _kakasi_failed
+    if _kakasi is None and not _kakasi_failed:
+        try:
+            import pykakasi
+            _kakasi = pykakasi.kakasi()
+        except Exception:
+            _kakasi_failed = True
+    if _kakasi is None:
+        return ""
+    try:
+        return "".join(item["hepburn"] for item in _kakasi.convert(text)).lower()
+    except Exception:
+        return ""
+
+
 def strip_ass_text(text: str) -> str:
     """ASS override tag 와 hard newline 제거."""
     text = _TAG_RE.sub("", text)

@@ -389,6 +389,15 @@ class _AiSyncOptionsDialog(QDialog):
         self._vad.setChecked(settings.value("aiSyncVad", False, type=bool))
         form.addRow(self._vad)
 
+        self._snap_video = QCheckBox("영상 그래픽 전환에 시간 스냅 (화면 가사 영상용)")
+        self._snap_video.setToolTip(
+            "Whisper 일치율이 낮아도, 화면 모션그래픽(가사 연출)의 등장·소멸\n"
+            "시점을 영상에서 감지해 제안 시작/끝을 ±0.8초 이내로 스냅합니다.\n"
+            "미러링 자동 효과와 같은 신호를 쓰므로 효과 분석 창과도 일치합니다.")
+        self._snap_video.setChecked(
+            settings.value("aiSyncSnapVideo", False, type=bool))
+        form.addRow(self._snap_video)
+
         # 동영상 시간 범위 제한 (선택 영역 재정렬 시) — 그 구간만 전사
         self._clip_on = QCheckBox("동영상 시간 범위만 전사 (초)")
         self._clip_start = QDoubleSpinBox()
@@ -437,9 +446,10 @@ class _AiSyncOptionsDialog(QDialog):
         self._lyrics.setPlaceholderText(
             "(선택) 실제 불리는 가사 원문을 붙여넣으세요 — 한 줄에 한 소절.\n"
             "원문만 넣으면 대상 줄에 순서대로 연결됩니다.\n"
-            "원문+한국어 번역을 번갈아 넣으면 번역으로 자막 줄을 자동으로 찾습니다:\n"
+            "원문/독음/한국어 형식도 자동 인식합니다:\n"
             "  夜の因業（カルマ）が…\n"
-            "  밤의 인업(카르마)이…"
+            "  요루노 인고우(카루마)가…   ← 독음(생략 가능)\n"
+            "  밤의 인업(카르마)이…       ← 번역으로 자막 줄을 찾음"
         )
         self._lyrics.setMaximumHeight(140)
         self._lyric_info = QLabel("")
@@ -483,6 +493,7 @@ class _AiSyncOptionsDialog(QDialog):
         self._settings.setValue("aiSyncLanguage", self._lang.currentData() or "")
         self._settings.setValue("aiSyncModel", self._model.currentText())
         self._settings.setValue("aiSyncVad", self._vad.isChecked())
+        self._settings.setValue("aiSyncSnapVideo", self._snap_video.isChecked())
         if self._vocals.isEnabled():
             self._settings.setValue("aiSyncSeparateVocals", self._vocals.isChecked())
         super().accept()
@@ -495,13 +506,17 @@ class _AiSyncOptionsDialog(QDialog):
             return
         n_src = sum(1 for p in pairs if p.source)
         n_tr = sum(1 for p in pairs if p.translation)
+        n_rd = sum(1 for p in pairs if p.reading)
+        rd = f" · 독음 {n_rd}" if n_rd else ""
         if n_tr:
             self._lyric_info.setText(
-                f"가사 {len(pairs)}쌍 감지 (원문 {n_src} · 번역 {n_tr}) — "
+                f"가사 {len(pairs)}쌍 감지 (원문 {n_src}{rd} · 번역 {n_tr}) — "
                 "번역 유사도로 자막 줄을 찾아 연결합니다.")
         else:
+            extra = f" (독음 {n_rd})" if n_rd else ""
             self._lyric_info.setText(
-                f"원문 {len(pairs)}줄 감지 — 대상 줄에 순서대로 1:1 연결합니다.")
+                f"원문 {len(pairs)}줄 감지{extra} — "
+                "대상 줄에 순서대로 1:1 연결합니다.")
 
     def lyric_text(self) -> str:
         """붙여넣은 가사 원문 텍스트 (없으면 빈 문자열)."""
@@ -519,6 +534,9 @@ class _AiSyncOptionsDialog(QDialog):
 
     def vad_filter(self) -> bool:
         return self._vad.isChecked()
+
+    def snap_to_video(self) -> bool:
+        return self._snap_video.isChecked()
 
     def clip_range(self) -> "tuple[Optional[int], Optional[int]]":
         """(start_ms, end_ms) 또는 (None, None) — 시간 범위 미사용."""
@@ -2175,6 +2193,7 @@ class MainWindow(QMainWindow):
             clip_start_ms=clip_s,
             clip_end_ms=clip_e,
             ref_texts=ref_texts,
+            snap_to_video=opt_dlg.snap_to_video(),
         )
 
         # 진행 다이얼로그

@@ -8,23 +8,28 @@
   · 원문만 — 한 줄에 하나. 대상 줄에 순서대로 1:1 연결.
   · 원문 + 한국어 번역 교차 — 한국어 줄이 직전 원문 블록을 닫는다.
     번역 텍스트 유사도로 기존 자막 줄을 자동으로 찾아 연결한다.
+  · 원문 + 독음 + 한국어 번역 3줄 — 독음(요루노 카루마가…)도 한글이므로,
+    원문 뒤 연속된 한글 2줄은 발음 유사도로 확인해 첫 줄=독음, 둘째 줄=번역.
+    원문+독음 2줄 형식도 발음 유사도로 독음을 가려내 번역으로 오인하지 않는다.
 
-분류 규칙: 한국어(한글 포함) 줄 = 번역, 그 외 모든 줄 = 원문.
+분류 규칙: 한국어(한글 포함) 줄 = 번역 후보, 그 외 모든 줄 = 원문.
 (일본 노래에 영어 소절이 흔하므로 ja 로 한정하지 않는다.)
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
-from ai.lyric_normalize import detect_language, strip_ass_text, tokenize
+from ai.lyric_normalize import detect_language, strip_ass_text, to_romaji, tokenize
 
 
 @dataclass(slots=True)
 class LyricPair:
-    """가사 한 줄 단위 — 원문(불리는 텍스트)과 한국어 번역."""
+    """가사 한 줄 단위 — 원문(불리는 텍스트) / 한국어 번역 / 한글 독음."""
     source: str | None
     translation: str | None
+    reading: str | None = None
 
 
 @dataclass(slots=True)
@@ -39,11 +44,66 @@ class RefMapResult:
     by_translation: bool          # True=번역 유사도 매칭, False=순서 1:1
 
 
-def parse_lyric_pairs(raw: str) -> list[LyricPair]:
-    """붙여넣은 텍스트를 (원문, 번역) 쌍 리스트로.
+# ── 발음 비교 (독음 판별) ────────────────────────────────────────
+# 한글 음절 → 로마자 (개정 로마자 표기 근사 — 발음 비교용이라 정밀할 필요 없음)
+_CHO = ("g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "",
+        "j", "jj", "ch", "k", "t", "p", "h")
+_JUNG = ("a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae",
+         "oe", "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i")
+_JONG = ("", "k", "k", "k", "n", "n", "n", "t", "l", "k", "m", "l", "l",
+         "l", "p", "l", "m", "p", "p", "t", "t", "ng", "t", "t", "k", "t",
+         "p", "t")
 
-    한국어 줄이 하나도 없으면 각 줄이 독립 원문. 있으면 한국어 줄이
-    직전까지 쌓인 원문 블록을 닫는다 (원문 2줄 + 번역 1줄도 한 쌍).
+
+def _hangul_to_roman(text: str) -> str:
+    out: list[str] = []
+    for ch in text:
+        cp = ord(ch)
+        if 0xAC00 <= cp <= 0xD7A3:
+            i = cp - 0xAC00
+            out.append(_CHO[i // 588] + _JUNG[(i % 588) // 28] + _JONG[i % 28])
+        elif ch.isascii() and ch.isalpha():
+            out.append(ch.lower())
+    return "".join(out)
+
+
+def _fold_pron(s: str) -> str:
+    """언어별 표기 차이를 발음 근사로 접는다 — 츠(cheu)≈つ(tsu), l≈r 등."""
+    s = re.sub(r"[^a-z]", "", s.lower())
+    for a, b in (("sh", "s"), ("ch", "c"), ("ts", "c"), ("l", "r"),
+                 ("f", "h"), ("wo", "o"), ("eu", "u"), ("eo", "o")):
+        s = s.replace(a, b)
+    return re.sub(r"(.)\1+", r"\1", s)
+
+
+# 2줄(원문/한글) 형식에서 한글 줄을 독음으로 판정하는 임계값. 번역이 외래어를
+# 공유해도(카르마 등) 0.5 부근에 그치고, 실제 독음은 0.8+ 로 갈린다.
+_READING_SIM = 0.65
+
+
+def _sounds_like(source: str, hangul: str) -> float | None:
+    """한글 줄이 source(일본어 등)의 독음처럼 들리는지 — 유사도 0~1.
+
+    로마자 변환 불가(pykakasi 미설치 등)면 None (판단 불가).
+    """
+    rom_src = to_romaji(source)
+    if not rom_src:
+        return None
+    a = _fold_pron(rom_src)
+    b = _fold_pron(_hangul_to_roman(hangul))
+    if not a or not b:
+        return None
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def parse_lyric_pairs(raw: str) -> list[LyricPair]:
+    """붙여넣은 텍스트를 (원문, 번역, 독음) 쌍 리스트로.
+
+    한국어 줄이 하나도 없으면 각 줄이 독립 원문. 있으면 한국어 줄이 직전까지
+    쌓인 원문 블록을 닫는다 (원문 2줄 + 번역 1줄도 한 쌍). 원문 뒤 연속된
+    한글 2줄은 가사/독음/한국어 3줄 형식 — 발음이 원문과 비슷한 첫 줄을
+    독음으로 옮기고 둘째 줄을 번역으로 삼는다. 한글 1줄뿐이어도 발음이
+    원문과 거의 같으면 번역이 아니라 독음으로 재분류한다.
     """
     lines = [ln.strip() for ln in raw.replace("\r", "").split("\n")]
     lines = [ln for ln in lines if ln]
@@ -55,14 +115,41 @@ def parse_lyric_pairs(raw: str) -> list[LyricPair]:
 
     pairs: list[LyricPair] = []
     pending: list[str] = []
+    open_pair: LyricPair | None = None  # 직전 원문 블록을 닫은 쌍 (한글 1줄 수용)
     for ln, ko in zip(lines, is_ko):
         if not ko:
+            open_pair = None
             pending.append(ln)
             continue
-        pairs.append(LyricPair(" ".join(pending) if pending else None, ln))
-        pending = []
+        if pending:
+            open_pair = LyricPair(" ".join(pending), ln)
+            pairs.append(open_pair)
+            pending = []
+        elif open_pair is not None:
+            # 원문 뒤 두 번째 연속 한글 줄 — 3줄 형식이면 앞 줄이 독음.
+            # 발음으로 확인하고(실측: 독음 0.9+, 번역 0.55 이하), 판단
+            # 불가(pykakasi 미설치)면 형식(가사/독음/한국어 순서)을 믿는다.
+            first = open_pair.translation
+            sim = _sounds_like(open_pair.source, first) if open_pair.source else 0.0
+            if sim is None or sim >= _READING_SIM:
+                open_pair.reading = first
+                open_pair.translation = ln
+            else:
+                pairs.append(LyricPair(None, ln))
+            open_pair = None
+        else:
+            pairs.append(LyricPair(None, ln))
     if pending:
         pairs.append(LyricPair(" ".join(pending), None))
+
+    # 원문+한글 1줄 쌍 — 한글이 번역이 아니라 독음인 2줄 형식 가려내기.
+    # 독음을 번역으로 두면 자막 텍스트와 유사도 매칭이 어긋나므로 중요하다.
+    for p in pairs:
+        if p.source and p.translation and p.reading is None:
+            sim = _sounds_like(p.source, p.translation)
+            if sim is not None and sim >= _READING_SIM:
+                p.reading = p.translation
+                p.translation = None
     return pairs
 
 

@@ -63,6 +63,10 @@ class SyncOptions:
     # 원문 가사(일본어 등)로 정렬하면 발음 공간에서 정확히 매칭된다.
     # 시간 제안만 바뀌고 표시 텍스트는 그대로다.
     ref_texts: Optional[dict[str, str]] = None
+    # 영상 그래픽 전환(화면 가사 모션그래픽 등장·소멸, 장면 컷)에 시간 스냅.
+    # Whisper 는 대략의 위치만, 정밀 경계는 영상에서 얻는다 — 미러링 분석과
+    # 같은 돌출 신호를 쓰므로 이후 자동 효과 연출 창과도 일치한다.
+    snap_to_video: bool = False
 
 
 def run_sync(
@@ -281,6 +285,16 @@ def run_sync(
         suggestions.append((al.event_id, s_ms, e_ms, conf))
         confs.append(conf)
 
+    # 6) 영상 그래픽 경계 스냅 (옵션)
+    if options.snap_to_video and suggestions:
+        _check_cancel(cancel_event)
+        _p(0.94, "영상 그래픽 전환 감지 중...")
+        suggestions = _snap_suggestions_to_video(
+            suggestions, audio_source,
+            clip_s if clip else None, clip_e if clip else None,
+            cancel_event,
+        )
+
     avg_conf = float(sum(confs) / len(confs)) if confs else 0.0
     zero_match = sum(1 for al in alignments if al.matched_token_count == 0)
     low_conf = sum(1 for c in confs if c < 0.3)
@@ -295,6 +309,67 @@ def run_sync(
         avg_confidence=avg_conf,
         language=detected_lang,
     )
+
+
+# 그래픽 경계 스냅 허용 반경 — Whisper 추정이 이보다 가까우면 경계로 이동.
+# 너무 크면 이웃 그래픽의 경계에 붙는다. 실측(00003.m2ts): 노래 전사의
+# 시작 오차 630ms 사례가 있어 600 으론 부족했다.
+_SNAP_TOL_MS = 800
+_SNAP_MIN_DUR_MS = 200
+
+
+def _snap_ms(ms: int, bounds: list[int], tol: int = _SNAP_TOL_MS) -> int:
+    """정렬된 bounds 중 가장 가까운 경계가 tol 이내면 그 값, 아니면 원값."""
+    if not bounds:
+        return ms
+    import bisect
+    i = bisect.bisect_left(bounds, ms)
+    best, bd = ms, tol + 1
+    for j in (i - 1, i):
+        if 0 <= j < len(bounds):
+            d = abs(bounds[j] - ms)
+            if d < bd:
+                bd, best = d, bounds[j]
+    return best if bd <= tol else ms
+
+
+def _snap_suggestions_to_video(
+    suggestions: list[tuple[str, int, int, float]],
+    video_path: str,
+    clip_s: Optional[int],
+    clip_e: Optional[int],
+    cancel_event: Optional[threading.Event],
+) -> list[tuple[str, int, int, float]]:
+    """제안 시작/끝을 근처 영상 그래픽 전환점으로 스냅.
+
+    스냅 후 길이가 너무 짧아지면(양끝이 같은 경계로 붙는 등) 원값 유지.
+    경계 감지 실패(비디오 아님 등) 시 그대로 반환.
+    """
+    from media.video_analysis import detect_graphic_boundaries
+    lo = min(s for _id, s, _e, _c in suggestions) - 1500
+    hi = max(e for _id, _s, e, _c in suggestions) + 1500
+    if clip_s is not None and clip_e is not None:
+        lo, hi = max(lo, clip_s), min(hi, clip_e)
+    bounds = detect_graphic_boundaries(
+        video_path, max(0, lo), hi,
+        cancel_check=(cancel_event.is_set if cancel_event is not None else None),
+    )
+    if not bounds:
+        return suggestions
+    out: list[tuple[str, int, int, float]] = []
+    snapped = 0
+    for eid, s_ms, e_ms, conf in suggestions:
+        ns, ne = _snap_ms(s_ms, bounds), _snap_ms(e_ms, bounds)
+        if clip_s is not None and clip_e is not None:
+            ns = max(clip_s, min(ns, clip_e))
+            ne = max(clip_s, min(ne, clip_e))
+        if ne - ns >= _SNAP_MIN_DUR_MS and (ns, ne) != (s_ms, e_ms):
+            snapped += 1
+            s_ms, e_ms = ns, ne
+        out.append((eid, s_ms, e_ms, conf))
+    log.info("그래픽 경계 스냅: 경계 %d개, %d/%d 줄 조정",
+             len(bounds), snapped, len(out))
+    return out
 
 
 def _ensure_audio_wav(path: str) -> Optional[str]:

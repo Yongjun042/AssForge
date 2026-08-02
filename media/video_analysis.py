@@ -121,6 +121,105 @@ def _probe_fps(video_path: str) -> float:
     return min(_MAX_FPS, fps)
 
 
+_BOUND_MIN_GAP_MS = 120.0     # 이보다 가까운 피크는 강한 쪽 하나로 병합
+_BOUND_LAG_MS = 250.0         # 페이드 누적 비교 창 — BD 그래픽은 서서히 뜬다
+
+
+def detect_graphic_boundaries(
+    video_path: str,
+    start_ms: int,
+    end_ms: int,
+    cancel_check=None,
+) -> list[int]:
+    """[start,end] 구간의 화면 그래픽 전환 시점(ms) 목록 — AI 싱크 스냅용.
+
+    돌출(채도+고휘도) 가중 맵을 ~250ms 이전 프레임과 비교한다 — BD 가사
+    그래픽은 페이드로 등장/소멸해 인접 프레임 차이는 노이즈 수준이지만,
+    페이드 전체가 lag 창 안에 누적되면 뚜렷한 피크가 된다 (00003.m2ts 실측:
+    중앙값 0.12 위로 등장 0.24 / 소멸 0.28). 임계값은 절대값이 아니라
+    중앙값+max(4·MAD, 중앙값/2) 상대 기준. 피크 시각에서 lag/2 를 빼
+    전환의 중심으로 보정한다. 미러링 분석과 같은 돌출 신호를 쓰므로
+    스냅된 시간 창은 이후 자동 효과 연출 분석과도 일치한다.
+    실패/취소 시 빈 리스트.
+    """
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg or end_ms <= start_ms:
+        return []
+    fps = _probe_fps(video_path)
+    frame_ms = 1000.0 / fps
+    lag = max(1, round(_BOUND_LAG_MS / frame_ms))
+    args = [
+        ffmpeg, "-v", "error",
+        "-ss", f"{start_ms / 1000.0:.3f}", "-to", f"{end_ms / 1000.0:.3f}",
+        "-i", video_path,
+        "-vf", f"fps={fps:.6f},scale={_W}:{_H}",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ]
+    ts_list: list[float] = []
+    score: list[float] = []
+    from collections import deque
+    hist: deque[np.ndarray] = deque(maxlen=lag)  # 메모리: lag 프레임만 유지
+    frame_i = 0
+    try:
+        proc = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        assert proc.stdout is not None
+        while True:
+            if cancel_check is not None and cancel_check():
+                kill_tree(proc)
+                return []
+            buf = proc.stdout.read(_FRAME_BYTES)
+            if len(buf) < _FRAME_BYTES:
+                break
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape(_H, _W, 3)
+            ts = start_ms + frame_i * frame_ms
+            frame_i += 1
+            flat = frame.astype(np.int16).reshape(-1, 3)
+            sat = (flat.max(axis=1) - flat.min(axis=1)).astype(np.float64)
+            luma = flat.mean(axis=1)
+            wmap = sat + np.maximum(0.0, luma - 200.0) * 1.5
+            if len(hist) == lag:   # hist[0] = 정확히 lag 프레임 전
+                ts_list.append(ts)
+                score.append(float(np.abs(wmap - hist[0]).mean()))
+            hist.append(wmap)
+        proc.wait(timeout=10)
+    except Exception:
+        log.exception("그래픽 경계 감지 디코드 실패")
+        return []
+    if len(score) < 5:
+        return []
+
+    # 3점 이동평균으로 노이즈 억제 후 상대 임계 피크 추출
+    arr = np.convolve(np.asarray(score), np.ones(3) / 3.0, mode="same")
+    base = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - base)))
+    thr = base + max(4.0 * mad, base * 0.5, 0.02)
+    half_lag_ms = lag * frame_ms / 2.0
+    peaks: list[tuple[float, float]] = []
+    for i, v in enumerate(arr):
+        if v < thr:
+            continue
+        if i > 0 and arr[i - 1] > v:
+            continue
+        if i < len(arr) - 1 and arr[i + 1] >= v:
+            continue
+        peaks.append((ts_list[i] - half_lag_ms, float(v)))
+
+    merged: list[tuple[float, float]] = []
+    for t, v in peaks:
+        if merged and t - merged[-1][0] < _BOUND_MIN_GAP_MS:
+            if v > merged[-1][1]:
+                merged[-1] = (t, v)
+        else:
+            merged.append((t, v))
+    out = [max(0, int(round(t))) for t, _v in merged]
+    log.info("그래픽 경계 감지: %d~%dms @ %.3ffps lag=%d → 피크 %d개 (기준 %.3f)",
+             start_ms, end_ms, fps, lag, len(out), thr)
+    return out
+
+
 def analyze_line_windows(
     video_path: str,
     windows: list[tuple[int, int]],
