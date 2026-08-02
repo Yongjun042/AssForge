@@ -2163,16 +2163,19 @@ class MainWindow(QMainWindow):
                 from ai.lyric_text import creation_sync_targets, parse_lyric_pairs
                 pairs = [p for p in parse_lyric_pairs(lyric_raw)
                          if p.source or p.translation]
-                if not creation_sync_targets(pairs):
+                n_targets = len(creation_sync_targets(pairs))
+                if not n_targets:
                     QMessageBox.warning(
                         self, "AI 동기화",
                         "붙여넣은 가사에서 정렬할 원문(일본어 등) 줄을 찾지 못했습니다.\n"
                         "실제 불리는 원문 가사를 포함해 주세요.")
                     return
+                extra = ("" if n_targets == len(pairs)
+                         else f" (그중 정렬 대상 {n_targets}개 — 머리말 등 제외)")
                 if QMessageBox.question(
                     self, "가사로 줄 만들기",
                     f"붙여넣은 가사를 기존 자막 줄에 연결하지 못했습니다.\n"
-                    f"가사로 새 줄 {len(pairs)}개를 만들고 동기화할까요?\n"
+                    f"가사로 새 줄 {len(pairs)}개를 만들고 동기화할까요?{extra}\n"
                     f"(각 줄 텍스트: 원문+독음+번역, 시간은 AI 제안으로 채워집니다)",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 ) != QMessageBox.StandardButton.Yes:
