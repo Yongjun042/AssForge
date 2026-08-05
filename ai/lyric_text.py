@@ -115,6 +115,10 @@ def parse_lyric_pairs(raw: str) -> list[LyricPair]:
     독음으로 옮기고 둘째 줄을 번역으로 삼는다. 한글 1줄뿐이어도 발음이
     원문과 거의 같으면 번역이 아니라 독음으로 재분류한다.
 
+    같은 블록(빈 줄 없이 이어짐) 안에서 그 뒤로 더 나오는 한글 줄은 여러 줄
+    번역으로 보고 \\N 으로 이어 붙인다 — 영어 프롤로그 3줄 + 한국어 번역
+    4줄 같은 화면 텍스트 블록이 단독 쌍으로 흩어지지 않는다.
+
     빈 줄은 절(verse) 경계 — 한글 줄 없이 빈 줄로 끝난 원문 블록(무대 지시문,
     영어 머리말 등)은 원문 단독 쌍으로 닫아서 다음 절과 섞이지 않게 한다.
     """
@@ -127,7 +131,8 @@ def parse_lyric_pairs(raw: str) -> list[LyricPair]:
 
     pairs: list[LyricPair] = []
     pending: list[str] = []
-    open_pair: LyricPair | None = None  # 직전 원문 블록을 닫은 쌍 (한글 1줄 수용)
+    open_pair: LyricPair | None = None  # 직전 원문 블록을 닫은 쌍 (한글 줄 수용 중)
+    open_ko = 0                         # open_pair 에 붙은 한글 줄 수
 
     def _flush_pending() -> None:
         nonlocal pending
@@ -137,7 +142,7 @@ def parse_lyric_pairs(raw: str) -> list[LyricPair]:
 
     for ln in all_lines:
         if not ln:
-            # 절 경계 — 한글 없이 끝난 원문 블록을 닫고 3줄 수집도 종료.
+            # 절 경계 — 한글 없이 끝난 원문 블록을 닫고 한글 수집도 종료.
             _flush_pending()
             open_pair = None
             continue
@@ -147,20 +152,26 @@ def parse_lyric_pairs(raw: str) -> list[LyricPair]:
             continue
         if pending:
             open_pair = LyricPair(" ".join(pending), ln)
+            open_ko = 1
             pairs.append(open_pair)
             pending = []
         elif open_pair is not None:
-            # 원문 뒤 두 번째 연속 한글 줄 — 3줄 형식이면 앞 줄이 독음.
-            # 발음으로 확인하고(실측: 독음 0.9+, 번역 0.55 이하), 판단
-            # 불가(초단문·pykakasi 미설치)면 형식 순서를 믿는다.
-            first = open_pair.translation
-            sim = _sounds_like(open_pair.source, first) if open_pair.source else 0.0
-            if sim is None or sim >= _READING_SIM:
-                open_pair.reading = first
-                open_pair.translation = ln
-            else:
-                pairs.append(LyricPair(None, ln))
-            open_pair = None
+            if open_ko == 1 and open_pair.reading is None and open_pair.source:
+                # 원문 뒤 두 번째 연속 한글 줄 — 3줄 형식이면 앞 줄이 독음.
+                # 발음으로 확인하고(실측: 독음 0.9+, 번역 0.55 이하), 판단
+                # 불가(초단문·pykakasi 미설치)면 형식 순서를 믿는다.
+                first = open_pair.translation
+                sim = _sounds_like(open_pair.source, first)
+                if sim is None or sim >= _READING_SIM:
+                    open_pair.reading = first
+                    open_pair.translation = ln
+                    open_ko = 2
+                    continue
+            # 같은 블록의 추가 한글 줄 — 여러 줄 번역으로 이어 붙인다.
+            open_pair.translation = (
+                open_pair.translation + r"\N" + ln
+                if open_pair.translation else ln)
+            open_ko += 1
         else:
             pairs.append(LyricPair(None, ln))
     _flush_pending()
