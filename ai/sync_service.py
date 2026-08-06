@@ -400,7 +400,9 @@ def _snap_suggestions_to_video(
                     e_ms = e.ms
                     break
             if e_ms is None:
-                e_ms = ve + 800
+                # 교체/소멸 이벤트를 못 찾으면 끝은 보컬 추정을 그대로 —
+                # 근거 없는 연장은 다음 줄과의 겹침만 만든다.
+                e_ms = ve
         if clip_s is not None and clip_e is not None:
             s_ms = max(clip_s, min(s_ms, clip_e))
             e_ms = max(clip_s, min(e_ms, clip_e))
