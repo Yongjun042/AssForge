@@ -198,6 +198,53 @@ def _similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+def _split_phrases(text: str) -> list[str]:
+    """말줄임(… 또는 .. 이상)이 구 경계인 가사 줄을 구 단위로 나눈다.
+
+    '胸を刺す...気配の中で...' → ['胸を刺す...', '気配の中で...']
+    끝에만 말줄임이 있으면 나뉘지 않는다.
+    """
+    out: list[str] = []
+    last = 0
+    for m in re.finditer(r"(?:…|\.{2,})+\s*", text):
+        if m.end() < len(text):
+            seg = text[last:m.end()].strip()
+            if seg:
+                out.append(seg)
+            last = m.end()
+    rest = text[last:].strip()
+    if rest:
+        out.append(rest)
+    return out
+
+
+def split_phrase_pairs(pairs: list[LyricPair]) -> list[LyricPair]:
+    """절 내부의 말줄임 구를 독립 쌍으로 분할한다.
+
+    화면 가사 그래픽은 구 단위로 따로 뜨는 경우가 많다 (실측: 수작업
+    완성본은 '가슴을 찌르는…'과 '냉기 속에서…'가 각각 다른 시간·위치의
+    이벤트다). 원문과 번역의 구 수가 같을 때만 나눈다 — 다르면 어느 구가
+    어느 번역인지 알 수 없으므로 통째로 둔다. 독음은 수가 맞으면 같이
+    나누고, 아니면 버린다(표시/정렬 어디에도 필수가 아니다).
+    """
+    out: list[LyricPair] = []
+    for p in pairs:
+        if not (p.source and p.translation):
+            out.append(p)
+            continue
+        src = _split_phrases(p.source)
+        tr = _split_phrases(p.translation)
+        if len(src) < 2 or len(src) != len(tr):
+            out.append(p)
+            continue
+        rd = _split_phrases(p.reading) if p.reading else []
+        if len(rd) != len(src):
+            rd = [None] * len(src)
+        for s, t, r in zip(src, tr, rd):
+            out.append(LyricPair(s, t, r))
+    return out
+
+
 def creation_sync_targets(pairs: list[LyricPair]) -> list[LyricPair]:
     """새 줄 생성 시 동기화 대상이 될 쌍만 고른다.
 

@@ -2162,9 +2162,13 @@ class MainWindow(QMainWindow):
             if not rm.matched_ids:
                 # 자막에 아직 이 노래의 줄이 없는 경우 — 가사로 새 줄을
                 # 만들어 준다 (원문\N독음\N번역 스택, 시간은 AI 제안).
-                from ai.lyric_text import creation_sync_targets, parse_lyric_pairs
-                pairs = [p for p in parse_lyric_pairs(lyric_raw)
-                         if p.source or p.translation]
+                from ai.lyric_text import (creation_sync_targets,
+                                           parse_lyric_pairs,
+                                           split_phrase_pairs)
+                # 말줄임 구 단위 분할 — 화면 가사 그래픽은 구마다 따로 뜬다.
+                pairs = split_phrase_pairs([
+                    p for p in parse_lyric_pairs(lyric_raw)
+                    if p.source or p.translation])
                 n_targets = len(creation_sync_targets(pairs))
                 if not n_targets:
                     QMessageBox.warning(

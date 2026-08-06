@@ -236,15 +236,46 @@ def detect_graphic_events(
                 merged[-1] = (t, v, i)
         else:
             merged.append((t, v, i))
-    out = [
-        GraphicEvent(
-            ms=max(0, int(round(t))),
-            appear=deltas[i] > 0,
+
+    # 피크 중심이 아니라 전환의 실제 경계로 시각을 정밀화한다:
+    #   등장 = 변화가 처음 감지된 프레임(페이드 시작) — 수작업 타이프셋은
+    #   페이드 시작에 맞춰 자막을 띄운다.
+    #   소멸 = 상승 구간의 끝 - lag (arr 는 페이드 완료 후에도 lag 만큼
+    #   높은 값을 유지하므로 그만큼 되돌린다) = 페이드 완료 시점.
+    # 이웃 전환의 고원과 이어질 수 있어 걸음을 1.5초로 제한한다.
+    low = base + 0.3 * (thr - base)
+    max_walk = max(1, round(1500.0 / frame_ms))
+    out: list[GraphicEvent] = []
+    for _t, v, i in merged:
+        appear = deltas[i] > 0
+        if appear:
+            j = i
+            while j > 0 and arr[j - 1] >= low and i - j < max_walk:
+                j -= 1
+            ms = ts_list[j] - frame_ms
+        else:
+            j = i
+            while (j < len(arr) - 1 and arr[j + 1] >= low
+                   and j - i < max_walk):
+                j += 1
+            ms = ts_list[j] - lag * frame_ms
+        out.append(GraphicEvent(
+            ms=max(0, int(round(ms))),
+            appear=appear,
             cx=cents[i][0], cy=cents[i][1],
             strength=v,
-        )
-        for t, v, i in merged
-    ]
+        ))
+    out.sort(key=lambda e: e.ms)
+    # 이웃 피크가 같은 경계로 수렴하면 중복 — 강한 쪽 하나만 남긴다.
+    deduped: list[GraphicEvent] = []
+    for e in out:
+        if (deduped and e.appear == deduped[-1].appear
+                and e.ms - deduped[-1].ms <= 60):
+            if e.strength > deduped[-1].strength:
+                deduped[-1] = e
+            continue
+        deduped.append(e)
+    out = deduped
     log.info("그래픽 이벤트: %d~%dms, %d건 (등장 %d, 기준 %.3f, 감도 %.1f)",
              start_ms, end_ms, len(out),
              sum(1 for e in out if e.appear), thr, sensitivity)
