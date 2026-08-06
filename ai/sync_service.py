@@ -333,6 +333,18 @@ def _snap_ms(ms: int, bounds: list[int], tol: int = _SNAP_TOL_MS) -> int:
     return best if bd <= tol else ms
 
 
+# 그래픽 우선 타이밍 — 화면 가사 그래픽은 보컬보다 먼저 뜨고(실측 1~2초),
+# 같은 자리 교체나 블록 페이드로 사라진다. 보컬 정렬은 '어느 등장 이벤트가
+# 이 줄 것인지' 고르는 사전정보로만 쓴다. 수작업 완성본(00001) 대비
+# 시작 오차 중앙값 0.93s / 끝 1.05s 실측.
+_GRAPHIC_LEAD_MS = 2500    # 등장 이벤트를 찾는 보컬 시작 이전 범위
+_GRAPHIC_LAG_MS = 500      # 보컬 시작 이후 허용 범위
+_GRAPHIC_TAIL_MS = 7000    # 끝(소멸/교체) 탐색 상한
+_SWAP_DIST = 0.18          # 같은 자리 교체 판정 거리 (화면 대각선 대비)
+_FADE_DIST = 0.35          # 근처 소멸 판정 거리
+_EVENT_SENSITIVITY = 2.5   # 움직이는 배경 위 작은 가사 텍스트까지 감지
+
+
 def _snap_suggestions_to_video(
     suggestions: list[tuple[str, int, int, float]],
     video_path: str,
@@ -340,35 +352,65 @@ def _snap_suggestions_to_video(
     clip_e: Optional[int],
     cancel_event: Optional[threading.Event],
 ) -> list[tuple[str, int, int, float]]:
-    """제안 시작/끝을 근처 영상 그래픽 전환점으로 스냅.
+    """제안 시간을 화면 가사 그래픽의 등장~소멸 창으로 옮긴다.
 
-    스냅 후 길이가 너무 짧아지면(양끝이 같은 경계로 붙는 등) 원값 유지.
-    경계 감지 실패(비디오 아님 등) 시 그대로 반환.
+    줄 순서대로 각 보컬 창 [vs-2.5s, vs+0.5s] 안에서 아직 안 쓴 가장 이른
+    '등장' 이벤트를 소비해 시작으로 삼고(가사 그래픽은 노래 순서대로 뜬다 —
+    창 안의 마지막 이벤트를 고르면 다음 줄 그래픽을 훔친다), 끝은 같은 자리
+    교체(근접 등장)나 근처 소멸 이벤트에서 얻는다. 등장 이벤트를 못 찾은
+    줄과 이벤트 감지 실패 시엔 보컬 시간을 그대로 둔다.
     """
-    from media.video_analysis import detect_graphic_boundaries
-    lo = min(s for _id, s, _e, _c in suggestions) - 1500
-    hi = max(e for _id, _s, e, _c in suggestions) + 1500
+    from media.video_analysis import detect_graphic_events
+    lo = min(s for _id, s, _e, _c in suggestions) - _GRAPHIC_LEAD_MS - 500
+    hi = max(e for _id, _s, e, _c in suggestions) + _GRAPHIC_TAIL_MS
     if clip_s is not None and clip_e is not None:
         lo, hi = max(lo, clip_s), min(hi, clip_e)
-    bounds = detect_graphic_boundaries(
+    events = detect_graphic_events(
         video_path, max(0, lo), hi,
         cancel_check=(cancel_event.is_set if cancel_event is not None else None),
+        sensitivity=_EVENT_SENSITIVITY,
     )
-    if not bounds:
+    if not events:
         return suggestions
+    appears = [e for e in events if e.appear]
+    used: set[int] = set()
     out: list[tuple[str, int, int, float]] = []
-    snapped = 0
-    for eid, s_ms, e_ms, conf in suggestions:
-        ns, ne = _snap_ms(s_ms, bounds), _snap_ms(e_ms, bounds)
+    moved = 0
+    for eid, vs, ve, conf in suggestions:
+        s_ms, e_ms = vs, ve
+        cand = [e for e in appears
+                if vs - _GRAPHIC_LEAD_MS <= e.ms <= vs + _GRAPHIC_LAG_MS
+                and id(e) not in used]
+        if cand:
+            ev = cand[0]
+            used.add(id(ev))
+            s_ms = ev.ms
+            e_ms = None
+            for e in events:
+                # 보컬 끝 추정이 늦을 수 있어 ve-800 부터 탐색한다.
+                if e.ms < max(s_ms + 400, ve - 800):
+                    continue
+                if e.ms > ve + _GRAPHIC_TAIL_MS:
+                    break
+                d = ((e.cx - ev.cx) ** 2 + (e.cy - ev.cy) ** 2) ** 0.5
+                if e.appear and d < _SWAP_DIST:
+                    e_ms = e.ms
+                    break
+                if not e.appear and d < _FADE_DIST:
+                    e_ms = e.ms
+                    break
+            if e_ms is None:
+                e_ms = ve + 800
         if clip_s is not None and clip_e is not None:
-            ns = max(clip_s, min(ns, clip_e))
-            ne = max(clip_s, min(ne, clip_e))
-        if ne - ns >= _SNAP_MIN_DUR_MS and (ns, ne) != (s_ms, e_ms):
-            snapped += 1
-            s_ms, e_ms = ns, ne
+            s_ms = max(clip_s, min(s_ms, clip_e))
+            e_ms = max(clip_s, min(e_ms, clip_e))
+        if e_ms - s_ms < _SNAP_MIN_DUR_MS:
+            s_ms, e_ms = vs, ve
+        if (s_ms, e_ms) != (vs, ve):
+            moved += 1
         out.append((eid, s_ms, e_ms, conf))
-    log.info("그래픽 경계 스냅: 경계 %d개, %d/%d 줄 조정",
-             len(bounds), snapped, len(out))
+    log.info("그래픽 우선 타이밍: 이벤트 %d건(등장 %d), %d/%d 줄 조정",
+             len(events), len(appears), moved, len(out))
     return out
 
 

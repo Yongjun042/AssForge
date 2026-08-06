@@ -389,10 +389,12 @@ class _AiSyncOptionsDialog(QDialog):
         self._vad.setChecked(settings.value("aiSyncVad", False, type=bool))
         form.addRow(self._vad)
 
-        self._snap_video = QCheckBox("영상 그래픽 전환에 시간 스냅 (화면 가사 영상용)")
+        self._snap_video = QCheckBox("화면 가사 그래픽의 등장~소멸을 줄 시간으로 (그래픽 우선)")
         self._snap_video.setToolTip(
-            "Whisper 일치율이 낮아도, 화면 모션그래픽(가사 연출)의 등장·소멸\n"
-            "시점을 영상에서 감지해 제안 시작/끝을 ±0.8초 이내로 스냅합니다.\n"
+            "화면 모션그래픽(가사 연출)의 등장·소멸 이벤트를 영상에서 감지해,\n"
+            "각 줄의 시간을 그래픽이 떠 있는 구간으로 옮깁니다. 보컬 정렬은\n"
+            "어느 그래픽이 이 줄 것인지 고르는 기준으로만 씁니다 — 가사\n"
+            "그래픽은 보통 노래보다 1~2초 먼저 뜨고 블록 페이드로 사라집니다.\n"
             "미러링 자동 효과와 같은 신호를 쓰므로 효과 분석 창과도 일치합니다.")
         self._snap_video.setChecked(
             settings.value("aiSyncSnapVideo", False, type=bool))
