@@ -125,6 +125,132 @@ _BOUND_MIN_GAP_MS = 120.0     # 이보다 가까운 피크는 강한 쪽 하나�
 _BOUND_LAG_MS = 250.0         # 페이드 누적 비교 창 — BD 그래픽은 서서히 뜬다
 
 
+@dataclass(slots=True)
+class GraphicEvent:
+    """화면 그래픽 전환 1건 — 시각·극성(등장/소멸)·변화 영역 중심."""
+    ms: int
+    appear: bool      # True=돌출 질량 증가(등장/교체 유입), False=감소(소멸)
+    cx: float         # 변화 영역 중심 x (0..1)
+    cy: float
+    strength: float   # 피크 세기 (상대값)
+
+
+def detect_graphic_events(
+    video_path: str,
+    start_ms: int,
+    end_ms: int,
+    cancel_check=None,
+    sensitivity: float = 1.0,
+) -> list[GraphicEvent]:
+    """그래픽 등장/소멸 이벤트 목록 — 가사 타이프세팅의 시간·위치 근거.
+
+    detect_graphic_boundaries 와 같은 lag(~250ms) 비교지만 피크마다
+    돌출 질량 증감으로 등장/소멸을 구분하고, 변화 영역 |Δ돌출맵| 의
+    중심(cx,cy)을 기록한다 — 등장 이벤트의 중심 = 새 텍스트가 뜬 위치.
+
+    sensitivity > 1 은 임계값을 낮춰 약한 전환(움직이는 배경 위 작은
+    가사 텍스트)도 잡는다. 과검출은 보컬 정렬 사전정보 같은 외부
+    기준으로 걸러내는 것을 전제로 한다. 실패/취소 시 빈 리스트.
+    """
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg or end_ms <= start_ms or sensitivity <= 0:
+        return []
+    fps = _probe_fps(video_path)
+    frame_ms = 1000.0 / fps
+    lag = max(1, round(_BOUND_LAG_MS / frame_ms))
+    args = [
+        ffmpeg, "-v", "error",
+        "-ss", f"{start_ms / 1000.0:.3f}", "-to", f"{end_ms / 1000.0:.3f}",
+        "-i", video_path,
+        "-vf", f"fps={fps:.6f},scale={_W}:{_H}",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ]
+    ts_list: list[float] = []
+    score: list[float] = []
+    deltas: list[float] = []
+    cents: list[tuple[float, float]] = []
+    from collections import deque
+    hist: deque[np.ndarray] = deque(maxlen=lag)
+    frame_i = 0
+    try:
+        proc = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        assert proc.stdout is not None
+        while True:
+            if cancel_check is not None and cancel_check():
+                kill_tree(proc)
+                return []
+            buf = proc.stdout.read(_FRAME_BYTES)
+            if len(buf) < _FRAME_BYTES:
+                break
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape(_H, _W, 3)
+            ts = start_ms + frame_i * frame_ms
+            frame_i += 1
+            flat = frame.astype(np.int16).reshape(-1, 3)
+            sat = (flat.max(axis=1) - flat.min(axis=1)).astype(np.float64)
+            luma = flat.mean(axis=1)
+            wmap = sat + np.maximum(0.0, luma - 200.0) * 1.5
+            if len(hist) == lag:
+                dmap = np.abs(wmap - hist[0])
+                dsum = float(dmap.sum())
+                ts_list.append(ts)
+                score.append(float(dmap.mean()))
+                deltas.append(float(wmap.sum() - hist[0].sum()))
+                if dsum > 1e-6:
+                    d2 = dmap.reshape(_H, _W)
+                    cents.append((
+                        float((d2 * _XS).sum() / dsum) / max(1, _W - 1),
+                        float((d2 * _YS).sum() / dsum) / max(1, _H - 1),
+                    ))
+                else:
+                    cents.append((0.5, 0.5))
+            hist.append(wmap)
+        proc.wait(timeout=10)
+    except Exception:
+        log.exception("그래픽 이벤트 감지 디코드 실패")
+        return []
+    if len(score) < 5:
+        return []
+
+    arr = np.convolve(np.asarray(score), np.ones(3) / 3.0, mode="same")
+    base = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - base)))
+    thr = base + max(4.0 * mad, base * 0.5, 0.02) / sensitivity
+    half_lag_ms = lag * frame_ms / 2.0
+    peaks: list[tuple[float, float, int]] = []   # (ts, strength, idx)
+    for i, v in enumerate(arr):
+        if v < thr:
+            continue
+        if i > 0 and arr[i - 1] > v:
+            continue
+        if i < len(arr) - 1 and arr[i + 1] >= v:
+            continue
+        peaks.append((ts_list[i] - half_lag_ms, float(v), i))
+
+    merged: list[tuple[float, float, int]] = []
+    for t, v, i in peaks:
+        if merged and t - merged[-1][0] < _BOUND_MIN_GAP_MS:
+            if v > merged[-1][1]:
+                merged[-1] = (t, v, i)
+        else:
+            merged.append((t, v, i))
+    out = [
+        GraphicEvent(
+            ms=max(0, int(round(t))),
+            appear=deltas[i] > 0,
+            cx=cents[i][0], cy=cents[i][1],
+            strength=v,
+        )
+        for t, v, i in merged
+    ]
+    log.info("그래픽 이벤트: %d~%dms, %d건 (등장 %d, 기준 %.3f, 감도 %.1f)",
+             start_ms, end_ms, len(out),
+             sum(1 for e in out if e.appear), thr, sensitivity)
+    return out
+
+
 def detect_graphic_boundaries(
     video_path: str,
     start_ms: int,
