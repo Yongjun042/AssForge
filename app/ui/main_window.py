@@ -2176,7 +2176,7 @@ class MainWindow(QMainWindow):
                     self, "가사로 줄 만들기",
                     f"붙여넣은 가사를 기존 자막 줄에 연결하지 못했습니다.\n"
                     f"가사로 새 줄 {len(pairs)}개를 만들고 동기화할까요?{extra}\n"
-                    f"(각 줄 텍스트: 원문+독음+번역, 시간은 AI 제안으로 채워집니다)",
+                    f"(표시 텍스트는 한국어 번역, 시간은 AI 제안으로 채워집니다)",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 ) != QMessageBox.StandardButton.Yes:
                     return
@@ -2252,10 +2252,15 @@ class MainWindow(QMainWindow):
     def _create_events_from_lyrics(
         self, pairs, start_ms: int,
     ) -> "tuple[dict[str, str], list[str]]":
-        """가사 쌍으로 새 이벤트 생성 — 텍스트는 원문\\N독음\\N번역 스택.
+        """가사 쌍으로 새 이벤트 생성 — 표시 텍스트는 한국어 번역.
+
+        완성 자막은 번역만 보여주는 게 목표다 (실측: 사용자 완성본
+        '밤하늘로 이어지는 언덕길.ass'는 번역 + 타이프셋만 담는다).
+        원문/독음은 정렬 ref 로만 쓰고, 번역이 없는 쌍만 독음→원문 순으로
+        표시 텍스트를 대신한다.
 
         시간은 start_ms 부터 2초 간격 placeholder — AI 제안이 채운다.
-        Returns (ref_texts, 동기화 대상 event_ids). 원문 있는 줄만 대상.
+        Returns (ref_texts, 동기화 대상 event_ids).
         """
         from ai.lyric_text import creation_sync_targets
         events = self._db.get_events(self._main_track_id)
@@ -2268,8 +2273,8 @@ class MainWindow(QMainWindow):
         ids: list[str] = []
         t = max(0, int(start_ms))
         for p in pairs:
-            parts = [x for x in (p.source, p.reading, p.translation) if x]
-            if not parts:
+            text = p.translation or p.reading or p.source
+            if not text:
                 continue
             eid = str(uuid.uuid4())
             new_events.append(EventRow(
@@ -2277,7 +2282,7 @@ class MainWindow(QMainWindow):
                 track_id=self._main_track_id,
                 start_ms=t,
                 end_ms=t + 2000,
-                text=r"\N".join(parts),
+                text=text,
                 order_index=order + len(new_events),
             ))
             if id(p) in sync_set:
