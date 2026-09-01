@@ -218,6 +218,23 @@ def _split_phrases(text: str) -> list[str]:
     return out
 
 
+def split_phrase_pairs_grouped(
+    pairs: list[LyricPair],
+) -> tuple[list[LyricPair], list[int]]:
+    """split_phrase_pairs + 각 구가 나온 원래 절 인덱스.
+
+    타이프셋에서 같은 절의 구들을 블록 페이드로 함께 끝내는 데 쓴다.
+    Returns (분할된 쌍들, 병렬 그룹 인덱스 리스트).
+    """
+    out: list[LyricPair] = []
+    groups: list[int] = []
+    for gi, p in enumerate(pairs):
+        for q in split_phrase_pairs([p]):
+            out.append(q)
+            groups.append(gi)
+    return out, groups
+
+
 def split_phrase_pairs(pairs: list[LyricPair]) -> list[LyricPair]:
     """절 내부의 말줄임 구를 독립 쌍으로 분할한다.
 

@@ -140,6 +140,14 @@ def _run_transcription(
         word_timestamps=True,
         vad_filter=vad_filter,
         beam_size=5,
+        # 이전 세그먼트 텍스트로 조건화하지 않는다 — 노래/BGM 에서 한 번의
+        # 환청이 뒤 세그먼트 전체로 전파되는 캐스케이드(실측: 곡 전반부
+        # 전사가 통째로 붕괴, 실행마다 결과가 크게 흔들림)를 끊는다.
+        condition_on_previous_text=False,
+        # VAD 를 끈 노래 모드에서는 no-speech 게이트도 끈다 — 반주 위 여린
+        # 가창을 '음성 아님'으로 판정해 곡 도입부 전사가 통째로 비는 사례가
+        # 실측됐다 (00001: 0~30초 세그먼트 0건). 과잉 전사는 정렬이 거른다.
+        no_speech_threshold=None if not vad_filter else 0.6,
     )
 
     duration_s = float(getattr(info, "duration", 0.0) or 0.0)

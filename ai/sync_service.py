@@ -171,73 +171,9 @@ def run_sync(
             )
         raise RuntimeError(f"AI 동기화 중단: {reason}")
 
-    # 2) 오디오 준비 — 구간이 지정되면 그 부분만 추출(선택 영역 재정렬).
-    # 보컬 분리를 쓸 때만 44.1k 스테레오 중간 파일이 필요하다. 분리를 안 쓰면
-    # 16k mono 를 한 번에 추출해 ffmpeg 2중 디코드를 피한다.
-    _p(0.02, "오디오 준비 중...")
-    _check_cancel(cancel_event)
-    offset_ms = clip_s if clip else 0
-    sep_input = audio_source
-    if clip:
-        if options.separate_vocals:
-            clip_src = _extract_clip_source(audio_source, clip_s, clip_e)
-            if not clip_src:
-                raise RuntimeError("구간 오디오 추출에 실패했습니다 (FFmpeg 확인).")
-            sep_input = clip_src
-            wav_path = _to_whisper_wav(clip_src)
-        else:
-            wav_path = _extract_clip_wav_16k(audio_source, clip_s, clip_e)
-    else:
-        wav_path = _ensure_audio_wav(audio_source)
-    if not wav_path:
-        raise RuntimeError("오디오 추출에 실패했습니다 (FFmpeg 설치 확인).")
-
-    # 2.5) 보컬 분리 (선택) — 반주를 제거한 보컬 트랙으로 전사
-    t0 = 0.05
-    if options.separate_vocals:
-        _check_cancel(cancel_event)
-        from ai.vocal_separation import is_available, separate_vocals
-        ok, why = is_available()
-        if not ok:
-            raise RuntimeError(f"보컬 분리를 사용할 수 없습니다: {why}")
-        vocals = separate_vocals(
-            sep_input, progress=lambda f, m: _p(0.03 + 0.32 * f, m),
-            cancel_event=cancel_event,
-        )
-        _check_cancel(cancel_event)
-        if not vocals:
-            raise RuntimeError(
-                "보컬 분리에 실패했습니다 (로그 확인). "
-                "옵션에서 보컬 분리를 끄고 다시 시도할 수 있습니다."
-            )
-        log.info("보컬 분리 사용: %s", vocals)
-        wav_path = vocals
-        t0 = 0.35
-
-    # 3) 전사 (faster-whisper 는 중간 취소가 안 되므로 앞뒤 경계에서 확인)
-    _check_cancel(cancel_event)
-    _p(t0, "Whisper 모델 준비 중...")
-    try:
-        result: TranscriptionResult = transcribe(
-            wav_path,
-            language=options.language,
-            model_size=options.model_size,
-            device=options.device,
-            compute_type=options.compute_type,
-            vad_filter=options.vad_filter,
-            progress=lambda f, m, _t0=t0: _p(_t0 + (0.78 - _t0) * f, m),
-        )
-    except TranscriptionUnavailable as exc:
-        raise RuntimeError(str(exc))
-
-    # 구간 전사면 결과 시간이 0 기준이므로 원래 위치로 오프셋한다.
-    if offset_ms:
-        for seg in result.segments:
-            seg.start_ms += offset_ms
-            seg.end_ms += offset_ms
-            for w in seg.words:
-                w.start_ms += offset_ms
-                w.end_ms += offset_ms
+    # 2~3) 오디오 준비 + 보컬 분리 + 전사 (공용 헬퍼)
+    result, offset_ms, audio_dur_ms = _transcribe_source(
+        audio_source, options, _p, cancel_event)
 
     detected_lang = result.language or options.language or _guess_lang_from_lines(rows)
     log.info("Whisper 언어=%s, segment=%d, 오프셋=%dms", detected_lang,
@@ -246,7 +182,6 @@ def run_sync(
     # 4) 정렬 — DTW
     _check_cancel(cancel_event)
     _p(0.78, "가사 정렬 중...")
-    audio_dur_ms = _audio_duration_ms(wav_path) + offset_ms
     alignments = align_lines_to_transcript(
         align_input, result, language=detected_lang, audio_duration_ms=audio_dur_ms,
     )
@@ -309,6 +244,97 @@ def run_sync(
         avg_confidence=avg_conf,
         language=detected_lang,
     )
+
+
+def _transcribe_source(
+    audio_source: str,
+    options: SyncOptions,
+    _p: Callable[[float, str], None],
+    cancel_event: Optional[threading.Event],
+) -> tuple[TranscriptionResult, int, int]:
+    """오디오 준비(구간/보컬 분리 포함) → 전사 → 시간 오프셋 적용.
+
+    run_sync 와 run_lyric_typeset 이 공유한다. 진행률 0.02~0.78 구간을 쓴다.
+
+    Returns:
+        (transcript, offset_ms, audio_end_ms) — 전사 결과(절대 시간으로
+        오프셋됨), 구간 시작 오프셋, 전사 구간 끝(절대 ms).
+    """
+    clip = (options.clip_start_ms is not None and options.clip_end_ms is not None
+            and options.clip_end_ms > options.clip_start_ms)
+    clip_s = int(options.clip_start_ms) if clip else 0
+    clip_e = int(options.clip_end_ms) if clip else 0
+
+    # 오디오 준비 — 구간이 지정되면 그 부분만 추출(선택 영역 재정렬).
+    # 보컬 분리를 쓸 때만 44.1k 스테레오 중간 파일이 필요하다. 분리를 안 쓰면
+    # 16k mono 를 한 번에 추출해 ffmpeg 2중 디코드를 피한다.
+    _p(0.02, "오디오 준비 중...")
+    _check_cancel(cancel_event)
+    offset_ms = clip_s if clip else 0
+    sep_input = audio_source
+    if clip:
+        if options.separate_vocals:
+            clip_src = _extract_clip_source(audio_source, clip_s, clip_e)
+            if not clip_src:
+                raise RuntimeError("구간 오디오 추출에 실패했습니다 (FFmpeg 확인).")
+            sep_input = clip_src
+            wav_path = _to_whisper_wav(clip_src)
+        else:
+            wav_path = _extract_clip_wav_16k(audio_source, clip_s, clip_e)
+    else:
+        wav_path = _ensure_audio_wav(audio_source)
+    if not wav_path:
+        raise RuntimeError("오디오 추출에 실패했습니다 (FFmpeg 설치 확인).")
+
+    # 보컬 분리 (선택) — 반주를 제거한 보컬 트랙으로 전사
+    t0 = 0.05
+    if options.separate_vocals:
+        _check_cancel(cancel_event)
+        from ai.vocal_separation import is_available, separate_vocals
+        ok, why = is_available()
+        if not ok:
+            raise RuntimeError(f"보컬 분리를 사용할 수 없습니다: {why}")
+        vocals = separate_vocals(
+            sep_input, progress=lambda f, m: _p(0.03 + 0.32 * f, m),
+            cancel_event=cancel_event,
+        )
+        _check_cancel(cancel_event)
+        if not vocals:
+            raise RuntimeError(
+                "보컬 분리에 실패했습니다 (로그 확인). "
+                "옵션에서 보컬 분리를 끄고 다시 시도할 수 있습니다."
+            )
+        log.info("보컬 분리 사용: %s", vocals)
+        wav_path = vocals
+        t0 = 0.35
+
+    # 전사 (faster-whisper 는 중간 취소가 안 되므로 앞뒤 경계에서 확인)
+    _check_cancel(cancel_event)
+    _p(t0, "Whisper 모델 준비 중...")
+    try:
+        result: TranscriptionResult = transcribe(
+            wav_path,
+            language=options.language,
+            model_size=options.model_size,
+            device=options.device,
+            compute_type=options.compute_type,
+            vad_filter=options.vad_filter,
+            progress=lambda f, m, _t0=t0: _p(_t0 + (0.78 - _t0) * f, m),
+        )
+    except TranscriptionUnavailable as exc:
+        raise RuntimeError(str(exc))
+
+    # 구간 전사면 결과 시간이 0 기준이므로 원래 위치로 오프셋한다.
+    if offset_ms:
+        for seg in result.segments:
+            seg.start_ms += offset_ms
+            seg.end_ms += offset_ms
+            for w in seg.words:
+                w.start_ms += offset_ms
+                w.end_ms += offset_ms
+
+    audio_end_ms = _audio_duration_ms(wav_path) + offset_ms
+    return result, offset_ms, audio_end_ms
 
 
 # 그래픽 경계 스냅 허용 반경 — Whisper 추정이 이보다 가까우면 경계로 이동.
@@ -414,6 +440,109 @@ def _snap_suggestions_to_video(
     log.info("그래픽 우선 타이밍: 이벤트 %d건(등장 %d), %d/%d 줄 조정",
              len(events), len(appears), moved, len(out))
     return out
+
+
+@dataclass(slots=True)
+class LyricTypesetResult:
+    """run_lyric_typeset 결과 — 생성할 줄들과 통계."""
+    lines: list          # list[ai.lyric_typeset.PlannedLine]
+    language: str
+    n_graphic: int       # 그래픽 이벤트가 시간 근거인 줄 수
+    n_events: int        # 감지된 그래픽 이벤트 수
+
+
+def run_lyric_typeset(
+    video_path: str,
+    pairs: list,
+    groups: list[int],
+    options: SyncOptions = SyncOptions(),
+    progress: Optional[Callable[[float, str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    transcript: Optional[TranscriptionResult] = None,
+) -> LyricTypesetResult:
+    """가사 쌍들 → 완성본 형식 타이프셋 줄 계획 (그래픽 우선 타이밍).
+
+    전사→보컬 정렬로 각 구의 대략 시각을 얻고, 영상의 그래픽 등장/소멸
+    이벤트에서 실제 시작·끝·위치를 정한 뒤, 장면 밝기로 흑/백 스타일을
+    고른다. DB 를 건드리지 않는다 — 호출자가 PlannedLine 으로 이벤트를
+    만든다.
+
+    Args:
+        pairs: ai.lyric_text.LyricPair 리스트 (구 분할 완료 상태).
+        groups: 각 쌍의 원래 절 인덱스 (split_phrase_pairs_grouped).
+        transcript: 테스트/재실행용 전사 주입 — 주면 오디오 단계를 건너뛴다.
+    """
+    from ai.lyric_text import creation_sync_targets
+    from ai.lyric_typeset import compose_lines, plan_times
+    from media.video_analysis import analyze_line_windows, detect_graphic_events
+
+    def _p(frac: float, msg: str) -> None:
+        if progress:
+            progress(max(0.0, min(1.0, frac)), msg)
+
+    if not pairs or len(pairs) != len(groups):
+        raise RuntimeError("가사 쌍이 비었거나 그룹 정보가 어긋납니다.")
+
+    # 1) 전사
+    if transcript is None:
+        result, _offset, audio_end_ms = _transcribe_source(
+            video_path, options, _p, cancel_event)
+    else:
+        result = transcript
+        audio_end_ms = max(
+            (g.end_ms for g in result.segments), default=0)
+    lang = options.language or result.language or "ja"
+
+    # 2) 보컬 정렬 — 정렬 대상(원문 있는 노래 구)만
+    _check_cancel(cancel_event)
+    _p(0.80, "가사 정렬 중...")
+    targets = {id(p) for p in creation_sync_targets(pairs)}
+    align_input = [
+        (str(i), p.source, False, i * 2000, i * 2000 + 2000)
+        for i, p in enumerate(pairs) if id(p) in targets
+    ]
+    als = align_lines_to_transcript(
+        align_input, result, language=lang, audio_duration_ms=audio_end_ms)
+    aligns: list = [None] * len(pairs)
+    for al in als:
+        aligns[int(al.event_id)] = al
+
+    # 3) 그래픽 이벤트 (구간 지정 시 그 범위만)
+    _check_cancel(cancel_event)
+    _p(0.84, "영상 그래픽 이벤트 감지 중...")
+    clip = (options.clip_start_ms is not None and options.clip_end_ms is not None
+            and options.clip_end_ms > options.clip_start_ms)
+    lo = int(options.clip_start_ms) if clip else 0
+    hi = int(options.clip_end_ms) if clip else audio_end_ms
+    events = detect_graphic_events(
+        video_path, lo, hi,
+        cancel_check=(cancel_event.is_set if cancel_event else None),
+        sensitivity=2.5,
+    )
+
+    # 4) 시간/위치 계획
+    _check_cancel(cancel_event)
+    vocal_end = max(
+        (g.end_ms for g in result.segments if g.end_ms - g.start_ms >= 1000),
+        default=audio_end_ms)
+    rows = plan_times(pairs, groups, aligns, events, vocal_end)
+
+    # 5) 장면 분석 (밝기 → 흑/백 스타일, 드리프트 → \move)
+    _p(0.90, "장면 밝기/위치 분석 중...")
+    windows = [(r.start, r.end) for r in rows if r.start is not None]
+    vis = analyze_line_windows(
+        video_path, windows,
+        cancel_check=(cancel_event.is_set if cancel_event else None),
+    ) or []
+    _check_cancel(cancel_event)
+
+    lines = compose_lines(pairs, rows, vis)
+    n_graphic = sum(1 for r in rows if r.via == "graphic")
+    log.info("가사 타이프셋 계획: %d줄 (그래픽 근거 %d, 이벤트 %d개)",
+             len(lines), n_graphic, len(events))
+    _p(1.0, f"타이프셋 계획 완료 — {len(lines)}줄")
+    return LyricTypesetResult(
+        lines=lines, language=lang, n_graphic=n_graphic, n_events=len(events))
 
 
 def _ensure_audio_wav(path: str) -> Optional[str]:

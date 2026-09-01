@@ -152,6 +152,48 @@ class _AiSyncWorker(QObject):
             self.finished.emit(None, str(exc))
 
 
+class _LyricTypesetWorker(QObject):
+    """가사 → 완성본 형식 타이프셋 계획 워커 (전사+정렬+그래픽 분석).
+
+    DB 를 건드리지 않는다 — 결과(PlannedLine 리스트)는 GUI 스레드가
+    커맨드로 이벤트를 만든다.
+    """
+    progress = Signal(float, str)
+    finished = Signal(object, str)   # (LyricTypesetResult|None, 에러)
+
+    def __init__(self, video_path: str, pairs: list, groups: list,
+                 options) -> None:
+        super().__init__()
+        self._video_path = video_path
+        self._pairs = pairs
+        self._groups = groups
+        self._options = options
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def run(self) -> None:
+        from ai.sync_service import SyncCancelled, run_lyric_typeset
+        try:
+            result = run_lyric_typeset(
+                self._video_path, self._pairs, self._groups, self._options,
+                progress=lambda f, m: self.progress.emit(f, m),
+                cancel_event=self._cancel,
+            )
+            self.finished.emit(result, "")
+        except SyncCancelled:
+            log.info("가사 타이프셋 취소됨")
+            self.finished.emit(None, "")
+        except Exception as exc:
+            log.exception("가사 타이프셋 실패")
+            self.finished.emit(None, str(exc))
+
+
 class _VideoLoadWorker(QObject):
     """Background worker for audio extraction, waveform generation, and keyframe extraction."""
     finished = Signal(object, list, str)  # (peaks_or_None, keyframes, source_path)
@@ -461,6 +503,20 @@ class _AiSyncOptionsDialog(QDialog):
         form.addRow(self._lyrics)
         form.addRow(self._lyric_info)
 
+        # 완성본 형식 타이프셋 — 가사로 '새 줄'을 만들 때, 시간 제안 대신
+        # 그래픽 우선 타이밍 + 위치/흑백 스타일/페이드가 적용된 줄을 바로
+        # 생성한다.
+        self._typeset = QCheckBox("완성본 형식 타이프셋 생성 (그래픽 타이밍·위치·스타일 자동)")
+        self._typeset.setToolTip(
+            "가사로 새 줄을 만들 때 적용됩니다. 화면 가사 그래픽의 등장·소멸에\n"
+            "시간을 맞추고(보컬은 후보 선택용), 그래픽 위치에 \\pos·\\fad 를 붙이고,\n"
+            "장면 밝기에 따라 흑/백 가사 스타일을 자동 배정합니다.\n"
+            "기존 줄에 연결되는 경우에는 시간 제안만 만듭니다.")
+        self._typeset.setChecked(
+            settings.value("aiSyncLyricTypeset", True, type=bool))
+        self._typeset.setEnabled(False)
+        form.addRow(self._typeset)
+
         hint = QLabel(
             "노래/BGM 은 언어 자동 감지가 자주 틀립니다 — 가사 언어를 직접 지정하세요.\n"
             "모델이 클수록 정확하지만 첫 사용 시 다운로드가 필요합니다\n"
@@ -496,6 +552,7 @@ class _AiSyncOptionsDialog(QDialog):
         self._settings.setValue("aiSyncModel", self._model.currentText())
         self._settings.setValue("aiSyncVad", self._vad.isChecked())
         self._settings.setValue("aiSyncSnapVideo", self._snap_video.isChecked())
+        self._settings.setValue("aiSyncLyricTypeset", self._typeset.isChecked())
         if self._vocals.isEnabled():
             self._settings.setValue("aiSyncSeparateVocals", self._vocals.isChecked())
         super().accept()
@@ -503,6 +560,7 @@ class _AiSyncOptionsDialog(QDialog):
     def _update_lyric_info(self) -> None:
         from ai.lyric_text import parse_lyric_pairs
         pairs = parse_lyric_pairs(self._lyrics.toPlainText())
+        self._typeset.setEnabled(bool(pairs))
         if not pairs:
             self._lyric_info.setText("")
             return
@@ -539,6 +597,9 @@ class _AiSyncOptionsDialog(QDialog):
 
     def snap_to_video(self) -> bool:
         return self._snap_video.isChecked()
+
+    def lyric_typeset(self) -> bool:
+        return self._typeset.isEnabled() and self._typeset.isChecked()
 
     def clip_range(self) -> "tuple[Optional[int], Optional[int]]":
         """(start_ms, end_ms) 또는 (None, None) — 시간 범위 미사용."""
@@ -2164,9 +2225,9 @@ class MainWindow(QMainWindow):
                 # 만들어 준다 (원문\N독음\N번역 스택, 시간은 AI 제안).
                 from ai.lyric_text import (creation_sync_targets,
                                            parse_lyric_pairs,
-                                           split_phrase_pairs)
+                                           split_phrase_pairs_grouped)
                 # 말줄임 구 단위 분할 — 화면 가사 그래픽은 구마다 따로 뜬다.
-                pairs = split_phrase_pairs([
+                pairs, pair_groups = split_phrase_pairs_grouped([
                     p for p in parse_lyric_pairs(lyric_raw)
                     if p.source or p.translation])
                 n_targets = len(creation_sync_targets(pairs))
@@ -2176,15 +2237,34 @@ class MainWindow(QMainWindow):
                         "붙여넣은 가사에서 정렬할 원문(일본어 등) 줄을 찾지 못했습니다.\n"
                         "실제 불리는 원문 가사를 포함해 주세요.")
                     return
+                typeset = opt_dlg.lyric_typeset()
                 extra = ("" if n_targets == len(pairs)
                          else f" (그중 정렬 대상 {n_targets}개 — 머리말 등 제외)")
+                how = ("완성본 형식 타이프셋 줄" if typeset
+                       else "줄 (시간은 AI 제안)")
                 if QMessageBox.question(
                     self, "가사로 줄 만들기",
                     f"붙여넣은 가사를 기존 자막 줄에 연결하지 못했습니다.\n"
-                    f"가사로 새 줄 {len(pairs)}개를 만들고 동기화할까요?{extra}\n"
-                    f"(표시 텍스트는 한국어 번역, 시간은 AI 제안으로 채워집니다)",
+                    f"가사로 새 {how} {len(pairs)}개를 만들까요?{extra}\n"
+                    f"(표시 텍스트는 한국어 번역)",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 ) != QMessageBox.StandardButton.Yes:
+                    return
+                if typeset:
+                    # 그래픽 우선 타이프셋 — 시간 제안 대신 완성 줄을 바로
+                    # 생성한다 (위치·흑백 스타일·페이드 포함).
+                    if language is None:
+                        srcs = " ".join(p.source for p in pairs if p.source)
+                        language = detect_language(srcs) or None
+                    options = SyncOptions(
+                        model_size=opt_dlg.model_size(),
+                        language=language,
+                        separate_vocals=opt_dlg.separate_vocals(),
+                        vad_filter=opt_dlg.vad_filter(),
+                        clip_start_ms=clip_s,
+                        clip_end_ms=clip_e,
+                    )
+                    self._start_lyric_typeset(pairs, pair_groups, options)
                     return
                 ref_texts, only_ids = self._create_events_from_lyrics(
                     pairs, clip_s if clip_s is not None else 0)
@@ -2304,6 +2384,91 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"가사로 {len(new_events)}줄 생성됨 — AI 동기화 진행 중", 5000)
         return ref_texts, ids
+
+    def _start_lyric_typeset(self, pairs: list, groups: list,
+                             options) -> None:
+        """백그라운드 타이프셋 계획 실행 — 완료 시 줄+스타일을 한 번에 생성."""
+        self._ai_progress = QProgressDialog(
+            "가사 타이프셋 분석 시작 중...", "취소", 0, 100, self)
+        self._ai_progress.setWindowTitle("완성본 형식 타이프셋 생성")
+        self._ai_progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self._ai_progress.setMinimumDuration(0)
+        self._ai_progress.setAutoClose(True)
+        self._ai_progress.setValue(0)
+
+        self._ai_thread = QThread()
+        self._ai_worker = _LyricTypesetWorker(
+            self._video_path, pairs, groups, options)
+        self._ai_worker.moveToThread(self._ai_thread)
+        self._ai_db_ref = self._db
+
+        self._ai_thread.started.connect(self._ai_worker.run)
+        self._ai_worker.progress.connect(self._on_ai_progress)
+        self._ai_worker.finished.connect(self._on_lyric_typeset_finished)
+        self._ai_worker.finished.connect(self._ai_thread.quit)
+        self._ai_progress.canceled.connect(self._ai_worker.cancel)
+        self._ai_thread.start()
+
+    def _on_lyric_typeset_finished(self, result, error: str) -> None:
+        if hasattr(self, "_ai_progress") and self._ai_progress is not None:
+            self._ai_progress.close()
+            self._ai_progress = None
+        worker = getattr(self, "_ai_worker", None)
+        if worker is not None and worker.cancelled:
+            self.statusBar().showMessage("가사 타이프셋 취소됨", 4000)
+            return
+        if getattr(self, "_ai_db_ref", None) is not self._db:
+            log.info("타이프셋 결과 폐기 — 완료 전에 프로젝트가 바뀜")
+            return
+        if error:
+            QMessageBox.critical(self, "가사 타이프셋 실패", error)
+            return
+        if result is None or not result.lines:
+            if result is not None:
+                QMessageBox.information(
+                    self, "가사 타이프셋",
+                    "생성할 줄이 없습니다 (가사·영상을 확인하세요).")
+            return
+        if not self._db or not self._main_track_id:
+            return
+
+        from ai.lyric_typeset import DARK_STYLE, LIGHT_STYLE, lyric_style_props
+        from app.commands.edit_commands import (BulkInsertEventsCommand,
+                                                CompositeCommand)
+        from app.commands.style_commands import CreateStyleCommand
+        cmds = []
+        existing = {s["name"] for s in self._db.get_styles()}
+        for name, dark in ((LIGHT_STYLE, False), (DARK_STYLE, True)):
+            if name not in existing:
+                cmds.append(
+                    CreateStyleCommand(self._db, name, lyric_style_props(dark)))
+        events = self._db.get_events(self._main_track_id)
+        order = len(events)
+        new_events = [
+            EventRow(
+                id=str(uuid.uuid4()),
+                track_id=self._main_track_id,
+                start_ms=pl.start_ms,
+                end_ms=pl.end_ms,
+                text=pl.text,
+                style_id=pl.style,
+                order_index=order + i,
+            )
+            for i, pl in enumerate(result.lines)
+        ]
+        cmds.append(BulkInsertEventsCommand(self._db, new_events))
+        self.cmd_bus.execute(
+            CompositeCommand(cmds, "가사 타이프셋 생성")
+            if len(cmds) > 1 else cmds[0])
+        self._mark_modified()
+        self._refresh_all()
+        self.grid.select_by_id(new_events[0].id)
+        QMessageBox.information(
+            self, "가사 타이프셋 완료",
+            f"{len(new_events)}줄 생성 — 그래픽 타이밍 {result.n_graphic}줄, "
+            f"감지 이벤트 {result.n_events}개.\n"
+            f"스타일 {LIGHT_STYLE}/{DARK_STYLE} 은 스타일 편집기에서 폰트 등을 "
+            f"바꿀 수 있습니다.")
 
     def _on_ai_progress(self, frac: float, msg: str) -> None:
         if hasattr(self, "_ai_progress") and self._ai_progress is not None:
