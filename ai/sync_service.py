@@ -623,10 +623,18 @@ def _direct_lyric_effects(
         digest = None
     _check_cancel(cancel_event)
 
+    # 취소 경로 (실측: run_cli 0.18s, 실제 codex 호출 0.22s 만에 반환):
+    #   취소 버튼 -> cancel_event.set() -> 감시 스레드가 token.cancel() ->
+    #   run_cli 가 이 스레드의 thread-local 토큰에 등록해 둔 CLI 프로세스
+    #   트리를 taskkill -> communicate 가 즉시 돌아와 프로바이더가 LLMError ->
+    #   디렉터는 규칙 폴백으로 '정상' 반환 -> 아래에서 token.cancelled 를 보고
+    #   SyncCancelled 로 바꾼다 (폴백 결과를 조용히 쓰지 않는다).
+    # 프로바이더 호출은 이 워커 스레드에서 동기 1회(스레드/재시도 없음)라
+    # 토큰 등록이 반드시 그 호출에 걸린다.
     token = CliCancelToken()
     stop = threading.Event()
     watcher: Optional[threading.Thread] = None
-    if cancel_event is not None and use_llm:
+    if cancel_event is not None:
         def _watch() -> None:
             while not stop.wait(0.25):
                 if cancel_event.is_set():
@@ -634,7 +642,7 @@ def _direct_lyric_effects(
                     return
         watcher = threading.Thread(target=_watch, name="typeset-llm-cancel", daemon=True)
         watcher.start()
-        if progress:
+        if use_llm and progress:
             progress(0.93, "AI 연출 결정 중 — LLM 응답 대기 (취소하면 즉시 중단)")
     set_cancel_token(token)
     try:
@@ -646,6 +654,8 @@ def _direct_lyric_effects(
         stop.set()
         if watcher is not None:
             watcher.join(timeout=1.0)
+    if token.cancelled:
+        raise SyncCancelled("사용자가 취소했습니다.")
     _check_cancel(cancel_event)
     vias = [rows[i].via for i in row_indices]
     lines, notes = expand_planned(fx_lines, proposal.directives, play_res, vias)
