@@ -15,7 +15,8 @@ fx 이름)이 얼마나 자주 쓰였는지·전형적인 값(글자 크기, \\f
   4. \\frz270 + \\clip/\\iclip, 또는 \\fn@(세로 폰트)  → vertical_title
   5. 본문 중간 블록에 \\1c/\\c 전환                    → partial_color
   6. \\move + \\t(...\\fscx...)                          → drift_scale
-  7. 그 외                                              → plain
+  7. \\move + \\t(...\\fr/\\frz...) (크기 변화 없음)      → fly_rotate
+  8. 그 외                                              → plain
 
 파일 없음/파싱 실패는 예외 없이 빈 다이제스트를 돌려준다.
 """
@@ -39,8 +40,9 @@ _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
 # 다이제스트에 실리는 카테고리 순서 (스키마와 동일 이름)
 CATEGORY_ORDER: tuple[str, ...] = (
     "char_scatter", "char_diagonal", "char_stack", "ghost_trail", "shadow_bar",
-    "vertical_title", "partial_color", "drift_scale", "plain",
+    "vertical_title", "partial_color", "drift_scale", "fly_rotate", "plain",
 )
+_FR_IN_T_RE = re.compile(r"\\frz?-?\d")   # \t 안의 \fr / \frz (frx/fry 제외)
 
 
 @dataclass(slots=True)
@@ -230,8 +232,12 @@ def _classify_single(r: _Rec) -> str:
         return "vertical_title"
     if any(t.name in ("1c", "c") for t in r.mid):
         return "partial_color"
-    if _tag(r.head, "move") is not None and "fscx" in _t_bodies(r.head):
-        return "drift_scale"
+    if _tag(r.head, "move") is not None:
+        bodies = _t_bodies(r.head)
+        if "fscx" in bodies:
+            return "drift_scale"
+        if _FR_IN_T_RE.search(bodies):
+            return "fly_rotate"
     return "plain"
 
 

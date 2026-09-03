@@ -45,10 +45,18 @@ _HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 _SHORT_LETTERS = 5          # 이 글자 수 이하를 '짧은 줄' 로 본다
 _LONG_LETTERS = 8           # 이 글자 수 이상을 '긴 줄' 로 본다
 _DRIFT_BIG = 0.05           # |drift_x|+|drift_y| 가 이보다 크면 드리프트 연출
+_DRIFT_FLY = 0.15           # 짧은 단어가 이만큼 흘러가면 날아가는 회전 단어 (레퍼런스 '마음')
+_FLY_LETTERS = 3            # 이 글자 수 이하를 '짧은 단어' 로 본다
 _MOTION_SCATTER = 0.3
 _MAX_EXTRAS = 2
 _VERSE_CYCLE: tuple[str, ...] = ("plain", "drift_scale", "char_scatter",
                                   "ghost_trail", "plain")
+# 다이제스트 보강 후보 — 레퍼런스가 쓰는데 배정에 하나도 없는 fx 를 가장 잘 맞는
+# plain 절 줄 1개에 배정한다. (fx → 허용 최대 글자 수)
+_DIGEST_FLOOR_FX: dict[str, int] = {
+    "fly_rotate": _FLY_LETTERS, "char_scatter": _SHORT_LETTERS,
+    "char_diagonal": _LONG_LETTERS, "ghost_trail": _SHORT_LETTERS,
+}
 
 
 @dataclass(slots=True)
@@ -197,15 +205,23 @@ def _saturation(hex_color: str) -> float:
 
 
 _ACCENT_MAX_LUM_DARK = 0.6    # 검은 글자(밝은 장면) 강조색은 이보다 어두워야 배경과 구분
-_ACCENT_MIN_LUM_LIGHT = 0.4   # 흰 글자(어두운 장면) 강조색은 이보다 밝아야 함
+_ACCENT_MIN_VALUE_LIGHT = 0.5 # 흰 글자(어두운 장면) 강조색은 최대 채널이 이 이상(어두운 회색 거부)
+_ACCENT_MIN_LUM_LIGHT = 0.03  # …그리고 거의 검정이 아니어야 함
+
+
+def _value(hex_color: str) -> float:
+    """HSV 의 V (최대 채널, 0~1) — 어두운 배경 위 가시성 판단용."""
+    return max(int(hex_color[i:i + 2], 16) for i in (1, 3, 5)) / 255.0
 
 
 def _accent_color(v: Any, dark: bool) -> str | None:
     """장면 주요색 중 글자색·배경과 대비되는, 가장 채도 높은 색.
 
     partial_color 는 밝은 장면(검은 글자)에서 주로 쓰이는데 장면의 주요색은
-    곧 배경색(#FEFEFE 등)이라 그대로 쓰면 강조 단어가 사라진다. 휘도로 걸러
-    없으면 None → 스키마 기본(#C2A954, 레퍼런스 금색).
+    곧 배경색(#FEFEFE 등)이라 그대로 쓰면 강조 단어가 사라진다. 검은 글자는
+    휘도 상한, 흰 글자(어두운 장면)는 '어두운 회색/검정' 을 거른다 — 채도 있는
+    중간 밝기 색(#3355AA 등)은 어두운 배경에서도 읽히므로 통과. 없으면 None →
+    스키마 기본(#C2A954, 레퍼런스 금색).
     """
     cands: list[tuple[float, str]] = []
     for c in _vis(v, "dominant_colors", None) or []:
@@ -215,7 +231,7 @@ def _accent_color(v: Any, dark: bool) -> str | None:
         lum = _luminance(c)
         if dark and lum > _ACCENT_MAX_LUM_DARK:
             continue
-        if not dark and lum < _ACCENT_MIN_LUM_LIGHT:
+        if not dark and (lum < _ACCENT_MIN_LUM_LIGHT or _value(c) < _ACCENT_MIN_VALUE_LIGHT):
             continue
         cands.append((_saturation(c), c))
     if not cands:
@@ -298,6 +314,25 @@ def _rule_drift(line: FxLine, v: Any, slot: int,
     return FxDirective("drift_scale", p)
 
 
+def _rule_fly(line: FxLine, v: Any, slot: int,
+              play_res: tuple[int, int]) -> FxDirective:
+    """날아가는 회전 단어 — 드리프트 방향으로 화면을 가로질러 도착점(x,y)에 닿는다."""
+    rx, ry = play_res
+    p = _defaults("fly_rotate")
+    dxf = float(_vis(v, "drift_x", 0.0))
+    dyf = float(_vis(v, "drift_y", 0.0))
+    if abs(dxf) + abs(dyf) > _DRIFT_BIG:
+        # 드리프트 벡터를 화면 절반 크기로 키운다 (레퍼런스: 좌상단 → 우하단 ~1000px)
+        k = 0.5 / max(abs(dxf), abs(dyf))
+        dx, dy = round(dxf * k * rx), round(dyf * k * ry)
+    else:
+        dx, dy = (900 if slot % 2 == 0 else -900), 700
+    p["dx"] = int(_clamp(dx, -1800, 1800))
+    p["dy"] = int(_clamp(dy, -1080, 1080))
+    p["fade_in"], p["fade_out"] = _fades(line)
+    return FxDirective("fly_rotate", p)
+
+
 def _rule_scatter(line: FxLine, v: Any) -> FxDirective:
     p = _defaults("char_scatter")
     motion = float(_vis(v, "motion", 0.0))
@@ -339,6 +374,8 @@ def _verse_family(line: FxLine, v: Any, slot: int, n_group: int) -> str:
     """
     motion = float(_vis(v, "motion", 0.0))
     drift = abs(float(_vis(v, "drift_x", 0.0))) + abs(float(_vis(v, "drift_y", 0.0)))
+    if n_group <= _FLY_LETTERS and drift > _DRIFT_FLY:
+        return "fly_rotate"       # 짧은 단어 + 큰 드리프트 (레퍼런스 '마음')
     if n_group <= _SHORT_LETTERS and motion > _MOTION_SCATTER:
         return "char_scatter"
     if drift > _DRIFT_BIG:
@@ -348,6 +385,8 @@ def _verse_family(line: FxLine, v: Any, slot: int, n_group: int) -> str:
     fam = _VERSE_CYCLE[slot % len(_VERSE_CYCLE)]
     if fam == "char_scatter" and n_group > _SHORT_LETTERS + 3:
         return "drift_scale"      # 긴 줄을 글자별로 흩뿌리면 화면을 넘친다
+    if fam == "ghost_trail" and n_group <= _FLY_LETTERS:
+        return "fly_rotate"       # 2~3글자에 잔상 5겹은 과하다 — 날아가는 단어로
     if fam == "ghost_trail" and n_group > _SHORT_LETTERS:
         return "plain"
     return fam
@@ -357,6 +396,12 @@ def _build_verse(line: FxLine, v: Any, family: str, slot: int,
                  play_res: tuple[int, int]) -> FxDirective:
     if family == "char_scatter":
         return _rule_scatter(line, v)
+    if family == "fly_rotate":
+        return _rule_fly(line, v, slot, play_res)
+    if family == "char_diagonal":
+        p = _defaults("char_diagonal")
+        p["fade_in"], p["fade_out"] = _fades(line)
+        return FxDirective("char_diagonal", p)
     if family == "drift_scale":
         return _rule_drift(line, v, slot, play_res)
     if family == "partial_color":
@@ -473,11 +518,16 @@ def build_system_prompt() -> str:
         "     role=prologue 는 plain(fs 70). role=verse 는 자유롭게.",
         "  3. 같은 group 번호의 줄들은 같은 fx 계열을 씁니다 (파라미터는 달라도 됨).",
         "  4. 글자별 fx(char_scatter/char_diagonal/char_stack)는 짧은 줄(≤8글자)에만.",
+        "     fly_rotate 는 짧은 단어(≤3글자)가 드리프트(drift)와 함께 화면을 가로질러",
+        "     날아갈 때 1~2줄만.",
         "  5. 변주는 하되 한 곡 안에서 일관성을 유지하세요 — 같은 페이드/크기 체계,",
         "     밝은 장면(dark=true)은 검은 글자이므로 shadow_bar 를 얹어 가독성 확보.",
-        "  6. 숫자는 범위 안, 색은 #RRGGBB, span 은 해당 줄 텍스트에 실제로 있는 부분.",
-        "  7. 분포: 본문 fx 가 plain 인 줄을 전체의 40% 이상으로 두고(참고 완성본도",
-        "     1/3 이 plain), 글자별/잔상 연출은 곡 전체에서 각각 2~3줄 정도만 씁니다.",
+        "  6. 숫자는 범위 안, 색은 #RRGGBB. span 은 반드시 *그 index 줄의 텍스트*에서만",
+        "     고르세요 — 다른 줄(앞뒤 index)의 단어를 넣으면 그 줄 전체가 무효 처리됩니다.",
+        "  7. 분포: 본문 fx 가 plain 인 줄을 전체의 40% 이상으로 두고, 나머지는 참고",
+        "     완성본 요약의 '연출 빈도' 에 비례해 나눕니다 (요약이 없으면 drift_scale >",
+        "     partial_color > char_* > ghost_trail 순). 글자별/잔상 연출은 곡 전체에서",
+        "     각각 2~3줄 정도만. 같은 본문 fx(plain 제외)를 3줄 연속으로 쓰지 마세요.",
         "     같은 결정을 반복 실행에서도 그대로 내리도록 확실한 근거(짧은 줄, 모션,",
         "     드리프트, 밝은 장면)가 있을 때만 plain 이 아닌 fx 를 고릅니다.",
         "",
@@ -567,9 +617,13 @@ def _parse_entry(item: Any, lines: list[FxLine], roles: list[str],
     """응답 항목 1개 → (index, directive|None). index 를 못 읽으면 None."""
     if not isinstance(item, dict):
         return None
+    raw_idx = item.get("index")
     try:
-        idx = int(item.get("index"))
-    except (TypeError, ValueError, OverflowError):   # None / "abc" / Infinity
+        if isinstance(raw_idx, float) and not math.isfinite(raw_idx):
+            raise ValueError(raw_idx)
+        idx = int(raw_idx)
+    except (TypeError, ValueError, OverflowError):   # None / "abc" / NaN / Infinity
+        notes.append(f"줄 번호가 유한한 숫자여야 함 (현재 {raw_idx!r}) → 항목 무시")
         return None
     if not (0 <= idx < len(lines)):
         notes.append(f"범위 밖 줄 번호 무시: {idx}")
@@ -613,6 +667,67 @@ def _parse_entry(item: Any, lines: list[FxLine], roles: list[str],
     return idx, FxDirective(fx, params, extras)
 
 
+def _apply_digest_floor(
+    proposal: TypesetProposal,
+    lines: list[FxLine],
+    visuals: list,
+    roles: list[str],
+    groups: list[int],
+    digest: StyleDigest | None,
+    play_res: tuple[int, int],
+) -> None:
+    """레퍼런스가 쓰는 연출 계열이 배정에 하나도 없으면 가장 잘 맞는 plain 절 줄 1개에 배정.
+
+    목표는 '완성본의 모든 연출을 재현' — LLM 이 빈도를 따르지 않거나 규칙이 조건을
+    못 만나 fly_rotate/char_* /ghost_trail 이 통째로 빠지는 것을 막는다. 후보는
+    role=verse, 현재 plain(없으면 한 줄짜리 연출 줄), 그룹에 다른 줄이 없고(같은
+    절은 같은 계열 규칙 유지), 글자 수가 계열 상한 이하인 줄 중 가장 짧은 줄(동률이면
+    앞). 결정적. 예외 없음.
+    """
+    if digest is None or not getattr(digest, "categories", None):
+        return
+    try:
+        n = len(lines)
+        groups = [int(groups[i]) if i < len(groups) else i for i in range(n)]
+        group_size: dict[int, int] = {}
+        for g in groups:
+            group_size[g] = group_size.get(g, 0) + 1
+        used = {d.fx for d in proposal.directives}
+        for fx, max_letters in _DIGEST_FLOOR_FX.items():
+            if fx not in TYPESET_FX or not digest.categories.get(fx) or fx in used:
+                continue
+            best: tuple[int, int] | None = None
+            # 1차: plain 줄만. fly_rotate 만 2차로 한 줄짜리 연출(drift·잔상·부분색)
+            # 줄도 후보 — r 회전 단어는 다른 fx 로는 대신할 수 없는 레퍼런스 연출.
+            passes: tuple[tuple[str, ...], ...] = (("plain",),)
+            if fx == "fly_rotate":
+                passes += (("plain", "drift_scale", "ghost_trail", "partial_color"),)
+            for allowed in passes:
+                for i, line in enumerate(lines):
+                    if (roles[i] != "verse" or proposal.directives[i].fx not in allowed
+                            or group_size.get(groups[i], 1) > 1):
+                        continue
+                    nl = _nletters(_plain(line))
+                    if nl == 0 or nl > max_letters:
+                        continue
+                    if best is None or nl < best[0]:
+                        best = (nl, i)
+                if best is not None:
+                    break
+            if best is None:
+                continue
+            i = best[1]
+            slot = i % len(_VERSE_CYCLE)
+            d = _build_verse(lines[i], visuals[i], fx, slot, play_res)
+            if validate_directive(d):
+                continue
+            proposal.directives[i] = d
+            used.add(fx)
+            proposal.notes.append(f"{i}번 줄: 참고 완성본에 있는 {fx} 가 배정에 없어 보강")
+    except Exception as e:  # noqa: BLE001 — 보강은 부가 기능
+        proposal.notes.append(f"다이제스트 보강 중 예외 무시: {type(e).__name__}: {e}")
+
+
 def direct_typeset(
     lines: list[FxLine],
     visuals: list,
@@ -628,12 +743,31 @@ def direct_typeset(
     LLM 응답은 항목별로 화이트리스트/범위/역할 고정/부분 문자열 검증을 거치며,
     실패·누락 줄은 direct_by_rules 결과로 대체하고 notes 에 남긴다.
     LLM 호출 자체가 실패하면 errors 에 적고 전체를 규칙으로 폴백(used_llm=False).
+    마지막에 _apply_digest_floor 로 레퍼런스 연출 계열 누락을 보강한다.
     """
-    proposal = TypesetProposal()
     n = len(lines)
     roles = [str(roles[i]) if i < len(roles) and roles[i] else "verse" for i in range(n)]
-    groups = [int(groups[i]) if i < len(groups) else i for i in range(n)]
     visuals = [visuals[i] if i < len(visuals) else None for i in range(n)]
+    proposal = _direct_typeset_core(lines, visuals, roles, groups, digest, provider,
+                                    use_llm, play_res)
+    if lines:
+        _apply_digest_floor(proposal, lines, visuals, roles, groups, digest, play_res)
+    return proposal
+
+
+def _direct_typeset_core(
+    lines: list[FxLine],
+    visuals: list,
+    roles: list[str],
+    groups: list[int],
+    digest: StyleDigest | None,
+    provider: LLMProvider | None,
+    use_llm: bool,
+    play_res: tuple[int, int],
+) -> TypesetProposal:
+    proposal = TypesetProposal()
+    n = len(lines)
+    groups = [int(groups[i]) if i < len(groups) else i for i in range(n)]
     fallback = direct_by_rules(lines, visuals, roles, groups, play_res)
     proposal.directives = list(fallback)
     if not lines:

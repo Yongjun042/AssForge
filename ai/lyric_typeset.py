@@ -270,7 +270,77 @@ def plan_times(
         r.start = max(r.start, prev)
         r.end = max(r.end, r.start + 300)
         prev = r.start
+
+    # gap 줄 무리 순차화 — 근거 없는 줄들이 같은 자리·같은 끝으로 쌓이면
+    # 앞 줄의 끝을 뒤 줄의 시작으로 잘라 차례로 보이게 하고 y 를 계단식으로.
+    # (시작이 확정된 뒤에 — 단조 보정 전의 임시 시작으로 칸을 나누면 틀린다)
+    _sequence_gap_runs(pairs, rows)
     return rows
+
+
+_GAP_RUN_MIN_MS = 1200          # 순차화 후 한 줄이 최소 이만큼은 보여야 한다
+_GAP_RUN_SAME_START_MS = 60     # 시작이 이 안이면 같은 '칸' (같은 절의 구 — 함께 둔다)
+_GAP_STAIR_Y: tuple[float, ...] = (0.35, 0.5, 0.65)   # 칸 순번별 y (프레임 비율)
+
+
+def _same_spot(a: _Row, b: _Row) -> bool:
+    """좌표 근거가 없는 줄(pos None)은 어느 자리와도 '같은 자리' 로 본다."""
+    if a.pos is None or b.pos is None:
+        return True
+    return ((a.pos[0] - b.pos[0]) ** 2 + (a.pos[1] - b.pos[1]) ** 2) ** 0.5 < _SWAP_DIST
+
+
+def _sequence_gap_runs(pairs: list[LyricPair], rows: list[_Row]) -> int:
+    """연속된 gap 줄이 같은 자리·같은 끝으로 몰린 무리를 순차 표시로 바꾼다.
+
+    인트로처럼 보컬/그래픽 근거가 없는 줄들은 모두 '다음 정상 줄 시작' 을 끝으로
+    받아 한 자리에 10여 줄이 20초씩 겹친다. 각 칸(같은 시작의 줄들)의 끝을 뒤에
+    오는 칸 중 _GAP_RUN_MIN_MS 이상 떨어진 첫 칸의 시작으로 자르고, y 를 칸 순번의
+    계단(0.35/0.5/0.65)으로 둔다. 제목 카드도 같은 규칙으로 끝을 자르되(레퍼런스:
+    제목·프롤로그는 첫 가사 줄이 뜰 때 사라진다) 세로 기둥이라 좌표는 그대로 둔다.
+    반환: 끝이 바뀐 줄 수.
+    """
+    n = len(rows)
+    changed = 0
+    i = 0
+    while i < n:
+        r = rows[i]
+        if r.via != "gap" or r.start is None:
+            i += 1
+            continue
+        j = i
+        while (j + 1 < n and rows[j + 1].via == "gap" and rows[j + 1].start is not None
+               and _same_spot(r, rows[j + 1]) and rows[j + 1].end == r.end):
+            j += 1
+        run = list(range(i, j + 1))
+        i = j + 1
+        if len(run) < 2:
+            continue
+        # 칸 나누기 — 시작이 (거의) 같은 줄은 한 칸
+        slots: list[list[int]] = []
+        for k in run:
+            if slots and abs(rows[k].start - rows[slots[-1][0]].start) <= _GAP_RUN_SAME_START_MS:
+                slots[-1].append(k)
+            else:
+                slots.append([k])
+        for s, members in enumerate(slots):
+            s_start = rows[members[0]].start
+            new_end = None
+            for later in slots[s + 1:]:
+                if rows[later[0]].start - s_start >= _GAP_RUN_MIN_MS:
+                    new_end = rows[later[0]].start
+                    break
+            yfrac = _GAP_STAIR_Y[s % len(_GAP_STAIR_Y)]
+            for k in members:
+                rk = rows[k]
+                if _role_of(pairs, k, rk) != "title":
+                    # 제목은 세로 기둥(프레임 높이의 대부분)이라 y 계단에 넣지 않는다
+                    px = rk.pos[0] if rk.pos is not None else 0.5
+                    rk.pos = (px, yfrac)
+                if new_end is not None and new_end < rk.end:
+                    rk.end = max(new_end, rk.start + 300)
+                    changed += 1
+    return changed
 
 
 @dataclass(slots=True)
@@ -377,7 +447,7 @@ def _role_of(pairs: list[LyricPair], i: int, r: _Row) -> str:
     p = pairs[i]
     if r.stack >= 0:
         return "tail"
-    if (i == 0 and not p.reading and r.via in ("gap", "-")
+    if (i == 0 and not p.reading and r.via in ("gap", "-", "vocal0")
             and any(q.reading for q in pairs)):
         return "title"
     tr = p.translation or ""
@@ -390,21 +460,38 @@ def _role_of(pairs: list[LyricPair], i: int, r: _Row) -> str:
 _COLLIDE_MS = 1000       # 이만큼 이상 동시에 보이면
 _COLLIDE_PX = 220        # 중심 거리가 이보다 가까울 때 '배치 충돌'
 _COLLIDE_COL_X = 0.20    # 2열 배치의 좌우 오프셋 (W 비율) — 레퍼런스 650/1445, 844/1480
+_COLLIDE_COL3_X = 0.28   # 3열 이상일 때 열 간격 (W 비율)
 _COLLIDE_WOBBLE_X = 0.06 # 1열 계단의 좌우 흔들림 — 레퍼런스 1052/1288/1280/1072
-_COLLIDE_ROW_MIN = 110.0 # 계단 행 간격(px) 하한/상한
+_COLLIDE_ROW_MIN = 110.0 # 1열 계단 행 간격(px) 하한/상한 (좌우 흔들림과 합쳐 220px 이상)
 _COLLIDE_ROW_MAX = 220.0
-_COLLIDE_WIDE = 0.36     # 추정 폭이 W 의 이 비율을 넘는 줄은 2열로 두면 겹친다
+_COLLIDE_GRID_ROW = 220.0  # 다열 격자의 행 간격 — 같은 열 이웃도 충돌 거리 밖
+_COLLIDE_WIDE = 0.36     # 추정 폭이 W 의 이 비율을 넘는 줄은 다열 격자에 두면 겹친다
+_COLLIDE_PX_PER_LETTER = 90.0  # fs 96 한글 폭 추정 (전각 0.9em + 공백)
+_COLLIDE_GAP_PX = 40.0   # 2열 나란히 둘 때 두 줄 사이 최소 여백
 
 
-def _spread_collisions(lines: list, rx: int, ry: int) -> int:
+def _est_width(text: str) -> float:
+    return _nletters(text) * _COLLIDE_PX_PER_LETTER
+
+
+_COLLIDE_ANCHOR_X = 0.30  # 고정 줄(세로 제목 기둥) 옆에 무리를 둘 때의 가로 거리 (W 비율)
+
+
+def _spread_collisions(lines: list, rx: int, ry: int,
+                       fixed: Optional[set[int]] = None) -> int:
     """동시에(≥1s) 보이면서 중심이 가까운(<220px) 줄 무리를 좌우/상하로 벌린다.
 
     같은 절의 구들(블록 페이드)과 인트로의 gap 줄들은 같은 교체 이벤트 중심을
     받아 한 자리에 쌓인다. 레퍼런스는 그런 쌍을 좌우로(x 650/1445), 서너 줄은
-    아래로 흐르는 계단으로 배치한다: 2줄(또는 7줄 이상)은 2열, 그 외 1열 계단.
-    긴 줄(추정 폭 > 0.36W)은 2열이 서로 겹치므로 1열. 무리 전체를 프레임
-    안(8~92%)으로 민 뒤 클램프. 반환: 좌표가 바뀐 줄 수. 결정적.
+    아래로 흐르는 계단으로 배치한다: 2줄은 두 줄의 추정 폭이 열 간격에 들어가면
+    2열(레퍼런스 '아무것도 바라지 않으려고'/'그렇지만' 650/1445), 아니면 1열 계단;
+    3~6줄은 1열 계단; 7줄 이상은 2~4열 격자(행 간격 220px). 무리 전체를 추정
+    폭까지 포함해 프레임 안(8~92%)으로 민 뒤 클램프. fixed 에 든 줄(세로 제목 —
+    프레임 높이 대부분을 차지하는 기둥)은 움직이지 않고, 같은 무리의 나머지를
+    기둥에서 0.30W 떨어진 쪽(기둥이 오른쪽이면 왼쪽)에 배치한다. 반환: 좌표가
+    바뀐 줄 수. 결정적.
     """
+    fixed = set(fixed or ())
     n = len(lines)
     parent = list(range(n))
 
@@ -430,28 +517,56 @@ def _spread_collisions(lines: list, rx: int, ry: int) -> int:
     lo_x, hi_x = 0.08 * rx, 0.92 * rx
     lo_y, hi_y = 0.08 * ry, 0.92 * ry
     moved = 0
-    for idxs in clusters.values():
+    for cluster in clusters.values():
+        if len(cluster) < 2:
+            continue
+        anchors = [t for t in cluster if t in fixed]
+        idxs = [t for t in cluster if t not in fixed]
         k = len(idxs)
-        if k < 2:
+        if k < 1:
             continue
         idxs.sort(key=lambda t: (lines[t].start_ms, t))
-        cx = sum(lines[t].x for t in idxs) / k
         cy = sum(lines[t].y for t in idxs) / k
-        widest = max(_nletters(lines[t].text) for t in idxs) * 100
-        ncols = 2 if (k == 2 or k > 6) and widest <= _COLLIDE_WIDE * rx else 1
+        if anchors:
+            ax = sum(lines[t].x for t in anchors) / len(anchors)
+            cx = ax - _COLLIDE_ANCHOR_X * rx if ax >= rx / 2.0 else ax + _COLLIDE_ANCHOR_X * rx
+        else:
+            cx = sum(lines[t].x for t in idxs) / k
+        widths = [_est_width(lines[t].text) for t in idxs]
+        if k == 1:
+            ncols = 1
+        elif k == 2:
+            # 두 줄을 나란히 둘 수 있나 — 반폭 합 + 여백이 열 간격(2·0.20W) 이하
+            fits = (widths[0] + widths[1]) / 2.0 + _COLLIDE_GAP_PX <= 2 * _COLLIDE_COL_X * rx
+            ncols = 2 if fits else 1
+        elif k > 6 and max(widths) <= _COLLIDE_WIDE * rx:
+            ncols = min(4, -(-k // 5))          # 열당 최대 5행 (행 간격 220px 이 프레임에 듦)
+        else:
+            ncols = 1
         nrows = -(-k // ncols)
-        dy = (min(_COLLIDE_ROW_MAX, max(_COLLIDE_ROW_MIN, 0.6 * ry / (nrows - 1)))
-              if nrows > 1 else 0.0)
+        if nrows <= 1:
+            dy = 0.0
+        elif ncols == 1:
+            dy = min(_COLLIDE_ROW_MAX, max(_COLLIDE_ROW_MIN, 0.6 * ry / (nrows - 1)))
+        else:
+            dy = _COLLIDE_GRID_ROW
         pts: list[tuple[float, float]] = []
         for s in range(k):
             col, row = s % ncols, s // ncols
-            if ncols == 2:
+            if k == 1:
+                ox = 0.0
+            elif ncols == 1:
+                ox = (_COLLIDE_WOBBLE_X if s % 2 else -_COLLIDE_WOBBLE_X) * rx
+            elif ncols == 2:
                 ox = (_COLLIDE_COL_X if col else -_COLLIDE_COL_X) * rx
             else:
-                ox = (_COLLIDE_WOBBLE_X if s % 2 else -_COLLIDE_WOBBLE_X) * rx
+                ox = (col - (ncols - 1) / 2.0) * _COLLIDE_COL3_X * rx
             oy = (row - (nrows - 1) / 2.0) * dy
             pts.append((cx + ox, cy + oy))
-        min_x, max_x = min(p[0] for p in pts), max(p[0] for p in pts)
+        # 프레임 맞춤 — 다열이면 글자 폭까지 넣어 가장자리 줄이 잘리지 않게
+        hw = [w / 2.0 if ncols > 1 else 0.0 for w in widths]
+        min_x = min(p[0] - h for p, h in zip(pts, hw))
+        max_x = max(p[0] + h for p, h in zip(pts, hw))
         min_y, max_y = min(p[1] for p in pts), max(p[1] for p in pts)
         sx = (lo_x - min_x) if min_x < lo_x else (hi_x - max_x) if max_x > hi_x else 0.0
         sy = (lo_y - min_y) if min_y < lo_y else (hi_y - max_y) if max_y > hi_y else 0.0
@@ -522,7 +637,8 @@ def to_fx_lines(
             x=first.x, y=first.y, dark=first.dark))
         roles.append("tail")
         row_indices.append(first.index)
-    _spread_collisions(fx_lines, rx, ry)
+    _spread_collisions(fx_lines, rx, ry,
+                       fixed={k for k, role in enumerate(roles) if role == "title"})
     # 시작 시간 순서 유지 (꼬리 합본은 원래도 마지막이지만 안전하게)
     order = sorted(range(len(fx_lines)),
                    key=lambda k: (fx_lines[k].start_ms, row_indices[k]))

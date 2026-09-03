@@ -13,8 +13,10 @@ effects.typeset_fx_schema 의 TYPESET_FX 화이트리스트를 그대로 따른�
   - ghost_trail     같은 텍스트 N 겹, 회색조 \c + \move 오프셋 + \blur
   - shadow_bar      (extras 전용) ■■■ 블러 막대, layer 0
   - vertical_title  \fn@세로폰트\frz270 — 머리(블러 등장 + 별 자리 \iclip 구멍)
-                    + 몸통(\clip 위→아래 드러내기) + 회전 ★
+                    + 몸통(\clip 또는 \iclip 위→아래 드러내기) + 회전 ★
   - partial_color   span 만 \1c 변경 (+ \1a 드러내기)
+  - fly_rotate      {\an5\move(x0,y0,x,y,0,mv)\fs\fad\t(0,mv,\fr-720)}마음 —
+                    (x-dx,y-dy) 에서 (x,y) 로 날아오며 회전 (\fr = \frz 축약)
 
 글자별 배치(char_*)는 행/대각선 상자가 프레임을 넘치면 행 전체를 안쪽으로 민다
 (글자마다 가장자리 좌표로 뭉개지지 않게). _cx/_cy 클램프는 마지막 안전장치.
@@ -535,13 +537,22 @@ def _x_vertical_title(line: FxLine, p: dict[str, Any], res: tuple[int, int]) -> 
         return "".join(parts)
 
     out: list[FxEvent] = []
+    iclip_reveal = p["reveal"] == "iclip"
     if head_n:
         hy = _cy(top + len_head / 2.0, res)
+        htop = _cy(top - margin_y, res)
+        hbot = _cy(top + len_head + margin_y, res)
         hole = ""
         if p["star"]:
             # 별 자리에 \iclip 구멍 — 블러 번짐이 별을 덮지 않게 (레퍼런스 '밤하늘')
             hole = (f"\\iclip({star_x - _STAR_HOLE},{star_y - _STAR_HOLE},"
                     f"{star_x + _STAR_HOLE},{star_y + _STAR_HOLE})")
+        if iclip_reveal:
+            # 레퍼런스 변형: 머리를 덮은 \iclip 사각형이 별 구멍(없으면 아래 선)으로
+            # 줄어들며 드러난다. 몸통은 아래의 \clip 와이프 그대로.
+            final = hole or f"\\iclip({cx0},{hbot},{cx1},{hbot})"
+            hole = (f"\\iclip({cx0},{htop},{cx1},{hbot})"
+                    f"\\t(0,{reveal},{final})")
         head = (
             f"{{\\an5\\pos({x},{hy}){font}\\frz270\\fs{sizes[0]}"
             f"\\bord0\\blur20\\t(0,600,\\blur0){hole}{fad}}}"
@@ -551,11 +562,16 @@ def _x_vertical_title(line: FxLine, p: dict[str, Any], res: tuple[int, int]) -> 
     y = _cy(by, res)
     ctop = _cy(by - len_body / 2.0 - margin_y, res)
     cbot = _cy(by + len_body / 2.0 + margin_y, res)
+    if iclip_reveal and not head_n:
+        # 머리가 없으면 기둥 자체를 \iclip 으로 — 가리는 사각형이 위에서부터 줄어든다
+        clip = (f"\\iclip({cx0},{ctop},{cx1},{cbot})"
+                f"\\t(0,{reveal},\\iclip({cx0},{cbot},{cx1},{cbot}))")
+    else:
+        clip = (f"\\clip({cx0},{ctop},{cx1},{ctop})"
+                f"\\t(0,{reveal},\\clip({cx0},{ctop},{cx1},{cbot}))")
     body = (
         f"{{\\an5\\pos({x},{y}){font}\\frz270\\fs{sizes[head_n]}"
-        f"\\clip({cx0},{ctop},{cx1},{ctop})"
-        f"\\t(0,{reveal},\\clip({cx0},{ctop},{cx1},{cbot}))"
-        f"{fad}}}"
+        f"{clip}{fad}}}"
     )
     out.append(_event(line, body + _glyphs(head_n, n)))
     if p["star"]:
@@ -591,6 +607,23 @@ def _x_partial_color(line: FxLine, p: dict[str, Any], res: tuple[int, int]) -> l
     return [_event(line, lead + body)]
 
 
+_FLY_MOVE_FRAC = 0.72   # 레퍼런스 '마음': 4900ms 이동 / 6790ms 지속
+
+
+def _x_fly_rotate(line: FxLine, p: dict[str, Any], res: tuple[int, int]) -> list[FxEvent]:
+    """(x-dx, y-dy) → (x, y) 로 날아오며 \\fr 회전. 도착 후 남은 시간은 머문다."""
+    x1, y1 = _cx(line.x, res), _cy(line.y, res)
+    x0, y0 = _cx(line.x - p["dx"], res), _cy(line.y - p["dy"], res)
+    dur = _line_dur(line)
+    mv = max(1, int(round(dur * _FLY_MOVE_FRAC)))
+    deg = _num(-360.0 * float(p["turns"]))     # turns=2 → \fr-720 (레퍼런스)
+    block = (
+        f"{{\\an5\\move({x0},{y0},{x1},{y1},0,{mv})\\fs{p['fs']}"
+        f"{_fad(p['fade_in'], p['fade_out'])}\\t(0,{mv},\\fr{deg})}}"
+    )
+    return [_event(line, block + _tighten(_safe_text(line.text)))]
+
+
 _EXPANDERS: dict[str, Callable[[FxLine, dict[str, Any], tuple[int, int]], list[FxEvent]]] = {
     "plain": _x_plain,
     "drift_scale": _x_drift_scale,
@@ -601,6 +634,7 @@ _EXPANDERS: dict[str, Callable[[FxLine, dict[str, Any], tuple[int, int]], list[F
     "shadow_bar": _x_shadow_bar,
     "vertical_title": _x_vertical_title,
     "partial_color": _x_partial_color,
+    "fly_rotate": _x_fly_rotate,
 }
 
 

@@ -103,14 +103,32 @@ TYPESET_FX: dict[str, dict[str, Any]] = {
             "offset_y": ParamSpec("int", 40, "본문 대비 Y 오프셋(px)", -300, 300),
         },
     },
-    # 세로쓰기 제목: \frz270 + \clip 위→아래 드러내기 + 회전하는 ★ (레퍼런스 제목)
+    # 세로쓰기 제목: \fn@세로폰트\frz270 + 몸통 \clip 위→아래 드러내기 + 회전하는 ★
+    # (레퍼런스 제목). reveal=iclip 은 머리('밤하늘')를 덮은 \iclip 사각형이 별
+    # 구멍으로 줄어들며 드러나는 변형 (머리가 없는 짧은 제목은 기둥 자체를 \iclip).
     "vertical_title": {
         "label": "세로 제목",
         "params": {
             "fs": ParamSpec("int", 70, "글자 크기", 30, 140),
             "reveal_ms": ParamSpec("int", 2800, "드러내기 시간(ms)", 100, 6000),
+            "reveal": ParamSpec("choice", "clip", "드러내기 방식",
+                                choices=("clip", "iclip")),
             "star": ParamSpec("bool", True, "회전 별 장식"),
             "fade_out": ParamSpec("int", 1100, "페이드 아웃(ms)", 0, 3000),
+        },
+    },
+    # 날아가며 회전하는 짧은 단어 (레퍼런스 '마음':
+    # \move(164.8,50.4,1172,794,0,4900)+\t(0,4900,\fr-720)). (x,y) 는 도착점,
+    # 출발점은 (x-dx, y-dy). 이동/회전은 지속의 72% 동안, 나머지는 도착점에 머문다.
+    "fly_rotate": {
+        "label": "날아가는 회전 단어",
+        "params": {
+            "fs": ParamSpec("int", 70, "글자 크기", 30, 160),
+            "dx": ParamSpec("int", 900, "이동량 X(px, 도착점 기준)", -1800, 1800),
+            "dy": ParamSpec("int", 700, "이동량 Y(px, 도착점 기준)", -1080, 1080),
+            "turns": ParamSpec("float", 2.0, "회전 바퀴 수(+=반시계)", -4, 4),
+            "fade_in": ParamSpec("int", 330, "페이드 인(ms)", 0, 2000),
+            "fade_out": ParamSpec("int", 330, "페이드 아웃(ms)", 0, 2000),
         },
     },
     # 부분 색상: span 에 해당하는 글자만 다른 색 (+선택: 시간차 알파 드러내기)
