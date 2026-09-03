@@ -9,7 +9,7 @@ import logging
 import os
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -449,6 +449,11 @@ class LyricTypesetResult:
     language: str
     n_graphic: int       # 그래픽 이벤트가 시간 근거인 줄 수
     n_events: int        # 감지된 그래픽 이벤트 수
+    used_llm: bool = False          # AI 연출을 LLM 이 정했는지 (False = 규칙)
+    fx_notes: list = field(default_factory=list)  # 연출 폴백/검증 노트
+    # AI 연출 상태: "" (연출 안 함) | "llm" (LLM 배정 반영) | "rules" (규칙 디렉터)
+    # | "none" (디렉터/확장 실패 → compose_lines 기본 배치, 연출 없음)
+    fx_status: str = ""
 
 
 def run_lyric_typeset(
@@ -459,6 +464,10 @@ def run_lyric_typeset(
     progress: Optional[Callable[[float, str], None]] = None,
     cancel_event: Optional[threading.Event] = None,
     transcript: Optional[TranscriptionResult] = None,
+    ai_effects: bool = False,
+    reference_ass: Optional[str] = None,
+    use_llm: bool = True,
+    play_res: tuple[int, int] = (1920, 1080),
 ) -> LyricTypesetResult:
     """가사 쌍들 → 완성본 형식 타이프셋 줄 계획 (그래픽 우선 타이밍).
 
@@ -471,6 +480,12 @@ def run_lyric_typeset(
         pairs: ai.lyric_text.LyricPair 리스트 (구 분할 완료 상태).
         groups: 각 쌍의 원래 절 인덱스 (split_phrase_pairs_grouped).
         transcript: 테스트/재실행용 전사 주입 — 주면 오디오 단계를 건너뛴다.
+        ai_effects: 완성본 스타일 연출(글자 분할·잔상·그림자·세로 제목)을
+            디렉터(LLM 또는 규칙)가 정해 여러 이벤트로 확장한다. 아니면
+            compose_lines 의 \\pos/\\move + \\fad 한 줄.
+        reference_ass: 레퍼런스 완성본 .ass — 스타일 다이제스트로 LLM 에 준다.
+        use_llm: False 면 규칙 디렉터만 (LLM 프로바이더 호출 안 함).
+        play_res: 스크립트의 PlayResX/Y — \\pos/\\move/\\clip 좌표계 (기본 1920x1080).
     """
     from ai.lyric_text import creation_sync_targets
     from ai.lyric_typeset import compose_lines, plan_times
@@ -536,13 +551,111 @@ def run_lyric_typeset(
     ) or []
     _check_cancel(cancel_event)
 
-    lines = compose_lines(pairs, rows, vis)
+    used_llm = False
+    fx_notes: list[str] = []
+    fx_status = ""
+    lines = None
+    res_xy = (int(play_res[0]) or 1920, int(play_res[1]) or 1080)
+    if ai_effects:
+        # 6) AI 연출 — 디렉터가 fx 를 정하고 확장기가 이벤트로 펼친다.
+        # LLM 호출은 이 워커 스레드 안에서 동기로 돈다. 디렉터/확장기는
+        # 스스로 규칙·plain 폴백을 보장하지만, 그 바깥(다이제스트·변환)의
+        # 예외까지 잡아 기존 compose_lines 로 내려간다.
+        _p(0.92, "AI 연출 결정 중...")
+        try:
+            lines, used_llm, fx_notes = _direct_lyric_effects(
+                pairs, groups, rows, vis, reference_ass, use_llm, cancel_event,
+                play_res=res_xy, progress=_p)
+            fx_status = "llm" if used_llm else "rules"
+        except SyncCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 연출 실패는 치명적이지 않다
+            log.exception("AI 연출 실패 — 기본 배치로 폴백")
+            fx_notes = [f"AI 연출 실패, 기본 배치(연출 없음)로 폴백: {exc}"]
+            fx_status = "none"
+            lines = None
+        _check_cancel(cancel_event)
+    if lines is None:
+        lines = compose_lines(pairs, rows, vis, res_xy[0], res_xy[1])
     n_graphic = sum(1 for r in rows if r.via == "graphic")
-    log.info("가사 타이프셋 계획: %d줄 (그래픽 근거 %d, 이벤트 %d개)",
-             len(lines), n_graphic, len(events))
+    log.info("가사 타이프셋 계획: %d줄 (그래픽 근거 %d, 이벤트 %d개, AI 연출=%s, 상태=%s)",
+             len(lines), n_graphic, len(events), ai_effects, fx_status or "-")
     _p(1.0, f"타이프셋 계획 완료 — {len(lines)}줄")
     return LyricTypesetResult(
-        lines=lines, language=lang, n_graphic=n_graphic, n_events=len(events))
+        lines=lines, language=lang, n_graphic=n_graphic, n_events=len(events),
+        used_llm=used_llm, fx_notes=fx_notes, fx_status=fx_status)
+
+
+def _direct_lyric_effects(
+    pairs: list,
+    groups: list[int],
+    rows: list,
+    vis: list,
+    reference_ass: Optional[str],
+    use_llm: bool,
+    cancel_event: Optional[threading.Event],
+    play_res: tuple[int, int] = (1920, 1080),
+    progress: Optional[Callable[[float, str], None]] = None,
+) -> tuple[list, bool, list[str]]:
+    """to_fx_lines → 스타일 다이제스트 → 디렉터 → expand_planned.
+
+    LLM 호출(claude/codex CLI, 최대 수 분) 동안 cancel_event 를 감시하는 스레드가
+    CliCancelToken 으로 CLI 프로세스 트리를 죽인다 — 취소 버튼이 CLI 타임아웃까지
+    막히지 않게. 죽은 CLI 는 LLM 오류 → 디렉터가 규칙으로 폴백한 뒤 여기서
+    SyncCancelled 를 낸다.
+
+    Returns:
+        (PlannedLine 목록, used_llm, notes)
+    """
+    from ai.llm._cli import CliCancelToken, set_cancel_token
+    from ai.lyric_typeset import expand_planned, fx_visuals, to_fx_lines
+    from ai.reference_style import build_style_digest
+    from ai.typeset_director import direct_typeset
+
+    play_res = (int(play_res[0]), int(play_res[1]))
+    fx_lines, roles, row_indices = to_fx_lines(pairs, rows, vis, play_res)
+    if not fx_lines:
+        return [], False, ["연출할 줄이 없습니다."]
+    line_vis = fx_visuals(rows, vis, row_indices)
+    line_groups = [int(groups[i]) if i < len(groups) else i for i in row_indices]
+    digest = build_style_digest(reference_ass) if reference_ass else None
+    if digest is not None and digest.empty:
+        digest = None
+    _check_cancel(cancel_event)
+
+    token = CliCancelToken()
+    stop = threading.Event()
+    watcher: Optional[threading.Thread] = None
+    if cancel_event is not None and use_llm:
+        def _watch() -> None:
+            while not stop.wait(0.25):
+                if cancel_event.is_set():
+                    token.cancel()
+                    return
+        watcher = threading.Thread(target=_watch, name="typeset-llm-cancel", daemon=True)
+        watcher.start()
+        if progress:
+            progress(0.93, "AI 연출 결정 중 — LLM 응답 대기 (취소하면 즉시 중단)")
+    set_cancel_token(token)
+    try:
+        proposal = direct_typeset(
+            fx_lines, line_vis, roles, line_groups, digest=digest,
+            use_llm=use_llm, play_res=play_res)
+    finally:
+        set_cancel_token(None)
+        stop.set()
+        if watcher is not None:
+            watcher.join(timeout=1.0)
+    _check_cancel(cancel_event)
+    vias = [rows[i].via for i in row_indices]
+    lines, notes = expand_planned(fx_lines, proposal.directives, play_res, vias)
+    all_notes = list(proposal.errors) + list(proposal.notes) + notes
+    if proposal.used_llm and (proposal.provider or proposal.model):
+        all_notes.insert(0, f"LLM: {proposal.provider} {proposal.model}".strip())
+    log.info("AI 연출: %d줄 → %d이벤트, LLM=%s, fx=%s",
+             len(fx_lines), len(lines), proposal.used_llm,
+             [d.fx for d in proposal.directives])
+    return lines, bool(proposal.used_llm), all_notes
 
 
 def _ensure_audio_wav(path: str) -> Optional[str]:

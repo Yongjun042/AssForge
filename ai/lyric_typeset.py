@@ -64,6 +64,7 @@ class PlannedLine:
     end_ms: int
     style: str
     via: str        # graphic|vocal|stack|gap — 시간의 근거 (통계/로그용)
+    layer: int = 0  # ASS 레이어 (AI 연출: 장식 0 / 별 1 / 본문 2)
 
 
 @dataclass(slots=True)
@@ -272,18 +273,36 @@ def plan_times(
     return rows
 
 
-def compose_lines(
+@dataclass(slots=True)
+class _Placed:
+    """줄 1개의 배치 결정 — compose_lines / to_fx_lines 가 공유하는 중간값."""
+    index: int                    # pairs 인덱스
+    row: _Row
+    visual: Optional[LineVisual]
+    text: str                     # 표시 평문 (번역 > 독음 > 원문)
+    x: int
+    y: int
+    dark: bool
+    dx: int = 0                   # 그래픽 드리프트 (px, 0 이면 \pos)
+    dy: int = 0
+
+
+def _place_lines(
     pairs: list[LyricPair],
     rows: list[_Row],
     visuals: list[LineVisual],
-    play_res_x: int = 1920,
-    play_res_y: int = 1080,
-) -> list[PlannedLine]:
-    """계획 + 시각 분석 → 태그 붙은 최종 줄. visuals 는 시간 있는 줄 순서."""
-    out: list[PlannedLine] = []
+    play_res_x: int,
+    play_res_y: int,
+) -> list[_Placed]:
+    """계획 + 시각 분석 → 좌표/텍스트/흑백 결정 (태그 없음).
+
+    compose_lines(태그 직접 생성)와 to_fx_lines(AI 연출 확장)가 같은 로직을
+    쓰도록 뽑아낸 헬퍼. visuals 는 시간 있는 줄 순서.
+    """
+    out: list[_Placed] = []
     n_stack = sum(1 for r in rows if r.stack >= 0)
     wi = 0
-    for p, r in zip(pairs, rows):
+    for i, (p, r) in enumerate(zip(pairs, rows)):
         if r.start is None:
             continue
         v = visuals[wi] if wi < len(visuals) else None
@@ -306,18 +325,255 @@ def compose_lines(
                     and v.brightness > _DARK_BRIGHTNESS)
         drift = (abs(v.gx1 - v.gx0) + abs(v.gy1 - v.gy0)
                  if v is not None and v.sampled and v.salient > 0.003 else 0.0)
+        dx = dy = 0
         if r.stack < 0 and drift > _MOVE_DRIFT:
             dx = round((v.gx1 - v.gx0) * play_res_x)
             dy = round((v.gy1 - v.gy0) * play_res_y)
-            motion = f"\\move({x},{y},{x + dx},{y + dy})"
+        out.append(_Placed(index=i, row=r, visual=v, text=text,
+                           x=x, y=y, dark=dark, dx=dx, dy=dy))
+    return out
+
+
+def compose_lines(
+    pairs: list[LyricPair],
+    rows: list[_Row],
+    visuals: list[LineVisual],
+    play_res_x: int = 1920,
+    play_res_y: int = 1080,
+) -> list[PlannedLine]:
+    """계획 + 시각 분석 → 태그 붙은 최종 줄. visuals 는 시간 있는 줄 순서."""
+    out: list[PlannedLine] = []
+    for pl in _place_lines(pairs, rows, visuals, play_res_x, play_res_y):
+        r = pl.row
+        if pl.dx or pl.dy:
+            motion = f"\\move({pl.x},{pl.y},{pl.x + pl.dx},{pl.y + pl.dy})"
         else:
-            motion = f"\\pos({x},{y})"
+            motion = f"\\pos({pl.x},{pl.y})"
         tags = f"{{\\an5{motion}\\fad(330,330)}}"
         out.append(PlannedLine(
-            text=tags + text,
+            text=tags + pl.text,
             start_ms=r.start,
             end_ms=r.end,
-            style=DARK_STYLE if dark else LIGHT_STYLE,
+            style=DARK_STYLE if pl.dark else LIGHT_STYLE,
             via=r.via,
         ))
     return out
+
+
+# ---- AI 연출 경로 (effects.typeset_fx 확장) --------------------------------
+
+def _role_of(pairs: list[LyricPair], i: int, r: _Row) -> str:
+    """줄의 역할 — 디렉터가 fx 를 고르는 사전정보.
+
+    tail: 꼬리 글자 스택 / title: 제목 카드 / prologue: 원문이 비일본어(영어
+    머리말 등)이고 번역이 여러 행 / verse: 그 외.
+
+    title 은 첫 줄이 '노래 구가 아니라는 근거' 가 있을 때만: 다른 쌍에는 독음이
+    있는데 이 줄만 없고(3행 형식에서 제목 카드는 독음이 없다), 보컬/그래픽
+    정렬 근거 없이 gap 으로 시간이 잡힌 경우. 2행(원문/번역)·원문만 형식은
+    모든 쌍이 독음이 없으므로 첫 가사 줄을 세로 제목으로 오판하지 않는다.
+    """
+    from ai.lyric_normalize import detect_language
+    p = pairs[i]
+    if r.stack >= 0:
+        return "tail"
+    if (i == 0 and not p.reading and r.via in ("gap", "-")
+            and any(q.reading for q in pairs)):
+        return "title"
+    tr = p.translation or ""
+    if (p.source and detect_language(p.source) != "ja"
+            and ("\\N" in tr or "\\n" in tr or "\n" in tr)):
+        return "prologue"
+    return "verse"
+
+
+_COLLIDE_MS = 1000       # 이만큼 이상 동시에 보이면
+_COLLIDE_PX = 220        # 중심 거리가 이보다 가까울 때 '배치 충돌'
+_COLLIDE_COL_X = 0.20    # 2열 배치의 좌우 오프셋 (W 비율) — 레퍼런스 650/1445, 844/1480
+_COLLIDE_WOBBLE_X = 0.06 # 1열 계단의 좌우 흔들림 — 레퍼런스 1052/1288/1280/1072
+_COLLIDE_ROW_MIN = 110.0 # 계단 행 간격(px) 하한/상한
+_COLLIDE_ROW_MAX = 220.0
+_COLLIDE_WIDE = 0.36     # 추정 폭이 W 의 이 비율을 넘는 줄은 2열로 두면 겹친다
+
+
+def _spread_collisions(lines: list, rx: int, ry: int) -> int:
+    """동시에(≥1s) 보이면서 중심이 가까운(<220px) 줄 무리를 좌우/상하로 벌린다.
+
+    같은 절의 구들(블록 페이드)과 인트로의 gap 줄들은 같은 교체 이벤트 중심을
+    받아 한 자리에 쌓인다. 레퍼런스는 그런 쌍을 좌우로(x 650/1445), 서너 줄은
+    아래로 흐르는 계단으로 배치한다: 2줄(또는 7줄 이상)은 2열, 그 외 1열 계단.
+    긴 줄(추정 폭 > 0.36W)은 2열이 서로 겹치므로 1열. 무리 전체를 프레임
+    안(8~92%)으로 민 뒤 클램프. 반환: 좌표가 바뀐 줄 수. 결정적.
+    """
+    n = len(lines)
+    parent = list(range(n))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for i in range(n):
+        a = lines[i]
+        for j in range(i + 1, n):
+            b = lines[j]
+            if min(a.end_ms, b.end_ms) - max(a.start_ms, b.start_ms) < _COLLIDE_MS:
+                continue
+            if ((a.x - b.x) ** 2 + (a.y - b.y) ** 2) ** 0.5 >= _COLLIDE_PX:
+                continue
+            parent[find(i)] = find(j)
+    clusters: dict[int, list[int]] = {}
+    for i in range(n):
+        clusters.setdefault(find(i), []).append(i)
+
+    lo_x, hi_x = 0.08 * rx, 0.92 * rx
+    lo_y, hi_y = 0.08 * ry, 0.92 * ry
+    moved = 0
+    for idxs in clusters.values():
+        k = len(idxs)
+        if k < 2:
+            continue
+        idxs.sort(key=lambda t: (lines[t].start_ms, t))
+        cx = sum(lines[t].x for t in idxs) / k
+        cy = sum(lines[t].y for t in idxs) / k
+        widest = max(_nletters(lines[t].text) for t in idxs) * 100
+        ncols = 2 if (k == 2 or k > 6) and widest <= _COLLIDE_WIDE * rx else 1
+        nrows = -(-k // ncols)
+        dy = (min(_COLLIDE_ROW_MAX, max(_COLLIDE_ROW_MIN, 0.6 * ry / (nrows - 1)))
+              if nrows > 1 else 0.0)
+        pts: list[tuple[float, float]] = []
+        for s in range(k):
+            col, row = s % ncols, s // ncols
+            if ncols == 2:
+                ox = (_COLLIDE_COL_X if col else -_COLLIDE_COL_X) * rx
+            else:
+                ox = (_COLLIDE_WOBBLE_X if s % 2 else -_COLLIDE_WOBBLE_X) * rx
+            oy = (row - (nrows - 1) / 2.0) * dy
+            pts.append((cx + ox, cy + oy))
+        min_x, max_x = min(p[0] for p in pts), max(p[0] for p in pts)
+        min_y, max_y = min(p[1] for p in pts), max(p[1] for p in pts)
+        sx = (lo_x - min_x) if min_x < lo_x else (hi_x - max_x) if max_x > hi_x else 0.0
+        sy = (lo_y - min_y) if min_y < lo_y else (hi_y - max_y) if max_y > hi_y else 0.0
+        for t, (px, py) in zip(idxs, pts):
+            nx = int(round(min(hi_x, max(lo_x, px + sx))))
+            ny = int(round(min(hi_y, max(lo_y, py + sy))))
+            if (nx, ny) != (lines[t].x, lines[t].y):
+                lines[t].x, lines[t].y = nx, ny
+                moved += 1
+    return moved
+
+
+def to_fx_lines(
+    pairs: list[LyricPair],
+    rows: list[_Row],
+    visuals: list[LineVisual],
+    play_res: tuple[int, int] = (1920, 1080),
+) -> "tuple[list, list[str], list[int]]":
+    """계획 + 시각 분석 → 태그 없는 FxLine 목록 (AI 연출 디렉터 입력).
+
+    compose_lines 와 같은 좌표/텍스트/스타일/흑백 결정을 공유하되, 동시에 같은
+    자리에 뜨는 줄들은 _spread_collisions 로 좌우/계단 배치한다 (디렉터·확장기
+    전 단계 — 글자별/잔상/막대 연출이 한 점에 쌓이지 않게).
+
+    Returns:
+        (fx_lines, roles, row_indices) — 병렬 리스트. roles 는
+        title|prologue|verse|tail, row_indices 는 각 FxLine 의 pairs 인덱스.
+
+    꼬리 글자 스택(rows[i].stack>=0)은 개별 줄로 두지 않고 하나의 FxLine
+    ("뛰쳐올라가", 첫 시작~공통 끝)으로 합쳐 char_stack 에 맡긴다 — 근거:
+      · 확장기의 char_stack 이 시차 등장·글자 크기 감소·상승 배치를 한 줄에서
+        결정적으로 만들고(레퍼런스 뛰/쳐/올/라/가 와 같은 꼴), 디렉터가
+        stagger 를 지속/글자 수로 조정한다. 글자를 따로 주면 디렉터가 각각에
+        다른 fx 를 고르거나 스택 정합이 깨질 수 있다.
+      · plan_times 의 stack 배치(균등 시차, 공통 소멸)는 char_stack 의
+        stagger_ms + 공통 end 와 같은 모델이라 정보 손실이 없다.
+    합쳐진 줄의 row_indices 는 첫 꼬리 쌍의 인덱스, 좌표는 맨 아래 글자의
+    자리(stack 0), 흑백은 첫 꼬리 줄의 장면 분석을 따른다.
+    """
+    from effects.typeset_fx_schema import FxLine
+
+    rx, ry = int(play_res[0]), int(play_res[1])
+    placed = _place_lines(pairs, rows, visuals, rx, ry)
+    fx_lines: list = []
+    roles: list[str] = []
+    row_indices: list[int] = []
+    tail: list[_Placed] = []
+    for pl in placed:
+        r = pl.row
+        if r.stack >= 0:
+            tail.append(pl)
+            continue
+        fx_lines.append(FxLine(
+            text=pl.text, start_ms=int(r.start), end_ms=int(r.end),
+            style=DARK_STYLE if pl.dark else LIGHT_STYLE,
+            x=pl.x, y=pl.y, dark=pl.dark))
+        roles.append(_role_of(pairs, pl.index, r))
+        row_indices.append(pl.index)
+    if tail:
+        tail.sort(key=lambda t: t.row.stack)
+        first = tail[0]
+        text = "".join(t.text.replace("\\N", "").replace("\n", "") for t in tail)
+        start = min(int(t.row.start) for t in tail)
+        end = max(int(t.row.end) for t in tail)
+        fx_lines.append(FxLine(
+            text=text, start_ms=start, end_ms=max(end, start + 300),
+            style=DARK_STYLE if first.dark else LIGHT_STYLE,
+            x=first.x, y=first.y, dark=first.dark))
+        roles.append("tail")
+        row_indices.append(first.index)
+    _spread_collisions(fx_lines, rx, ry)
+    # 시작 시간 순서 유지 (꼬리 합본은 원래도 마지막이지만 안전하게)
+    order = sorted(range(len(fx_lines)),
+                   key=lambda k: (fx_lines[k].start_ms, row_indices[k]))
+    return ([fx_lines[k] for k in order], [roles[k] for k in order],
+            [row_indices[k] for k in order])
+
+
+def fx_visuals(
+    rows: list[_Row],
+    visuals: list[LineVisual],
+    row_indices: list[int],
+) -> list[Optional[LineVisual]]:
+    """to_fx_lines 의 row_indices 에 맞춘 LineVisual 목록 (없으면 None).
+
+    visuals 는 '시간 있는 줄 순서'(analyze_line_windows 입력 순서)라 pairs
+    인덱스와 다르다 — 그 대응을 여기서 푼다.
+    """
+    timed = [i for i, r in enumerate(rows) if r.start is not None]
+    by_index = {i: (visuals[k] if k < len(visuals) else None)
+                for k, i in enumerate(timed)}
+    return [by_index.get(i) for i in row_indices]
+
+
+def expand_planned(
+    fx_lines: list,
+    directives: list,
+    play_res: tuple[int, int] = (1920, 1080),
+    vias: Optional[list[str]] = None,
+) -> tuple[list[PlannedLine], list[str]]:
+    """FxLine + FxDirective → 확장된 PlannedLine 들 (+ 폴백/오류 노트).
+
+    effects.typeset_fx.expand_safe 를 쓰므로 예외를 내지 않는다 — 검증 실패나
+    확장 예외는 plain 으로 폴백하고 notes 에 남긴다. directives 가 짧으면
+    나머지는 plain. vias 는 줄별 시간 근거(없으면 fx 이름).
+    """
+    from effects.typeset_fx import expand_safe
+    from effects.typeset_fx_schema import FxDirective
+
+    out: list[PlannedLine] = []
+    notes: list[str] = []
+    res = (int(play_res[0]), int(play_res[1]))
+    for i, line in enumerate(fx_lines):
+        d = directives[i] if i < len(directives) and directives[i] is not None \
+            else FxDirective("plain")
+        events, errs = expand_safe(line, d, res)
+        for e in errs:
+            notes.append(f"[{i}] {line.text[:12]!r}: {e}")
+        via = (vias[i] if vias is not None and i < len(vias) and vias[i]
+               else str(getattr(d, "fx", "plain")))
+        for ev in events:
+            out.append(PlannedLine(
+                text=ev.text, start_ms=int(ev.start_ms), end_ms=int(ev.end_ms),
+                style=ev.style or line.style, via=via, layer=int(ev.layer)))
+    return out, notes

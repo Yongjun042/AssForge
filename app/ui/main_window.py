@@ -18,7 +18,8 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QFileDialog,
     QFormLayout,
     QFrame, QHBoxLayout,
-    QLabel, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
+    QMessageBox,
     QPlainTextEdit, QProgressDialog, QPushButton, QSizePolicy, QSplitter,
     QStackedWidget, QStatusBar, QVBoxLayout, QWidget,
 )
@@ -162,12 +163,18 @@ class _LyricTypesetWorker(QObject):
     finished = Signal(object, str)   # (LyricTypesetResult|None, 에러)
 
     def __init__(self, video_path: str, pairs: list, groups: list,
-                 options) -> None:
+                 options, ai_effects: bool = False,
+                 reference_ass: Optional[str] = None,
+                 play_res: Optional[tuple[int, int]] = None) -> None:
         super().__init__()
         self._video_path = video_path
         self._pairs = pairs
         self._groups = groups
         self._options = options
+        self._ai_effects = bool(ai_effects)
+        self._reference_ass = reference_ass or None
+        # 스크립트 PlayResX/Y — \pos/\move/\clip 좌표계 (없으면 1920x1080)
+        self._play_res = tuple(play_res) if play_res else (1920, 1080)
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -184,6 +191,9 @@ class _LyricTypesetWorker(QObject):
                 self._video_path, self._pairs, self._groups, self._options,
                 progress=lambda f, m: self.progress.emit(f, m),
                 cancel_event=self._cancel,
+                ai_effects=self._ai_effects,
+                reference_ass=self._reference_ass,
+                play_res=self._play_res,
             )
             self.finished.emit(result, "")
         except SyncCancelled:
@@ -517,6 +527,36 @@ class _AiSyncOptionsDialog(QDialog):
         self._typeset.setEnabled(False)
         form.addRow(self._typeset)
 
+        # AI 연출 — 수작업 완성본의 연출(글자별 분할·고스트 잔상·그림자
+        # 막대·세로 제목·부분 색상)을 디렉터(LLM 또는 규칙)가 줄마다 고르고
+        # 여러 이벤트로 확장한다. 레퍼런스 .ass 를 주면 그 스타일 요약을
+        # LLM 프롬프트에 넣는다. 타이프셋이 켜져 있을 때만 의미가 있다.
+        self._fx = QCheckBox(
+            "AI 연출 적용 (완성본 스타일 재현 — 글자 분할·잔상·그림자·세로 제목)")
+        self._fx.setToolTip(
+            "타이프셋 줄을 완성본 스타일의 연출로 확장합니다: 글자별 3D 흩뿌리기,\n"
+            "대각선/세로 스택 배치, 고스트 잔상, 그림자 막대, 세로 제목+★,\n"
+            "부분 색상 등. 설치된 LLM CLI(claude/codex)가 있으면 줄별 연출을\n"
+            "LLM 이 고르고, 없으면 규칙으로 정합니다. 모든 태그는 화이트리스트\n"
+            "안에서만 생성됩니다.")
+        self._fx.setChecked(settings.value("aiSyncFxEnabled", True, type=bool))
+        form.addRow(self._fx)
+
+        self._fx_ref = QLineEdit()
+        self._fx_ref.setPlaceholderText("(선택) 레퍼런스 완성본 .ass — 스타일 요약을 LLM 에 제공")
+        self._fx_ref.setText(settings.value("aiSyncFxReference", "", type=str) or "")
+        self._fx_ref_btn = QPushButton("찾아보기")
+        self._fx_ref_btn.clicked.connect(self._browse_fx_reference)
+        frow = QHBoxLayout()
+        frow.setContentsMargins(0, 0, 0, 0)
+        frow.addWidget(self._fx_ref, 1)
+        frow.addWidget(self._fx_ref_btn)
+        self._fx_ref_widget = QWidget()
+        self._fx_ref_widget.setLayout(frow)
+        form.addRow("레퍼런스 .ass:", self._fx_ref_widget)
+        self._typeset.toggled.connect(self._update_fx_enabled)
+        self._update_fx_enabled()
+
         hint = QLabel(
             "노래/BGM 은 언어 자동 감지가 자주 틀립니다 — 가사 언어를 직접 지정하세요.\n"
             "모델이 클수록 정확하지만 첫 사용 시 다운로드가 필요합니다\n"
@@ -553,14 +593,31 @@ class _AiSyncOptionsDialog(QDialog):
         self._settings.setValue("aiSyncVad", self._vad.isChecked())
         self._settings.setValue("aiSyncSnapVideo", self._snap_video.isChecked())
         self._settings.setValue("aiSyncLyricTypeset", self._typeset.isChecked())
+        self._settings.setValue("aiSyncFxEnabled", self._fx.isChecked())
+        self._settings.setValue("aiSyncFxReference", self._fx_ref.text().strip())
         if self._vocals.isEnabled():
             self._settings.setValue("aiSyncSeparateVocals", self._vocals.isChecked())
         super().accept()
+
+    def _update_fx_enabled(self, *_args) -> None:
+        """AI 연출 위젯은 타이프셋이 활성+체크일 때만 쓸 수 있다."""
+        on = self._typeset.isEnabled() and self._typeset.isChecked()
+        self._fx.setEnabled(on)
+        self._fx_ref_widget.setEnabled(on)
+
+    def _browse_fx_reference(self) -> None:
+        start = self._fx_ref.text().strip()
+        start_dir = os.path.dirname(start) if start else ""
+        path, _f = QFileDialog.getOpenFileName(
+            self, "레퍼런스 완성본 .ass 선택", start_dir, "ASS 자막 (*.ass);;모든 파일 (*)")
+        if path:
+            self._fx_ref.setText(path)
 
     def _update_lyric_info(self) -> None:
         from ai.lyric_text import parse_lyric_pairs
         pairs = parse_lyric_pairs(self._lyrics.toPlainText())
         self._typeset.setEnabled(bool(pairs))
+        self._update_fx_enabled()
         if not pairs:
             self._lyric_info.setText("")
             return
@@ -600,6 +657,14 @@ class _AiSyncOptionsDialog(QDialog):
 
     def lyric_typeset(self) -> bool:
         return self._typeset.isEnabled() and self._typeset.isChecked()
+
+    def fx_enabled(self) -> bool:
+        """AI 연출 적용 여부 — 타이프셋이 켜져 있을 때만 True 가 될 수 있다."""
+        return self.lyric_typeset() and self._fx.isEnabled() and self._fx.isChecked()
+
+    def fx_reference(self) -> Optional[str]:
+        """레퍼런스 완성본 .ass 경로 (빈 문자열이면 None)."""
+        return self._fx_ref.text().strip() or None
 
     def clip_range(self) -> "tuple[Optional[int], Optional[int]]":
         """(start_ms, end_ms) 또는 (None, None) — 시간 범위 미사용."""
@@ -2264,7 +2329,10 @@ class MainWindow(QMainWindow):
                         clip_start_ms=clip_s,
                         clip_end_ms=clip_e,
                     )
-                    self._start_lyric_typeset(pairs, pair_groups, options)
+                    self._start_lyric_typeset(
+                        pairs, pair_groups, options,
+                        ai_effects=opt_dlg.fx_enabled(),
+                        reference_ass=opt_dlg.fx_reference())
                     return
                 ref_texts, only_ids = self._create_events_from_lyrics(
                     pairs, clip_s if clip_s is not None else 0)
@@ -2386,8 +2454,13 @@ class MainWindow(QMainWindow):
         return ref_texts, ids
 
     def _start_lyric_typeset(self, pairs: list, groups: list,
-                             options) -> None:
-        """백그라운드 타이프셋 계획 실행 — 완료 시 줄+스타일을 한 번에 생성."""
+                             options, ai_effects: bool = False,
+                             reference_ass: Optional[str] = None) -> None:
+        """백그라운드 타이프셋 계획 실행 — 완료 시 줄+스타일을 한 번에 생성.
+
+        ai_effects: 완성본 스타일 연출(디렉터+확장기) 적용.
+        reference_ass: 레퍼런스 완성본 .ass 경로 (LLM 스타일 다이제스트용).
+        """
         self._ai_progress = QProgressDialog(
             "가사 타이프셋 분석 시작 중...", "취소", 0, 100, self)
         self._ai_progress.setWindowTitle("완성본 형식 타이프셋 생성")
@@ -2398,7 +2471,9 @@ class MainWindow(QMainWindow):
 
         self._ai_thread = QThread()
         self._ai_worker = _LyricTypesetWorker(
-            self._video_path, pairs, groups, options)
+            self._video_path, pairs, groups, options,
+            ai_effects=ai_effects, reference_ass=reference_ass,
+            play_res=self._play_res())
         self._ai_worker.moveToThread(self._ai_thread)
         self._ai_db_ref = self._db
 
@@ -2452,6 +2527,7 @@ class MainWindow(QMainWindow):
                 end_ms=pl.end_ms,
                 text=pl.text,
                 style_id=pl.style,
+                layer=int(getattr(pl, "layer", 0) or 0),
                 order_index=order + i,
             )
             for i, pl in enumerate(result.lines)
@@ -2463,10 +2539,30 @@ class MainWindow(QMainWindow):
         self._mark_modified()
         self._refresh_all()
         self.grid.select_by_id(new_events[0].id)
+        worker_fx = bool(getattr(worker, "_ai_effects", False))
+        fx_notes = list(getattr(result, "fx_notes", []) or [])
+        if worker_fx:
+            # 세 갈래: LLM 배정 반영 / 규칙 디렉터 / 실패(연출 없는 기본 배치)
+            status = getattr(result, "fx_status", "") or (
+                "llm" if getattr(result, "used_llm", False) else "rules")
+            if status == "llm":
+                fx_line = "AI 연출: LLM 배정 반영"
+            elif status == "rules":
+                fx_line = "AI 연출: 규칙 디렉터 (LLM 미사용 또는 반영 0줄)"
+            else:
+                fx_line = "AI 연출 실패 — 기본 배치(연출 없음)"
+            if fx_notes:
+                fx_line += f" (노트 {len(fx_notes)}건 — 로그 참조)"
+                for n in fx_notes:
+                    log.info("AI 연출 노트: %s", n)
+            fx_line += "\n"
+        else:
+            fx_line = ""
         QMessageBox.information(
             self, "가사 타이프셋 완료",
             f"{len(new_events)}줄 생성 — 그래픽 타이밍 {result.n_graphic}줄, "
             f"감지 이벤트 {result.n_events}개.\n"
+            f"{fx_line}"
             f"스타일 {LIGHT_STYLE}/{DARK_STYLE} 은 스타일 편집기에서 폰트 등을 "
             f"바꿀 수 있습니다.")
 
