@@ -1,6 +1,8 @@
 """Serializer — export project back to .ass using Shadow Document."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 from .shadow_document import ShadowDocument, LineType
 from .parser import (
     ParsedStyle, ParsedEvent,
@@ -21,6 +23,17 @@ def export_ass(
     - Modified styles/events: re-serialize from structured data
     - New styles/events: append after existing ones
     """
+    # 구조 방어 — 섀도 문서에 [Events]/[V4+ Styles] Format 줄이 없으면(빈 파일이나
+    # 손상 파일을 연 경우) 최소 골격 위에 다시 쓴다. 헤더 없는 Dialogue 나열은
+    # 어떤 렌더러도 읽지 못한다 (실측: 저장 결과가 Dialogue 60줄뿐이라 자막이
+    # 전혀 보이지 않았다). 기존 줄 참조(shadow_line_idx)는 골격에 없으므로 모두
+    # '새 줄' 로 다시 배정한다.
+    if (not shadow.get_lines_by_type(LineType.EVENT_FORMAT)
+            or not shadow.get_lines_by_type(LineType.STYLE_FORMAT)):
+        shadow = ShadowDocument.create_empty()
+        styles = [replace(st, shadow_line_idx=-1) for st in styles]
+        events = [replace(ev, shadow_line_idx=-1) for ev in events]
+
     overrides: dict[int, str] = {}
     inserts: dict[int, list[str]] = {}
     deleted_event_idxs: set[int] = set()
@@ -47,11 +60,30 @@ def export_ass(
             s = style_by_shadow[rl.index]
             overrides[rl.index] = serialize_style_line(s, style_fmt)
 
-    # New styles (no shadow_line_idx)
-    new_styles = [s for s in styles if s.shadow_line_idx < 0]
-    if new_styles and shadow_style_lines:
-        last_style_idx = shadow_style_lines[-1].index
-        inserts[last_style_idx] = [serialize_style_line(s, style_fmt) for s in new_styles]
+    # New styles (no shadow_line_idx). 섀도에 같은 이름의 Style 줄이 있으면
+    # (골격의 Default, 파일에서 온 스타일을 DB 가 다시 내보내는 경우) 중복
+    # 삽입 대신 그 줄을 덮어쓴다. 앵커는 마지막 Style 줄, Style 줄이 하나도
+    # 없으면 Format 줄 — 예전엔 Style 줄이 없는 문서에서 새 스타일이 통째로
+    # 사라졌다.
+    shadow_style_by_name = {
+        _style_name_of(rl.text): rl.index for rl in shadow_style_lines
+    }
+    new_style_lines: list[str] = []
+    for st in styles:
+        if st.shadow_line_idx >= 0:
+            continue
+        line = serialize_style_line(st, style_fmt)
+        dup_idx = shadow_style_by_name.get(st.name)
+        if dup_idx is not None and dup_idx not in overrides:
+            overrides[dup_idx] = line
+        else:
+            new_style_lines.append(line)
+    if new_style_lines:
+        if shadow_style_lines:
+            anchor_idx = shadow_style_lines[-1].index
+        else:
+            anchor_idx = style_format_lines[-1].index
+        inserts.setdefault(anchor_idx, []).extend(new_style_lines)
 
     # Events: `events` 의 순서(= order_index 순)가 파일에 실리는 최종 순서다.
     # 기존 이벤트를 각자의 원래 shadow 줄(slot)에 되쓰면 그리드에서 재정렬한
@@ -89,17 +121,25 @@ def export_ass(
         else:
             inserts.setdefault(anchor, []).append(serialize_event_line(e, event_fmt))
 
-    # Override script info if changed
+    # Override script info if changed; 문서에 없는 키(Video File 등)는 마지막
+    # KV 줄 뒤에 추가한다 — 예전엔 새 문서에서 조용히 사라졌다.
     if script_info:
-        for rl in shadow.get_lines_by_type(LineType.SCRIPT_INFO_KV):
+        kv_lines = shadow.get_lines_by_type(LineType.SCRIPT_INFO_KV)
+        seen_keys: set[str] = set()
+        for rl in kv_lines:
             text = rl.text.strip()
             if ":" in text:
                 key = text.partition(":")[0].strip()
+                seen_keys.add(key)
                 if key in script_info:
                     new_val = script_info[key]
                     expected = f"{key}: {new_val}"
                     if rl.text.strip() != expected:
                         overrides[rl.index] = expected
+        missing = [k for k in script_info if k not in seen_keys]
+        if missing and kv_lines:
+            inserts.setdefault(kv_lines[-1].index, []).extend(
+                f"{k}: {script_info[k]}" for k in missing)
 
     return shadow.export(overrides, inserts, deleted_indices=deleted_event_idxs)
 
@@ -129,3 +169,9 @@ _DEFAULT_EVENT_FORMAT = [
     "Layer", "Start", "End", "Style", "Name",
     "MarginL", "MarginR", "MarginV", "Effect", "Text",
 ]
+
+
+def _style_name_of(style_line: str) -> str:
+    """'Style: Name,...' 줄에서 이름만."""
+    body = style_line.split(":", 1)[1] if ":" in style_line else style_line
+    return body.split(",", 1)[0].strip()

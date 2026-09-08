@@ -405,3 +405,58 @@ def build_style_digest(ass_path: str) -> StyleDigest:
     except Exception:  # noqa: BLE001 — 다이제스트는 절대 예외를 내지 않는다
         return StyleDigest(source_path=ass_path or "")
     return digest
+
+
+# ── 내장 스타일 프로필 ───────────────────────────────────────────
+# 수작업 완성본(에마에 소원을! 00001, 81이벤트)에서 build_style_digest 로 실측한
+# 값을 상수로 굳힌 것. 사용자가 새 자막을 만드는 상황이 기본이라 레퍼런스
+# 파일 없이도 LLM 디렉터가 같은 연출 어휘·비율을 쓰게 한다. 예시 문구는
+# 형식만 같게 만든 중립 예시다.
+_DEFAULT_CATEGORIES: dict[str, int] = {
+    "char_scatter": 13, "char_diagonal": 7, "char_stack": 5, "ghost_trail": 5,
+    "shadow_bar": 4, "vertical_title": 6, "partial_color": 3, "drift_scale": 9,
+    "fly_rotate": 1, "plain": 28,
+}
+_DEFAULT_TYPICAL: dict[str, Any] = {
+    "fs_median": 110,
+    "fad_common": [(330, 330), (330, 0), (0, 330), (660, 0)],
+    "styles": ["가사 하양", "가사 검정"],
+    "ellipsis_lines": 41,
+    "chars_per_line": 4.6,
+}
+_DEFAULT_EXAMPLES: dict[str, list[str]] = {
+    "vertical_title": [
+        '{\\fad(0,1100) \\fn@서울한강체 B \\frz270 \\fs70 \\pos(1025,144) \\bord0 \\blur20 \\iclip(...) \\t(0,2800,\\iclip(...))} "제목 앞부분" (7.8s)',
+        '{\\fad(0,1100) \\fn@서울한강체 B \\fs20 \\bord0 \\blur20 \\t(0,600,\\blur0) \\t(0,9050,\\frz-720) \\pos(1046,85) \\org(1048,76)} "★" (7.8s)',
+    ],
+    "plain": [
+        '{\\fs70} "프롤로그 첫 줄, 둘째 줄" (3.0s)',
+        '{\\fs110 \\pos(570,482) \\fad(0,330) … \\fsp-5} "짧은 소절..." (3.4s)',
+    ],
+    "drift_scale": [
+        '{\\fad(83,330) \\move(1282,590,1282,840) \\t(0,2550,\\fscx200\\fscy200) … \\fsp-5} "뛰어가는 소절..." (2.6s)',
+        '{\\fad(330,330) \\move(1052,252,1374,650) \\t(0,7510,\\fscx80\\fscy80) … \\fsp-5} "멀어지는 소절..." (7.5s)',
+    ],
+    "char_scatter": [
+        '{\\fs120 \\fad(330,330) \\move(482,498,452,505) \\t(0,3670,\\fscx142\\fscy112\\frz3\\frx14\\fry-15)} "글" (3.7s)',
+        '{\\fs120 \\fad(330,330) \\move(1033,498,1033,475) \\t(0,2460,\\fscx156\\fscy138\\frx12\\fry6\\frz-10)} "자" (2.5s)',
+    ],
+    "char_diagonal": ['{\\fad(330,330) \\pos(280,456)} "굴" (6.8s) … 다음 글자 \\pos(386,528), (496,590)'],
+    "char_stack": ['{\\pos(1084,955) \\fs112} "뛰" (2.3s)', '{\\pos(1084,733) \\fs108} "어" (2.1s)'],
+    "ghost_trail": ['{\\fs100 \\move(1099,345,989,345,1295,1800) \\bord0 \\t(1300,500,\\blur5\\fscx120\\c&H4E4E4E&)} "같은 텍스트 ×5겹" (1.6s)'],
+    "shadow_bar": ['{\\fad(660,0) \\1c&H131313& \\1a&H1& \\3a&H00& \\bord0 \\blur40 \\fsp-35 \\fscx110 \\fscy216 \\pos(873,954)} "■■■■■■■■■" (1.6s)'],
+    "partial_color": ['{\\fs110 \\pos(1480,884) \\1c&HC2A954&} "살아" {\\1c&HFFFFFF&} "왔어..." (3.6s)', '{\\fad(330,0) \\pos(960,896) \\c&64C2F7& \\t(6800,660,\\1a&HFF&)} "봄의 햇볕" {\\c&000000&} "을..." (7.8s)'],
+    "fly_rotate": ['{\\fad(330,330) \\fs70 \\t(0,4900,\\fr-720) \\move(164,50,1172,794,0,4900)} "마음" (6.8s)'],
+}
+
+
+def default_style_digest() -> StyleDigest:
+    """레퍼런스 파일 없이 쓰는 내장 스타일 프로필 (항상 비어 있지 않다)."""
+    return StyleDigest(
+        source_path="(내장 프로필: 수작업 완성본 실측)",
+        n_lines=81,
+        categories=dict(_DEFAULT_CATEGORIES),
+        examples={k: list(v) for k, v in _DEFAULT_EXAMPLES.items()},
+        typical={k: (list(v) if isinstance(v, list) else v)
+                 for k, v in _DEFAULT_TYPICAL.items()},
+    )

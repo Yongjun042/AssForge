@@ -609,7 +609,7 @@ def _direct_lyric_effects(
     """
     from ai.llm._cli import CliCancelToken, set_cancel_token
     from ai.lyric_typeset import expand_planned, fx_visuals, to_fx_lines
-    from ai.reference_style import build_style_digest
+    from ai.reference_style import build_style_digest, default_style_digest
     from ai.typeset_director import direct_typeset
 
     play_res = (int(play_res[0]), int(play_res[1]))
@@ -618,9 +618,12 @@ def _direct_lyric_effects(
         return [], False, ["연출할 줄이 없습니다."]
     line_vis = fx_visuals(rows, vis, row_indices)
     line_groups = [int(groups[i]) if i < len(groups) else i for i in row_indices]
+    # 레퍼런스 파일은 선택 사항 — 없거나 못 읽으면 내장 스타일 프로필(수작업
+    # 완성본에서 실측한 연출 빈도·전형값)을 쓴다. 사용자가 새 자막을 만드는
+    # 상황이 기본이므로 레퍼런스 없이도 같은 연출 어휘로 동작한다.
     digest = build_style_digest(reference_ass) if reference_ass else None
-    if digest is not None and digest.empty:
-        digest = None
+    if digest is None or digest.empty:
+        digest = default_style_digest()
     _check_cancel(cancel_event)
 
     # 취소 경로 (실측: run_cli 0.18s, 실제 codex 호출 0.22s 만에 반환):

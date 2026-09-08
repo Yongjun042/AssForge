@@ -543,7 +543,7 @@ class _AiSyncOptionsDialog(QDialog):
         form.addRow(self._fx)
 
         self._fx_ref = QLineEdit()
-        self._fx_ref.setPlaceholderText("(선택) 레퍼런스 완성본 .ass — 스타일 요약을 LLM 에 제공")
+        self._fx_ref.setPlaceholderText("(선택) 레퍼런스 완성본 .ass — 비우면 내장 스타일 프로필 사용")
         self._fx_ref.setText(settings.value("aiSyncFxReference", "", type=str) or "")
         self._fx_ref_btn = QPushButton("찾아보기")
         self._fx_ref_btn.clicked.connect(self._browse_fx_reference)
@@ -1411,7 +1411,41 @@ class MainWindow(QMainWindow):
             except ValueError:
                 rel_video = abs_video  # 다른 드라이브 (Windows)
             script_info["Video File"] = rel_video
-        save_ass_file(path, self._shadow, self._styles, events, script_info or None)
+        save_ass_file(path, self._shadow, self._styles_for_export(), events,
+                      script_info or None)
+
+    def _styles_for_export(self) -> list:
+        """저장용 스타일 = 파일 스타일(self._styles) + DB 에만 있는 스타일.
+
+        타이프셋/스타일 명령이 DB 에 만든 스타일('가사 하양' 등)이 저장에서
+        빠지면 이벤트가 없는 스타일을 가리켜 렌더러가 Default 로 대체한다
+        (실측: 저장 파일에 Style 줄이 하나도 없었다). 섀도 문서에 이미 있는
+        이름은 건드리지 않고, 나머지만 새 스타일로 붙인다.
+        """
+        import dataclasses
+        from core.ass.parser import ParsedStyle as _PS
+        from core.ass.shadow_document import LineType as _LT
+        styles = list(self._styles)
+        have = {st.name for st in styles}
+        if self._shadow is not None:
+            for rl in self._shadow.get_lines_by_type(_LT.STYLE):
+                body = rl.text.split(":", 1)[1] if ":" in rl.text else rl.text
+                have.add(body.split(",", 1)[0].strip())
+        if self._db is not None:
+            fields = {f.name for f in dataclasses.fields(_PS)}
+            for row in self._db.get_styles():
+                name = row.get("name")
+                if not name or name in have:
+                    continue
+                kw = {k: v for k, v in row.items() if k in fields and v is not None}
+                kw["shadow_line_idx"] = -1
+                try:
+                    styles.append(_PS(**kw))
+                except TypeError:
+                    log.warning("스타일 내보내기 실패(필드 불일치): %s", name)
+                    continue
+                have.add(name)
+        return styles
 
     # ============================================================
     # Editing
