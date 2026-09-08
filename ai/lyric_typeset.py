@@ -38,6 +38,7 @@ _TAIL_MAX_LETTERS = 1        # 이 이하 원문 = 글자 분할 연출 (駈/け
                              # 2로 두면 끝머리의 정상 2자 구절(永遠 등)을 오판한다.
 _DARK_BRIGHTNESS = 0.62      # 이보다 밝은 장면은 검은 글자
 _MOVE_DRIFT = 0.02           # 그래픽 드리프트가 이보다 크면 \move
+_GAP_PRIOR_WINDOW_MS = 4000  # gap 줄: 비례 추정 시각 ±이 안의 등장 이벤트만 채택
 
 
 def lyric_style_props(dark: bool) -> dict:
@@ -112,7 +113,10 @@ def plan_times(
         vs, ve = int(al.start_ms), int(al.end_ms)
         r = rows[i]
         r.start, r.end, r.via = vs, ve + 300, "vocal"
-        if al.matched_token_count < 2 or al.match_ratio < 0.3:
+        # 실측: 환청 세그먼트에 3/8(0.375) 우연 매칭된 줄이 'vocal' 로 잡히면
+        # 앞 gap 줄들의 상한(nxt)이 6.6s 로 무너져 인트로 전체가 0.3초짜리로
+        # 눌렸다 — 3토큰 미만 또는 비율 0.4 미만은 근거로 쓰지 않는다.
+        if al.matched_token_count < 3 or al.match_ratio < 0.4:
             # 매칭이 없거나 신뢰 불가(1토큰 우연 일치, 비율<0.3 — 실측:
             # 환청 세그먼트에 인트로 라인들이 0.08~0.25 로 끌려갔다) —
             # 비례 추정 시간만 임시로 두고 gap 단계에서 등장 이벤트로
@@ -158,7 +162,9 @@ def plan_times(
                      default=None)
         cand = [e for e in appears
                 if id(e) not in used
-                and vs - 4000 <= e.ms <= vs + 1500
+                # 뒤로는 1차와 같은 2.5s 까지만 — 더 넓히면 앞 줄(아직 gap 단계를
+                # 안 거친 vocal0 줄)의 그래픽을 훔친다 (실측: 30s 줄이 26.15s 이벤트를 가져감)
+                and vs - _APPEAR_LOOKBACK_MS <= e.ms <= vs + 1500
                 and e.ms > prev_g
                 and (next_g is None or e.ms < next_g)]
         if not cand:
@@ -222,10 +228,25 @@ def plan_times(
             if rows[j].start is not None and rows[j].via in ("graphic", "vocal"):
                 nxt = rows[j].start
                 break
-        lo = rows[i - 1].end if i > 0 and rows[i - 1].end is not None else 0
-        cand = [e for e in appears
-                if id(e) not in used
-                and lo <= e.ms <= (nxt if nxt is not None else lo + 8000)]
+        # 탐색 하한은 '이전 줄의 시작' — 이전 gap 줄이 이벤트를 받으면 그 끝이
+        # nxt(다음 정상 줄)까지 늘어나므로, 끝을 하한으로 쓰면 뒤 gap 줄들의
+        # 창이 텅 비어 비례 추정 시간에 갇힌다 (실측: 인트로 10줄이 0/2.5/5/7.5s
+        # 로 균등 배치되고 그래픽 이벤트를 못 받음).
+        lo = 0
+        if i > 0 and rows[i - 1].start is not None:
+            lo = rows[i - 1].start + 300
+        hi = nxt if nxt is not None else lo + 8000
+        window = [e for e in appears if id(e) not in used and lo <= e.ms <= hi]
+        # 비례 추정(prior)이 있으면 그 근처(±4s)에서 가장 가까운 이벤트를,
+        # 없으면 창의 첫 이벤트를 고른다. '창 안의 가장 이른 이벤트' 는 앞 줄이
+        # 뒤 줄의 그래픽까지 차례로 먹어 남은 줄들이 한 시각으로 몰린다
+        # (실측: 인트로 6줄이 전부 26.15s).
+        prior = r.start
+        if prior is not None:
+            near = [e for e in window if abs(e.ms - prior) <= _GAP_PRIOR_WINDOW_MS]
+            cand = sorted(near, key=lambda e: abs(e.ms - prior))[:1]
+        else:
+            cand = window[:1]
         if cand:
             used.add(id(cand[0]))
             r.start = cand[0].ms
@@ -333,10 +354,23 @@ def _sequence_gap_runs(pairs: list[LyricPair], rows: list[_Row]) -> int:
             yfrac = _GAP_STAIR_Y[s % len(_GAP_STAIR_Y)]
             for k in members:
                 rk = rows[k]
-                if _role_of(pairs, k, rk) != "title":
-                    # 제목은 세로 기둥(프레임 높이의 대부분)이라 y 계단에 넣지 않는다
-                    px = rk.pos[0] if rk.pos is not None else 0.5
-                    rk.pos = (px, yfrac)
+                if _role_of(pairs, k, rk) == "title":
+                    # 제목 카드는 세로 기둥이라 y 계단에 넣지 않는다. 끝은 프롤로그
+                    # 칸이 아니라 '그래픽 이벤트로 시작이 확정된' 다음 칸(첫 가사)
+                    # 에서 자른다 — 레퍼런스에서 제목은 프롤로그와 나란히 떠 있다가
+                    # 첫 가사 줄이 뜰 때 사라진다 (프롤로그 칸에서 자르면 1.4초 만에
+                    # 사라지고, 안 자르면 30초 뒤 정상 줄까지 남는다).
+                    for later in slots[s + 1:]:
+                        lr = rows[later[0]]
+                        if (lr.pos is not None and lr.start - s_start >= _GAP_RUN_MIN_MS
+                                and _role_of(pairs, later[0], lr) != "prologue"):
+                            if lr.start < rk.end:
+                                rk.end = max(lr.start, rk.start + 300)
+                                changed += 1
+                            break
+                    continue
+                px = rk.pos[0] if rk.pos is not None else 0.5
+                rk.pos = (px, yfrac)
                 if new_end is not None and new_end < rk.end:
                     rk.end = max(new_end, rk.start + 300)
                     changed += 1
