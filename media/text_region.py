@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import math
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -58,6 +59,9 @@ _SAT_THR = 80.0              # 채도(max-min) 임계
 _CUT_FRAC = 0.35             # 변화 픽셀 비율이 이 이상이면 컷 → 그 기준 프레임 무시
 _BIG_FRAC = 0.08             # 프레임의 8% 넘는 덩어리는 텍스트 아님
 _MIN_H, _MAX_H = 4, 90       # 성분 높이 허용 범위 (px)
+_COL_MAX_W = 64              # 이 폭 이하의 좁고 긴 성분(세로 기둥)은 높이 상한 면제 (세로 제목 실측 폭 44~63px)
+_COL_MAX_H_FRAC = 0.9        # …단 프레임 높이의 90% 까지
+_TALL_AREA_FRAC = 0.6        # 세로 덩어리가 텍스트 면적의 60% 이상이면 layout=vertical
 _MAX_W_FRAC = 0.60           # 성분 너비 ≤ 프레임 60%
 _GAP_FACTOR = 0.8            # 덩어리 분리 x 간격 = 글자 높이 × 0.8 (실측: 구 사이 1.25em)
 _SUPPORT_MIN = 0.4           # 다른 프레임에서도 같은 자리에 남은 픽셀 비율
@@ -67,6 +71,8 @@ _FALLBACK_PENALTY = 0.4      # 그때의 신뢰도 배율
 _ACCENT_FRAC = 0.10          # 채도 높은 글자 조각 면적 비율 ≥ 10% → accent_color (2/8 글자 실측 11%)
 _ACCENT_SAT = 60.0           # accent 후보 픽셀 채도 (안티앨리어스 가장자리 포함)
 _MAIN_MIN_RATIO = 0.4        # 가운데 샘플 픽셀이 최대의 40% 이상이면 대표 프레임
+_EARLY_MIN_RATIO = 0.15      # 가운데가 흐릴 때 앞쪽(가운데까지) 샘플이 최대의 15% 이상이면 그쪽을 대표로
+_MIN_MAIN_PX = 120           # 대표 프레임으로 삼을 최소 마스크 픽셀 (글자 몇 개 분량)
 _MIN_MASK_PX = 24            # 이보다 적은 마스크 픽셀은 검출 실패
 _SPECK_FRAC = 0.06           # 가장 큰 덩어리의 6% 미만인 덩어리는 잡티
 _EDGE_BAND = 0.06            # 프레임 가장자리 6% 띠 안에만 있는 덩어리는 배경 질감 (가사 안전영역 밖)
@@ -89,6 +95,10 @@ class TextRegion:
     scale: float = 1.0           # 끝/시작 bbox 크기비 (면적비의 제곱근)
     confidence: float = 0.0
     sampled: bool = False
+    # 검출 창 (ms) — 호출자가 창을 넓혀 재검출한 경우 drift/scale 이 잰 실제 구간의
+    # 근거. 음수면 모름(창 = 줄 구간으로 간주).
+    win_start_ms: int = -1
+    win_end_ms: int = -1
 
 
 # ---------------------------------------------------------------- 마스크
@@ -185,9 +195,11 @@ def _probe_fps(video_path: str) -> float:
 class _Slots:
     """창 하나의 수집 상태 — 기준 프레임(before 2, after 2) + 샘플 5장.
 
-    각 목표 시각 이후 첫 프레임을 쓴다(결정적). 기준 시각이 창 시작 뒤로
-    밀리는(영상 맨 앞) 슬롯은 비워 둔다. after 까지 모이면(또는 스트림이
-    끝나면) finalize() 가 샘플을 마스크로 바꾸고 프레임을 모두 놓는다.
+    각 목표 시각 이후 첫 프레임을 쓴다(결정적). 기준 시각이 영상 시작(0)보다
+    앞인 슬롯은 아예 두지 않는다 — 두면 첫 프레임(창 안, 텍스트가 이미 있음)이
+    기준이 돼 텍스트가 '변화 없음' 으로 지워진다; 대신 after 나 극성만(weak)으로
+    간다. after 까지 모이면(또는 스트림이 끝나면) finalize() 가 샘플을 마스크로
+    바꾸고 프레임을 모두 놓는다.
     """
 
     __slots__ = ("b_targets", "s_targets", "a_targets", "befores", "afters",
@@ -197,7 +209,7 @@ class _Slots:
         e_ms = max(e_ms, s_ms + 1)
         dur = e_ms - s_ms
         edge = min(_EDGE_MS, dur * 0.25)
-        self.b_targets = [s_ms - b for b in _BEFORE_MS]
+        self.b_targets = [s_ms - b for b in _BEFORE_MS if s_ms - b >= 0]
         self.a_targets = [e_ms + a for a in _AFTER_MS]
         lo, hi = s_ms + edge, e_ms - edge
         self.s_targets = [lo + (hi - lo) * k / (_N_SAMPLES - 1)
@@ -253,7 +265,8 @@ def _decode(
         log.warning("텍스트 영역 검출: ffmpeg 없음")
         return None
     slots = [_Slots(s, e) for s, e in windows]
-    span_s = max(0.0, min(sl.b_targets[0] for sl in slots) / 1000.0)
+    span_s = max(0.0, min((sl.b_targets[0] if sl.b_targets else sl.s_targets[0])
+                          for sl in slots) / 1000.0)
     span_e = max(sl.a_targets[-1] for sl in slots) / 1000.0 + 0.3
     if span_e <= span_s:
         return None
@@ -270,34 +283,51 @@ def _decode(
              span_s, span_e, fps, len(slots))
     pending = list(slots)
     frame_i = 0
+    killed = False
+    # stderr 는 임시 파일로 — PIPE 는 stdout 을 읽는 동안 가득 차면 교착한다.
+    # -v error 라 보통 비어 있고, 실패(경로/포맷/seek) 시 마지막 몇 줄을 경고로 남긴다.
     try:
-        proc = subprocess.Popen(
-            args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        assert proc.stdout is not None
-        while pending:
-            if cancel_check is not None and cancel_check():
-                kill_tree(proc)
-                return None
-            buf = proc.stdout.read(_FRAME_BYTES)
-            if len(buf) < _FRAME_BYTES:
-                break
-            frame = np.frombuffer(buf, dtype=np.uint8).reshape(_H, _W, 3)
-            ts = span_s * 1000.0 + frame_i * frame_ms
-            still: list[_Slots] = []
-            for sl in pending:
-                sl.feed(ts, frame_i, frame)
-                if sl.collected:
-                    sl.finalize()
-                else:
-                    still.append(sl)
-            pending = still
-            frame_i += 1
-        if pending:
-            proc.wait(timeout=10)
-        else:
-            kill_tree(proc)   # 남은 창 없음 — 조기 종료
+        with tempfile.TemporaryFile() as err:
+            proc = subprocess.Popen(
+                args, stdout=subprocess.PIPE, stderr=err,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            assert proc.stdout is not None
+            while pending:
+                if cancel_check is not None and cancel_check():
+                    kill_tree(proc)
+                    return None
+                buf = proc.stdout.read(_FRAME_BYTES)
+                if len(buf) < _FRAME_BYTES:
+                    break
+                frame = np.frombuffer(buf, dtype=np.uint8).reshape(_H, _W, 3)
+                ts = span_s * 1000.0 + frame_i * frame_ms
+                still: list[_Slots] = []
+                for sl in pending:
+                    sl.feed(ts, frame_i, frame)
+                    if sl.collected:
+                        sl.finalize()
+                    else:
+                        still.append(sl)
+                pending = still
+                frame_i += 1
+            if pending:
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    # 스트림은 끝났는데 ffmpeg 가 안 죽는다 — 모인 슬롯은 유효하다
+                    log.warning("텍스트 영역 검출: ffmpeg 종료 대기 초과 — 강제 종료")
+                    kill_tree(proc)
+                    killed = True
+            else:
+                kill_tree(proc)   # 남은 창 없음 — 조기 종료
+                killed = True
+            rc = proc.poll()
+            if frame_i == 0 or (not killed and rc not in (0, None)):
+                err.seek(0)
+                tail = err.read()[-2000:].decode("utf-8", "replace").strip().splitlines()[-3:]
+                log.warning("텍스트 영역 검출: ffmpeg 프레임 %d장, 종료 코드 %s%s",
+                            frame_i, rc, (" — " + " | ".join(tail)) if tail else "")
     except Exception:
         log.exception("텍스트 영역 검출 디코드 실패")
         return None
@@ -425,13 +455,17 @@ def _components(mask: np.ndarray) -> tuple[list[_Comp], np.ndarray]:
     comps: list[_Comp] = []
     keep2 = np.zeros(n2 + 1, dtype=bool)
     max_w = mask.shape[1] * _MAX_W_FRAC
+    col_max_h = mask.shape[0] * _COL_MAX_H_FRAC
     for i, bx in enumerate(_boxes(lab2, n2)):
         if bx is None:
             continue
         x0, y0, x1, y1, area = bx
         h = y1 - y0 + 1
         w = x1 - x0 + 1
-        if h < _MIN_H or h > _MAX_H or w > max_w or area > big:
+        # 세로쓰기 기둥은 팽창으로 글자들이 하나로 이어져 높이 상한을 넘는다 —
+        # 한 글자 폭 이하의 좁고 긴 성분만 면제 (넓은 큰 덩어리는 배경).
+        column = w <= _COL_MAX_W and h <= col_max_h
+        if h < _MIN_H or (h > _MAX_H and not column) or w > max_w or area > big:
             continue
         keep2[i] = True
         comps.append(_Comp(x0, y0, x1, y1, area))
@@ -741,7 +775,11 @@ def _layout(ft: _FrameText, play_res: tuple[int, int]) -> tuple[str, float]:
     ang, ratio = _pca_angle(pts, sx, sy)
     if all(wide):
         return "horizontal", (ang if abs(ang) <= 15.0 else 0.0)
-    if all(tall) or bh > 2.5 * bw:
+    # 세로 기둥이 텍스트 면적의 대부분이면 세로 — 같은 창에 뜬 가로 한 줄(제목 기둥
+    # 옆의 永遠にも...)이 기둥과 함께 PCA 에 들어가 대각선으로 오판되지 않게.
+    areas = [sum(c.area for c in cl) for cl in ft.clusters]
+    tall_area = sum(a for a, t in zip(areas, tall) if t)
+    if all(tall) or bh > 2.5 * bw or tall_area >= _TALL_AREA_FRAC * max(1, sum(areas)):
         return "vertical", (ang if abs(ang) >= 70.0 else 90.0)
     if abs(ang) <= 15.0:
         return "horizontal", ang
@@ -794,13 +832,23 @@ def _region_for(slots: _Slots, play_res: tuple[int, int]) -> TextRegion | None:
     if not valid:
         return None
     # 대표 프레임 = 가운데 샘플 (창 안에서 나중에 뜨는 다른 줄이 섞이지 않음).
-    # 가운데가 흐리면(최대의 40% 미만) 가장 뚜렷한 샘플.
+    # 가운데가 흐리면(최대의 40% 미만) 가운데까지의 샘플 중 가장 뚜렷한 것 —
+    # 긴 창의 마지막 샘플은 뒤에 뜨는 다른 줄들이 섞여 가장 오염됐다 (48s 제목
+    # 창 실측: s4 에 永遠にも/思えたから 가 함께). 앞쪽이 전부 흐리면(텍스트가
+    # 늦게 뜸) 가장 뚜렷한 샘플.
     best_idx = max(valid_idx, key=lambda i: results[i].px)
+    best_px = results[best_idx].px
     mid = len(samples) // 2
     main_idx = best_idx
     r_mid = results[mid]
-    if r_mid is not None and r_mid.px >= _MAIN_MIN_RATIO * results[best_idx].px:
+    if r_mid is not None and r_mid.px >= _MAIN_MIN_RATIO * best_px:
         main_idx = mid
+    else:
+        early = [i for i in valid_idx if i <= mid]
+        if early:
+            e_idx = max(early, key=lambda i: results[i].px)
+            if results[e_idx].px >= max(_MIN_MAIN_PX, _EARLY_MIN_RATIO * best_px):
+                main_idx = e_idx
     main = results[main_idx]
     assert main is not None
     cx, cy, w, h = _norm_box(main.box)
@@ -888,7 +936,10 @@ def detect_text_regions(
         if cancel_check is not None and cancel_check():
             return [None] * len(windows)
         try:
-            out.append(_region_for(sl, play_res))
+            reg = _region_for(sl, play_res)
+            if reg is not None:
+                reg.win_start_ms, reg.win_end_ms = int(windows[i][0]), int(windows[i][1])
+            out.append(reg)
         except Exception:
             log.exception("텍스트 영역 분석 실패 (창 %d)", i)
             out.append(None)

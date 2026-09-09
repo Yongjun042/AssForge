@@ -9,6 +9,12 @@ effects.typeset_fx_schema 의 계약(TYPESET_FX 화이트리스트 + ParamSpec �
   - direct_typeset  : LLM 이 가능하면 LLM 에게 묻고, 각 항목을 화이트리스트/범위로
                       검증해 통과한 것만 반영. 실패·누락 줄은 규칙 결과로 대체.
 
+화면 측정 힌트(hints, ai.lyric_typeset.place_fx_lines 가 media.text_region 에서
+만든 dict): 원문 텍스트의 배치(layout)·드리프트·강조색은 화면에서 잰 사실이라
+fx 를 확정한다 (hint_fx). 규칙 디렉터는 그 fx 를 사이클보다 우선하고, LLM 은
+파라미터·extras 만 정한다 — 응답의 fx 가 힌트와 다르면 규칙 결과로 교체한다.
+힌트가 fx 를 정하지 못하는 줄(드리프트를 믿을 수 없는 창 등)은 종전대로.
+
 프롬프트 인젝션 방어: 가사 텍스트는 '데이터' 라고 system 에 명시하고, 응답의
 fx/param 은 화이트리스트로만 통과시킨다. 문자열 파라미터(span)는 해당 줄 텍스트의
 부분 문자열일 때만 허용한다.
@@ -49,6 +55,7 @@ _DRIFT_FLY = 0.15           # 짧은 단어가 이만큼 흘러가면 날아가�
 _FLY_LETTERS = 3            # 이 글자 수 이하를 '짧은 단어' 로 본다
 _MOTION_SCATTER = 0.3
 _MAX_EXTRAS = 2
+_HINT_DRIFT_PX = 40.0       # 화면 텍스트 드리프트가 이 이상(px)이면 drift_scale
 _VERSE_CYCLE: tuple[str, ...] = ("plain", "drift_scale", "char_scatter",
                                   "ghost_trail", "plain")
 # 다이제스트 보강 후보 — 레퍼런스가 쓰는데 배정에 하나도 없는 fx 를 가장 잘 맞는
@@ -411,17 +418,145 @@ def _build_verse(line: FxLine, v: Any, family: str, slot: int,
     return _rule_plain(line, v)
 
 
+def _hint_drift(hint: dict) -> tuple[float, float] | None:
+    d = hint.get("drift")
+    if not (isinstance(d, (tuple, list)) and len(d) == 2):
+        return None
+    try:
+        dx, dy = float(d[0]), float(d[1])
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(dx) and math.isfinite(dy)):
+        return None
+    return dx, dy
+
+
+def hint_fx(line: FxLine, hint: dict | None) -> str | None:
+    """화면 측정 힌트가 확정하는 본문 fx 이름. None = 힌트로 정해지지 않음(규칙/LLM).
+
+    매핑(확정적): layout diagonal → char_diagonal, vertical → vertical_title
+    (세로쓰기 — 원문이 세로면 번역도 세로 기둥; char_stack 은 '아래→위로 솟는
+    글자' 꼬리 연출이라 긴 세로 줄이면 위 가장자리에 글자가 겹쳐 쌓인다),
+    scatter → char_scatter; 신뢰된 drift ≥40px → drift_scale (원문의 시작→끝
+    이동을 그대로 따라가는 \\move — fly_rotate 는 도착점 기준 (x-dx,y-dy)→(x,y)
+    라 시작 위치에 둔 번역이 -drift 만큼 어긋나므로 힌트 매핑에서 쓰지 않는다);
+    accent_color → partial_color; 그 외 horizontal → plain (레퍼런스의 가로 원문
+    줄은 흐르지 않으면 plain 이다 — drift 를 못 잰 줄도 같다). layout 을 모르는
+    힌트만 None. 역할 고정(title/tail/prologue)은 호출측이 먼저 처리한다.
+    """
+    if not isinstance(hint, dict):
+        return None
+    layout = hint.get("layout")
+    if layout == "diagonal":
+        return "char_diagonal"
+    if layout == "vertical":
+        return "vertical_title"
+    if layout == "scatter":
+        return "char_scatter"
+    drift = _hint_drift(hint)
+    if drift is not None and math.hypot(*drift) >= _HINT_DRIFT_PX:
+        return "drift_scale"
+    accent = hint.get("accent_color")
+    if isinstance(accent, str) and _HEX_RE.match(accent):
+        return "partial_color"
+    if layout == "horizontal":
+        return "plain"
+    return None
+
+
+def _measured_params(fx: str, hint: dict) -> dict[str, Any]:
+    """화면 측정값으로 고정되는 fx 파라미터 — 규칙 디렉티브에 채우고, LLM 이 힌트와
+    같은 fx 를 골랐을 때도 그 응답 위에 덮어쓴다 (대각선 끝점 diag_end 는 프롬프트
+    열에 있어도 LLM 이 정확히 옮겨 적는다는 보장이 없고, 잰 값이 항상 옳다).
+
+    char_diagonal: x1/y1 = diag_end · drift_scale: dx/dy = drift, scale_to = scale ·
+    partial_color: color = accent_color. 그 외 fx 는 빈 dict.
+    """
+    out: dict[str, Any] = {}
+    if not isinstance(hint, dict):
+        return out
+    if fx == "char_diagonal":
+        end = hint.get("diag_end")
+        if isinstance(end, (tuple, list)) and len(end) == 2:
+            try:
+                x1, y1 = int(round(float(end[0]))), int(round(float(end[1])))
+            except (TypeError, ValueError, OverflowError):
+                x1 = y1 = 0
+            if x1 > 0 and y1 > 0:
+                out["x1"], out["y1"] = int(_clamp(x1, 0, 10000)), int(_clamp(y1, 0, 10000))
+    elif fx == "drift_scale":
+        drift = _hint_drift(hint)
+        if drift is not None:
+            out["dx"] = int(_clamp(round(drift[0]), -800, 800))
+            out["dy"] = int(_clamp(round(drift[1]), -600, 600))
+        try:
+            scale = float(hint.get("scale", 1.0))
+        except (TypeError, ValueError):
+            scale = 1.0
+        if not math.isfinite(scale):
+            scale = 1.0
+        out["scale_to"] = float(_clamp(round(scale * 100.0, 1), 40, 250))
+    elif fx == "partial_color":
+        accent = hint.get("accent_color")
+        if isinstance(accent, str) and _HEX_RE.match(accent):
+            out["color"] = accent.upper()
+    return out
+
+
+def _hint_directive(line: FxLine, v: Any, hint: dict, fx: str, slot: int,
+                    play_res: tuple[int, int]) -> FxDirective:
+    """hint_fx 가 정한 fx 의 파라미터를 힌트 값으로 채운 디렉티브."""
+    measured = _measured_params(fx, hint)
+    if fx == "char_diagonal":
+        p = _defaults("char_diagonal")
+        p.update(measured)
+        p["fade_in"], p["fade_out"] = _fades(line)
+        return FxDirective("char_diagonal", p)
+    if fx == "vertical_title":
+        # 세로 원문 옆의 세로 번역 — 제목 카드의 별 장식은 없이, 드러내기만
+        d = _rule_title(line, v)
+        d.params["star"] = False
+        return d
+    if fx == "char_scatter":
+        return _rule_scatter(line, v)
+    if fx == "drift_scale":
+        p = _defaults("drift_scale")
+        p["fs"] = 96
+        p.update(measured)
+        p["fade_in"], p["fade_out"] = _fades(line)
+        return FxDirective("drift_scale", p)
+    if fx == "partial_color":
+        text = _plain(line)
+        span = text if hint.get("accent_full") else _last_span(text)
+        if not span:
+            return _rule_plain(line, v)
+        p = _defaults("partial_color")
+        p["span"] = span
+        p.update(measured)
+        dur = max(0, line.end_ms - line.start_ms)
+        p["reveal_ms"] = int(_clamp(dur * 0.5, 0, 5000)) if dur > 2000 else 0
+        p["fade_in"], p["fade_out"] = _fades(line)
+        d = FxDirective("partial_color", p)
+        if line.dark:
+            d.extras.append(_shadow_bar_extra(line, _nletters(text)))
+        return d
+    return _rule_plain(line, v)
+
+
 def direct_by_rules(
     lines: list[FxLine],
     visuals: list,
     roles: list[str],
     groups: list[int],
     play_res: tuple[int, int] = (1920, 1080),
+    hints: list | None = None,
 ) -> list[FxDirective]:
     """결정적 휴리스틱 디렉터. 항상 len(lines) 개의 검증 통과 directive 를 돌려준다.
 
     roles: 'title' | 'prologue' | 'verse' | 'tail' (모르면 verse 취급).
     같은 group 의 verse 줄들은 같은 fx 계열을 쓴다 (첫 줄이 계열을 정함).
+    hints: 줄별 화면 측정 힌트(dict|None) — hint_fx 가 fx 를 정하면 사이클·장면
+    분석보다 우선하고, 힌트 없는 같은 절의 구는 그 계열을 따른다.
     """
     out: list[FxDirective] = []
     if not lines:
@@ -430,6 +565,7 @@ def direct_by_rules(
     roles = [str(roles[i]) if i < len(roles) and roles[i] else "verse" for i in range(n)]
     groups = [int(groups[i]) if i < len(groups) else i for i in range(n)]
     visuals = [visuals[i] if i < len(visuals) else None for i in range(n)]
+    hints = [hints[i] if hints is not None and i < len(hints) else None for i in range(n)]
 
     # 그룹별 최장 글자 수 — 계열 강등을 그룹 단위로 일관되게 하기 위해
     max_letters: dict[int, int] = {}
@@ -452,11 +588,16 @@ def direct_by_rules(
                 if g not in slot_by_group:
                     slot_by_group[g] = len(slot_by_group)
                 slot = slot_by_group[g]
-                fam = family_by_group.get(g)
-                if fam is None:
-                    fam = _verse_family(line, v, slot, max_letters.get(g, 0))
-                    family_by_group[g] = fam
-                d = _build_verse(line, v, fam, slot, play_res)
+                forced = hint_fx(line, hints[i])
+                if forced is not None:
+                    d = _hint_directive(line, v, hints[i], forced, slot, play_res)
+                    family_by_group.setdefault(g, forced)
+                else:
+                    fam = family_by_group.get(g)
+                    if fam is None:
+                        fam = _verse_family(line, v, slot, max_letters.get(g, 0))
+                        family_by_group[g] = fam
+                    d = _build_verse(line, v, fam, slot, play_res)
             if validate_directive(d):
                 d = FxDirective("plain", _defaults("plain"))
         except Exception:  # noqa: BLE001 — 규칙 디렉터는 절대 예외를 내지 않는다
@@ -530,6 +671,10 @@ def build_system_prompt() -> str:
         "     각각 2~3줄 정도만. 같은 본문 fx(plain 제외)를 3줄 연속으로 쓰지 마세요.",
         "     같은 결정을 반복 실행에서도 그대로 내리도록 확실한 근거(짧은 줄, 모션,",
         "     드리프트, 밝은 장면)가 있을 때만 plain 이 아닌 fx 를 고릅니다.",
+        "  8. hint 열은 화면에서 측정된 사실입니다(원문 텍스트의 배치 layout, 드리프트",
+        "     px, 강조색). hint 에 fx 이름이 적힌 줄은 그 fx 를 반드시 그대로 쓰고",
+        "     파라미터·extras 만 정하세요 (다른 fx 를 쓰면 그 줄은 규칙 결과로 대체됩니다).",
+        "     hint 가 '-' 인 줄만 자유롭게 고릅니다.",
         "",
         "출력은 반드시 다음 JSON 만, 설명 없이:",
         '  {"lines": [{"index": <번호>, "fx": "<이름>", "params": {...},',
@@ -545,9 +690,28 @@ def _safe_text(s: str, limit: int = 80) -> str:
     return s[:limit]
 
 
+def _hint_text(line: FxLine, role: str, hint: dict | None) -> str:
+    """프롬프트 hint 열 — 확정 fx 와 측정값. 역할 고정 줄/힌트 없음은 '-'."""
+    if not isinstance(hint, dict) or role in _ROLE_FIXED_FX or role == "prologue":
+        return "-"
+    forced = hint_fx(line, hint)
+    drift = _hint_drift(hint)
+    facts = [str(hint.get("layout") or "horizontal")]
+    if drift is not None:
+        facts.append(f"drift={drift[0]:+.0f},{drift[1]:+.0f}px")
+    m = _measured_params("char_diagonal", hint) if forced == "char_diagonal" else {}
+    if "x1" in m:
+        facts.append(f"diag_end={m['x1']},{m['y1']}")
+    accent = hint.get("accent_color")
+    if isinstance(accent, str) and _HEX_RE.match(accent):
+        facts.append(f"accent={accent.upper()}")
+    return f"{forced or '-'} ({' '.join(facts)})"
+
+
 def build_user_prompt(
     lines: list[FxLine], visuals: list, roles: list[str], groups: list[int],
     digest: StyleDigest | None = None,
+    hints: list | None = None,
 ) -> str:
     parts: list[str] = []
     if digest is not None and not digest.empty:
@@ -555,11 +719,12 @@ def build_user_prompt(
         parts.append("")
     parts.append(f"연출할 줄 ({len(lines)}줄):")
     parts.append("index | role | group | text | dur_ms | x,y | dark | motion | "
-                 "brightness | drift | colors")
+                 "brightness | drift | colors | hint")
     for i, ln in enumerate(lines):
         v = visuals[i] if i < len(visuals) else None
         role = roles[i] if i < len(roles) else "verse"
         g = groups[i] if i < len(groups) else i
+        h = hints[i] if hints is not None and i < len(hints) else None
         cols = ",".join(c for c in (_vis(v, "dominant_colors", None) or [])[:2]
                         if isinstance(c, str) and _HEX_RE.match(c))
         parts.append(
@@ -569,7 +734,7 @@ def build_user_prompt(
             f"{float(_vis(v, 'motion', 0.0)):.2f} | "
             f"{float(_vis(v, 'brightness', 0.5)):.2f} | "
             f"{float(_vis(v, 'drift_x', 0.0)):+.2f},{float(_vis(v, 'drift_y', 0.0)):+.2f} | "
-            f"{cols or '-'}")
+            f"{cols or '-'} | {_hint_text(ln, role, h)}")
     parts.append("")
     parts.append("위 줄들에 대한 연출 배정 JSON 을 만드세요.")
     return "\n".join(parts)
@@ -675,6 +840,7 @@ def _apply_digest_floor(
     groups: list[int],
     digest: StyleDigest | None,
     play_res: tuple[int, int],
+    hints: list | None = None,
 ) -> None:
     """레퍼런스가 쓰는 연출 계열이 배정에 하나도 없으면 가장 잘 맞는 plain 절 줄 1개에 배정.
 
@@ -682,13 +848,17 @@ def _apply_digest_floor(
     못 만나 fly_rotate/char_* /ghost_trail 이 통째로 빠지는 것을 막는다. 후보는
     role=verse, 현재 plain(없으면 한 줄짜리 연출 줄), 그룹에 다른 줄이 없고(같은
     절은 같은 계열 규칙 유지), 글자 수가 계열 상한 이하인 줄 중 가장 짧은 줄(동률이면
-    앞). 결정적. 예외 없음.
+    앞). 화면 힌트가 plain 이 아닌 fx 를 확정한 줄은 후보에서 뺀다 (힌트→plain
+    은 '근거 없음' 이므로 보강 가능). 결정적. 예외 없음.
     """
     if digest is None or not getattr(digest, "categories", None):
         return
     try:
         n = len(lines)
         groups = [int(groups[i]) if i < len(groups) else i for i in range(n)]
+        hinted = {i for i in range(n)
+                  if hints is not None and i < len(hints)
+                  and hint_fx(lines[i], hints[i]) not in (None, "plain")}
         group_size: dict[int, int] = {}
         for g in groups:
             group_size[g] = group_size.get(g, 0) + 1
@@ -705,7 +875,7 @@ def _apply_digest_floor(
             for allowed in passes:
                 for i, line in enumerate(lines):
                     if (roles[i] != "verse" or proposal.directives[i].fx not in allowed
-                            or group_size.get(groups[i], 1) > 1):
+                            or group_size.get(groups[i], 1) > 1 or i in hinted):
                         continue
                     nl = _nletters(_plain(line))
                     if nl == 0 or nl > max_letters:
@@ -737,21 +907,25 @@ def direct_typeset(
     provider: LLMProvider | None = None,
     use_llm: bool = True,
     play_res: tuple[int, int] = (1920, 1080),
+    hints: list | None = None,
 ) -> TypesetProposal:
     """LLM(가능하면) 또는 규칙으로 줄별 연출을 정한다. 항상 len(lines) 개 directive.
 
     LLM 응답은 항목별로 화이트리스트/범위/역할 고정/부분 문자열 검증을 거치며,
     실패·누락 줄은 direct_by_rules 결과로 대체하고 notes 에 남긴다.
     LLM 호출 자체가 실패하면 errors 에 적고 전체를 규칙으로 폴백(used_llm=False).
-    마지막에 _apply_digest_floor 로 레퍼런스 연출 계열 누락을 보강한다.
+    hints(줄별 화면 측정 힌트)가 fx 를 확정한 줄은 LLM 이 다른 fx 를 내면 규칙
+    결과로 교체하고 notes 에 남긴다. 마지막에 _apply_digest_floor 로 레퍼런스
+    연출 계열 누락을 보강한다.
     """
     n = len(lines)
     roles = [str(roles[i]) if i < len(roles) and roles[i] else "verse" for i in range(n)]
     visuals = [visuals[i] if i < len(visuals) else None for i in range(n)]
+    hints = [hints[i] if hints is not None and i < len(hints) else None for i in range(n)]
     proposal = _direct_typeset_core(lines, visuals, roles, groups, digest, provider,
-                                    use_llm, play_res)
+                                    use_llm, play_res, hints)
     if lines:
-        _apply_digest_floor(proposal, lines, visuals, roles, groups, digest, play_res)
+        _apply_digest_floor(proposal, lines, visuals, roles, groups, digest, play_res, hints)
     return proposal
 
 
@@ -764,11 +938,13 @@ def _direct_typeset_core(
     provider: LLMProvider | None,
     use_llm: bool,
     play_res: tuple[int, int],
+    hints: list | None = None,
 ) -> TypesetProposal:
     proposal = TypesetProposal()
     n = len(lines)
     groups = [int(groups[i]) if i < len(groups) else i for i in range(n)]
-    fallback = direct_by_rules(lines, visuals, roles, groups, play_res)
+    hints = [hints[i] if hints is not None and i < len(hints) else None for i in range(n)]
+    fallback = direct_by_rules(lines, visuals, roles, groups, play_res, hints)
     proposal.directives = list(fallback)
     if not lines:
         return proposal
@@ -791,7 +967,7 @@ def _direct_typeset_core(
     try:
         data = provider.complete_json(
             build_system_prompt(),
-            build_user_prompt(lines, visuals, roles, groups, digest),
+            build_user_prompt(lines, visuals, roles, groups, digest, hints),
             max_tokens=8192,
         )
     except LLMError as e:
@@ -831,6 +1007,14 @@ def _direct_typeset_core(
         d = got[i]
         if d is None:
             continue
+        forced = hint_fx(lines[i], hints[i]) if roles[i] not in _ROLE_FIXED_FX else None
+        if forced is not None and d.fx != forced:
+            proposal.notes.append(
+                f"{i}번 줄: 화면 측정 힌트는 {forced} (LLM: {d.fx}) → 규칙 대체")
+            continue
+        if forced is not None:
+            # 같은 fx 라도 잰 값(대각선 끝점·드리프트·강조색)은 LLM 파라미터보다 우선
+            d.params.update(_measured_params(forced, hints[i]))
         try:
             errs = validate_directive(d)
         except Exception as e:  # noqa: BLE001

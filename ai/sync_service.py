@@ -454,6 +454,7 @@ class LyricTypesetResult:
     # AI 연출 상태: "" (연출 안 함) | "llm" (LLM 배정 반영) | "rules" (규칙 디렉터)
     # | "none" (디렉터/확장 실패 → compose_lines 기본 배치, 연출 없음)
     fx_status: str = ""
+    n_regions: int = 0   # 화면 텍스트 영역이 검출된 줄 수 (위치·연출 근거)
 
 
 def run_lyric_typeset(
@@ -488,7 +489,8 @@ def run_lyric_typeset(
         play_res: 스크립트의 PlayResX/Y — \\pos/\\move/\\clip 좌표계 (기본 1920x1080).
     """
     from ai.lyric_text import creation_sync_targets
-    from ai.lyric_typeset import compose_lines, plan_times
+    from ai.lyric_typeset import _REGION_RETRY_BACK_MS, compose_lines, plan_times, region_usable
+    from media.text_region import detect_text_regions
     from media.video_analysis import analyze_line_windows, detect_graphic_events
 
     def _p(frac: float, msg: str) -> None:
@@ -550,12 +552,52 @@ def run_lyric_typeset(
         cancel_check=(cancel_event.is_set if cancel_event else None),
     ) or []
     _check_cancel(cancel_event)
+    res_xy = (int(play_res[0]) or 1920, int(play_res[1]) or 1080)
+
+    # 5b) 화면 텍스트 영역 — 위치·연출의 정답은 화면에 그려진 원문 텍스트 자리다.
+    # 창별 글자 덩어리/배치/드리프트/강조색을 얻어 rows 와 병렬로 둔다 (검출 실패
+    # 창은 None → 등장 이벤트 중심으로 폴백). 예외를 던지지 않는 모듈이지만
+    # 방어적으로 감싼다 — 영역 없이도 파이프라인은 종전대로 동작한다.
+    _p(0.91, "화면 텍스트 영역 검출 중...")
+    try:
+        regions = detect_text_regions(
+            video_path, windows, play_res=res_xy,
+            cancel_check=(cancel_event.is_set if cancel_event else None),
+        ) or []
+    except Exception:  # noqa: BLE001 — 영역 검출 실패는 치명적이지 않다
+        log.exception("텍스트 영역 검출 실패 — 등장 이벤트 중심으로 배치")
+        regions = []
+    regions = [regions[k] if k < len(regions) else None for k in range(len(windows))]
+    _check_cancel(cancel_event)
+    # 5c) 영역이 없거나 신뢰가 낮은 줄 — 창을 2s 앞으로 넓혀 한 번 더. 계획 시각이
+    # 원문 등장보다 늦으면(실측 1~2s: 何も望まないように 91.9s vs 계획 93.7s) 기준
+    # 프레임(창 시작 0.9s 전)에 이미 원문이 있어 '변화' 로 잡히지 않는다. 앞 줄
+    # 텍스트가 섞여 들어오는 것은 배치 단계의 '이전 텍스트 제거' 가 처리한다.
+    retry = [k for k, tr in enumerate(regions) if not region_usable(tr)]
+    if retry:
+        _p(0.93, f"텍스트 영역 재검출 ({len(retry)}줄)...")
+        try:
+            regs2 = detect_text_regions(
+                video_path,
+                [(max(0, windows[k][0] - _REGION_RETRY_BACK_MS), windows[k][1]) for k in retry],
+                play_res=res_xy,
+                cancel_check=(cancel_event.is_set if cancel_event else None),
+            ) or []
+        except Exception:  # noqa: BLE001
+            log.exception("텍스트 영역 재검출 실패 — 1차 결과로 진행")
+            regs2 = []
+        # 넓힌 창은 tr2.win_start_ms/win_end_ms 에 남는다 — _region_placements 가 drift
+        # 외삽 배수·오염 판정을 줄 구간이 아니라 실제 검출 창으로 계산한다.
+        for k, tr2 in zip(retry, regs2):
+            if region_usable(tr2):
+                regions[k] = tr2
+        _check_cancel(cancel_event)
+    n_regions = sum(1 for tr in regions if region_usable(tr))
 
     used_llm = False
     fx_notes: list[str] = []
     fx_status = ""
     lines = None
-    res_xy = (int(play_res[0]) or 1920, int(play_res[1]) or 1080)
     if ai_effects:
         # 6) AI 연출 — 디렉터가 fx 를 정하고 확장기가 이벤트로 펼친다.
         # LLM 호출은 이 워커 스레드 안에서 동기로 돈다. 디렉터/확장기는
@@ -565,7 +607,7 @@ def run_lyric_typeset(
         try:
             lines, used_llm, fx_notes = _direct_lyric_effects(
                 pairs, groups, rows, vis, reference_ass, use_llm, cancel_event,
-                play_res=res_xy, progress=_p)
+                play_res=res_xy, progress=_p, regions=regions)
             fx_status = "llm" if used_llm else "rules"
         except SyncCancelled:
             raise
@@ -576,14 +618,17 @@ def run_lyric_typeset(
             lines = None
         _check_cancel(cancel_event)
     if lines is None:
-        lines = compose_lines(pairs, rows, vis, res_xy[0], res_xy[1])
+        lines = compose_lines(pairs, rows, vis, res_xy[0], res_xy[1], regions, groups)
     n_graphic = sum(1 for r in rows if r.via == "graphic")
-    log.info("가사 타이프셋 계획: %d줄 (그래픽 근거 %d, 이벤트 %d개, AI 연출=%s, 상태=%s)",
-             len(lines), n_graphic, len(events), ai_effects, fx_status or "-")
+    log.info("가사 타이프셋 계획: %d줄 (그래픽 근거 %d, 이벤트 %d개, 텍스트 영역 %d/%d, "
+             "AI 연출=%s, 상태=%s)",
+             len(lines), n_graphic, len(events), n_regions, len(windows),
+             ai_effects, fx_status or "-")
     _p(1.0, f"타이프셋 계획 완료 — {len(lines)}줄")
     return LyricTypesetResult(
         lines=lines, language=lang, n_graphic=n_graphic, n_events=len(events),
-        used_llm=used_llm, fx_notes=fx_notes, fx_status=fx_status)
+        used_llm=used_llm, fx_notes=fx_notes, fx_status=fx_status,
+        n_regions=n_regions)
 
 
 def _direct_lyric_effects(
@@ -596,8 +641,12 @@ def _direct_lyric_effects(
     cancel_event: Optional[threading.Event],
     play_res: tuple[int, int] = (1920, 1080),
     progress: Optional[Callable[[float, str], None]] = None,
+    regions: Optional[list] = None,
 ) -> tuple[list, bool, list[str]]:
-    """to_fx_lines → 스타일 다이제스트 → 디렉터 → expand_planned.
+    """place_fx_lines → 스타일 다이제스트 → 디렉터(화면 힌트 포함) → expand_planned.
+
+    regions: media.text_region.detect_text_regions 결과 (시간 있는 줄 순서, None
+    허용) — 좌표는 텍스트 영역 우선, 디렉터에는 줄별 힌트(layout/drift/accent)로.
 
     LLM 호출(claude/codex CLI, 최대 수 분) 동안 cancel_event 를 감시하는 스레드가
     CliCancelToken 으로 CLI 프로세스 트리를 죽인다 — 취소 버튼이 CLI 타임아웃까지
@@ -608,12 +657,13 @@ def _direct_lyric_effects(
         (PlannedLine 목록, used_llm, notes)
     """
     from ai.llm._cli import CliCancelToken, set_cancel_token
-    from ai.lyric_typeset import expand_planned, fx_visuals, to_fx_lines
+    from ai.lyric_typeset import expand_planned, fx_visuals, place_fx_lines
     from ai.reference_style import build_style_digest, default_style_digest
     from ai.typeset_director import direct_typeset
 
     play_res = (int(play_res[0]), int(play_res[1]))
-    fx_lines, roles, row_indices = to_fx_lines(pairs, rows, vis, play_res)
+    fx_lines, roles, row_indices, hints = place_fx_lines(
+        pairs, rows, vis, play_res, regions, groups)
     if not fx_lines:
         return [], False, ["연출할 줄이 없습니다."]
     line_vis = fx_visuals(rows, vis, row_indices)
@@ -651,7 +701,7 @@ def _direct_lyric_effects(
     try:
         proposal = direct_typeset(
             fx_lines, line_vis, roles, line_groups, digest=digest,
-            use_llm=use_llm, play_res=play_res)
+            use_llm=use_llm, play_res=play_res, hints=hints)
     finally:
         set_cancel_token(None)
         stop.set()
@@ -665,9 +715,9 @@ def _direct_lyric_effects(
     all_notes = list(proposal.errors) + list(proposal.notes) + notes
     if proposal.used_llm and (proposal.provider or proposal.model):
         all_notes.insert(0, f"LLM: {proposal.provider} {proposal.model}".strip())
-    log.info("AI 연출: %d줄 → %d이벤트, LLM=%s, fx=%s",
+    log.info("AI 연출: %d줄 → %d이벤트, LLM=%s, 힌트 %d줄, fx=%s",
              len(fx_lines), len(lines), proposal.used_llm,
-             [d.fx for d in proposal.directives])
+             sum(1 for h in hints if h), [d.fx for d in proposal.directives])
     return lines, bool(proposal.used_llm), all_notes
 
 

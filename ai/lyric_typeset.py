@@ -7,8 +7,11 @@ r"""가사 → 그래픽 우선 타이프셋 자막 계획 (완성본 형식).
     고르면 다음 줄의 그래픽을 훔친다).
   · 끝 = 같은 자리 교체(다음 등장, 근접) 또는 근처 소멸. 같은 절에서 나뉜
     구들은 블록 페이드로 함께 끝난다.
-  · 위치 = 등장 이벤트의 변화 영역 중심 (새 텍스트가 뜬 곳).
-  · 밝은 장면(주간)은 검은 글자, 어두운 장면은 흰 글자 스타일.
+  · 위치 = 화면에 그려진 원문 텍스트 영역(media.text_region) — 같은 창의 구들은
+    글자 덩어리를 읽기 순서대로 하나씩 받는다. 영역이 없거나 신뢰가 낮으면
+    등장 이벤트의 변화 영역 중심으로 폴백.
+  · 밝은 장면(주간)은 검은 글자, 어두운 장면은 흰 글자 스타일 — 텍스트 영역의
+    극성(dark_text)이 있으면 그것을 우선.
   · 원문 1~2자 꼬리(글자 분할 연출)는 세로 스택 + 시차 등장, 공통 소멸.
 
 00001 영상을 수작업 완성본과 구 단위 39줄로 비교한 실측: 시작 오차 중앙값
@@ -22,6 +25,7 @@ from typing import Optional
 
 from ai.alignment_song import LineAlignment
 from ai.lyric_text import LyricPair
+from media.text_region import TextRegion
 from media.video_analysis import GraphicEvent, LineVisual
 
 # 완성본 형식의 스타일 이름 — 없으면 생성해서 쓴다.
@@ -377,6 +381,652 @@ def _sequence_gap_runs(pairs: list[LyricPair], rows: list[_Row]) -> int:
     return changed
 
 
+# ---- 화면 텍스트 영역 기반 배치 ---------------------------------------------
+#
+# media.text_region.detect_text_regions 는 줄의 창 안에서 '기준 프레임(창 시작
+# 직전) 대비 새로 그려진 가는 구조' 를 글자 덩어리(cluster)로 준다. 그 안에는
+# 이 줄의 원문 말고도 (a) 앞 줄의 텍스트가 \move 로 흘러서 변화로 잡힌 것,
+# (b) 창 안에서 나중에 뜬 다음 줄의 텍스트가 섞인다 (실측 00001: '고개 한 번'
+# 창에 앞 두 줄이 3덩어리로, '별하늘로…' 창에 다음 절의 두 구가). 그래서
+#   · (a) 는 앞 줄이 '자기 텍스트' 로 확정한 덩어리(또는 가운데 샘플이 이 줄
+#     시작보다 앞선 앞 줄 영역의 덩어리)와 대조해 뺀다.
+#   · (b) 는 뒤 줄이 자기 영역으로 같은 덩어리를 보고 있으면 그 줄 것으로 넘긴다.
+#   · 같은 절의 구들(창이 겹치는 그룹 멤버)과 영역이 없는 뒤 줄(같은 장면, 이 창의
+#     샘플 구간 안에서 시작)은 남은 덩어리를 읽기 순서(행 위→아래, 행 안 좌→우)로
+#     하나씩 나눠 받는다 — 덩어리가 더 많으면 뒤쪽(최근에 뜬) 것들을.
+#   · 원문 글자 수로 추정한 폭의 35% 에 못 미치는 덩어리(세로 제목의 한 글자,
+#     꽃잎 잡티)는 이 줄들의 텍스트가 아니다.
+#
+# 번역의 자리는 원문 덩어리 '위' 가 기본이다 (레퍼런스 실측: 何も望まないように
+# (654,810)→(650,721), 諦めながら (834,984)→(844,884), 私はそれを (962,398)→
+# (949,301) — 원문 중심에서 h/2+35 위). 위가 다른 원문/먼저 놓인 번역과 겹치면
+# 아래, 그다음 그 자리 아래쪽 빈 곳(화면 텍스트 열의 맨 아래에 쌓기: 美しいとは/
+# 思ったことがない → (960,900)/(960,1045)), 마지막에 옆. 오른쪽 가장자리에 여러
+# 행으로 쌓인 원문(迫りくる/暗い闇/二度と)은 옆(왼쪽)이 먼저다 (레퍼런스
+# (1048,270)/(1138,436)/(1149,598)).
+#
+# 드리프트(원문이 \move 로 흐르는지)는 영역의 bbox 드리프트를 샘플 구간→줄 길이로
+# 외삽하되, 창 안에 다른 줄이 시작하지 않고(bbox 가 그 줄 때문에 커진다) 면적비가
+# 0.8~1.25 안이며 앞 줄 텍스트가 섞이지 않았을 때만 믿는다.
+
+_REGION_MIN_CONF = 0.4        # 이 이상이면 텍스트 영역을 좌표 근거로 쓴다
+_REGION_DARK_MIN_CONF = 0.2   # 흑백(dark_text)·장면 판정 하한 — 마스크가 조금만 잡혀도 극성은 맞다
+_REGION_MOVE_PX = 40.0        # 텍스트 영역 드리프트(줄 길이 외삽)가 이 이상이면 \move (px, 1080p 기준)
+_REGION_EDGE_MS = 400.0       # text_region 샘플 = 시작+400 ~ 끝-400 (짧은 창은 길이의 25%)
+_REGION_APPEAR_MS = 300       # 이만큼 먼저 뜬 줄의 텍스트는 '이전 텍스트' 로 본다
+_REGION_SCENE_BRIGHT = 0.25   # 장면 밝기 차가 이보다 크면 다른 장면 (영역 극성이 없을 때)
+_REGION_DRIFT_SCALE = (0.8, 1.25)  # 드리프트를 믿는 면적비(scale) 범위 — 밖이면 창 안에서 텍스트가 늘거나 줄었다
+_REGION_DRIFT_EXTRAP = 3.0    # 샘플 구간 → 줄 길이 외삽 배수 상한 (잡음 증폭 억제)
+_REGION_DRIFT_NOISE_PX = 25.0 # 잰 드리프트가 이보다 작으면 같은 블록의 다른 줄에 물려주지 않는다 (잡음 실측 ≤16px)
+_REGION_DRIFT_CAP_PX = 600.0  # 줄 길이로 외삽·상속한 드리프트 상한 (레퍼런스 최대 512px)
+_REGION_LINGER_MS = 1500      # 앞 줄의 원문은 계획된 끝 뒤에도 이만큼 화면에 남아 있다고 본다 (자리 점유)
+_REGION_OCCUPY_MS = 1000      # 이만큼 이상 같이 보여야 '자리를 차지한다' (교체 전환의 짧은 겹침은 무시, _COLLIDE_MS 와 같음)
+_REGION_RETRY_BACK_MS = 2000  # 영역이 안 잡힌 줄의 재검출 창을 이만큼 앞으로 넓힌다 (계획 시각이 원문보다 늦을 때)
+_REGION_MIN_WIDTH_FRAC = 0.45 # 원문 글자 수로 추정한 폭의 이 비율보다 좁은 덩어리는 그 줄의 텍스트가 아니다
+_REGION_RECENT_MS = 2900      # 이 안에 뜬 앞 줄의 텍스트는 기준 프레임(재검출 창은 2.9s 전)에 없어 '변화' 로 잡힌다
+_REGION_MOVED_PX = 20.0       # 앞 줄 덩어리가 이보다 옮겨졌으면 흐르는 텍스트 (변화로 잡힌 이유)
+_REGION_GLYPH_PX = 86.0       # 원문 1자 폭 추정 (1080p, 실측 fs≈96)
+_DIAG_MIN_CLUSTERS = 5        # 대각선 판정에 필요한 글자 덩어리 수 (실측 7; 잡티 4개 오판 방지)
+_DIAG_MIN_CONF = 0.6
+_OFF_GAP_PX = 40.0            # 번역 중심 = 원문 상단(하단) ± 이 값 (레퍼런스 실측 21~51)
+_OFF_SIDE_GAP_PX = 20.0       # 옆에 둘 때 원문 끝과 번역 끝 사이 여백
+_KOR_HALF_H = 34.0            # 충돌 판정용 번역 반높이 (fs 96 한글 실높이 ~70) — _OFF_GAP_PX 보다 작아야 위/아래 후보가 원문과 안 겹친다
+_KOR_LINE_H = 96.0            # 아래로 쌓을 때 행 간격의 기준
+_RIGHT_EDGE_FRAC = 0.82       # 원문 오른끝이 화면 폭의 이 비율을 넘으면 '가장자리 텍스트'
+_STACK_DY = (60.0, 260.0)     # 같은 열에 이 범위의 행 간격으로 다른 원문이 있으면 '쌓인 블록'
+_INHERIT_DY_MAX = 450.0       # 드리프트 상속은 3행 거리까지 (遠ざかる/白い壁/一度も 블록 실측 386px)
+_SINGLE_LINE_H_PX = 150.0     # 이보다 높은 가로 덩어리는 두 행이 합쳐진 것 — bbox 드리프트를 믿지 않는다
+_FRAME_LO, _FRAME_HI = 0.08, 0.92  # 번역 중심(시작점·\move 끝점)을 두는 프레임 안쪽 띠 — 배치·벌리기·클램프가 같은 값을 쓴다
+
+
+def _region_window(tr: TextRegion, r: "_Row") -> tuple[int, int]:
+    """영역이 실제로 잰 창 (ms). 재검출(창을 앞으로 넓힘)한 영역은 줄 구간과 다르다 —
+    drift/scale 의 샘플 구간·오염 판정은 이 창 기준이어야 한다. 모르면 줄 구간."""
+    ws = int(getattr(tr, "win_start_ms", -1))
+    we = int(getattr(tr, "win_end_ms", -1))
+    if ws >= 0 and we > ws:
+        return ws, we
+    return int(r.start), int(r.end)
+
+
+def _fit_drift(x: float, y: float, d: tuple[float, float], rx: int, ry: int
+               ) -> tuple[float, float]:
+    """드리프트 (dx, dy) 를 끝점 (x+dx, y+dy) 이 프레임 안쪽 띠(8~92%)에 남도록 방향을
+    유지한 채 줄인다. 시작점이 이미 띠 밖이면 0. 줄 길이로 외삽한 드리프트가 화면
+    밖으로 나가는 것(실측 \\move(1554,748,1794,1298))을 막는다 — 확장기의 가장자리
+    클램프는 글자 절반이 잘린 채 끝나므로 여기서 미리 줄인다."""
+    dx, dy = float(d[0]), float(d[1])
+    k = 1.0
+    if dx > 0:
+        k = min(k, (_FRAME_HI * rx - x) / dx)
+    elif dx < 0:
+        k = min(k, (_FRAME_LO * rx - x) / dx)
+    if dy > 0:
+        k = min(k, (_FRAME_HI * ry - y) / dy)
+    elif dy < 0:
+        k = min(k, (_FRAME_LO * ry - y) / dy)
+    k = max(0.0, min(1.0, k))
+    return (dx * k, dy * k)
+
+
+@dataclass(slots=True)
+class _RegionPlace:
+    """텍스트 영역이 정한 줄 1개의 자리 (px)."""
+    x: float
+    y: float
+    bounds: tuple[int, int, int, int]                  # 번역 상자 (x0, y0, x1, y1) — 같은 자리 줄들을 벌릴 때의 한계
+    own: list[tuple[float, float, float, float]]       # 이 줄의 텍스트로 본 덩어리 (cx, cy, w, h)
+    hint: Optional[dict]                               # 디렉터용 힌트 (typeset_director.hint_fx)
+    leader: bool = True                                # 자기 창의 영역으로 배치됐는지 (드리프트 신뢰 조건)
+
+
+def _px_cluster(c: tuple[float, float, float, float], rx: int, ry: int
+                ) -> tuple[float, float, float, float]:
+    return (c[0] * rx, c[1] * ry, c[2] * rx, c[3] * ry)
+
+
+def _cluster_match(a: tuple[float, float, float, float],
+                   b: tuple[float, float, float, float]) -> bool:
+    """두 덩어리가 같은 텍스트인가 — 크기가 비슷하고(폭·높이 1.6배 안) 중심이 가깝다
+    (느린 드리프트 허용: 폭의 30%/높이의 60%, 최소 60px). 크기 조건이 없으면 두
+    구를 합친 넓은 새 줄이 앞 줄의 좁은 덩어리를 '품어서' 같은 텍스트로 오판하고,
+    중심 허용이 넓으면 같은 행의 다른 구(絶えず vs 私はそれを, 216px)를 오판한다."""
+    wa, wb = max(a[2], 1.0), max(b[2], 1.0)
+    ha, hb = max(a[3], 1.0), max(b[3], 1.0)
+    if max(wa, wb) > 1.6 * min(wa, wb) or max(ha, hb) > 1.6 * min(ha, hb):
+        return False
+    return (abs(a[0] - b[0]) <= max(60.0, 0.3 * max(wa, wb))
+            and abs(a[1] - b[1]) <= max(60.0, 0.6 * max(ha, hb)))
+
+
+def _moved(a: tuple[float, float, float, float],
+           b: tuple[float, float, float, float]) -> bool:
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5 > _REGION_MOVED_PX
+
+
+def _inside(c: tuple[float, float, float, float],
+            o: tuple[float, float, float, float], margin: float = 24.0) -> bool:
+    """c 의 상자가 o 의 상자(여유 margin) 안에 든다 — 그려지는 중인 세로 제목 기둥의
+    일부(높이가 절반이라 _cluster_match 의 크기 조건에 걸리지 않음)를 제목 것으로."""
+    return (c[0] - c[2] / 2.0 >= o[0] - o[2] / 2.0 - margin
+            and c[0] + c[2] / 2.0 <= o[0] + o[2] / 2.0 + margin
+            and c[1] - c[3] / 2.0 >= o[1] - o[3] / 2.0 - margin
+            and c[1] + c[3] / 2.0 <= o[1] + o[3] / 2.0 + margin)
+
+
+def _same_slot(a: tuple[float, float, float, float],
+               b: tuple[float, float, float, float]) -> bool:
+    """같은 행(y 띠가 짧은 쪽의 50% 이상 겹침)·x 겹침 — 크기는 묻지 않는다 (교체된
+    자리, 또는 두 구를 합친 넓은 덩어리 vs 한 구)."""
+    ay0, ay1 = a[1] - a[3] / 2.0, a[1] + a[3] / 2.0
+    by0, by1 = b[1] - b[3] / 2.0, b[1] + b[3] / 2.0
+    ov = min(ay1, by1) - max(ay0, by0)
+    if ov < 0.5 * max(1.0, min(ay1 - ay0, by1 - by0)):
+        return False
+    return (a[0] - a[2] / 2.0) < (b[0] + b[2] / 2.0) and (a[0] + a[2] / 2.0) > (b[0] - b[2] / 2.0)
+
+
+def _reading_order(K: list[tuple[float, float, float, float]]
+                   ) -> list[tuple[float, float, float, float]]:
+    """행(y 띠가 짧은 쪽의 50% 이상 겹침) 위→아래, 행 안에서 좌→우. 결정적."""
+    rows: list[list[tuple[float, float, float, float]]] = []
+    for c in sorted(K, key=lambda o: (o[1], o[0])):
+        y0, y1 = c[1] - c[3] / 2.0, c[1] + c[3] / 2.0
+        for row in rows:
+            ry0 = min(o[1] - o[3] / 2.0 for o in row)
+            ry1 = max(o[1] + o[3] / 2.0 for o in row)
+            ov = min(ry1, y1) - max(ry0, y0)
+            if ov >= 0.5 * max(1.0, min(y1 - y0, ry1 - ry0)):
+                row.append(c)
+                break
+        else:
+            rows.append([c])
+    rows.sort(key=lambda row: sum(o[1] for o in row) / len(row))
+    out: list[tuple[float, float, float, float]] = []
+    for row in rows:
+        out.extend(sorted(row, key=lambda o: o[0]))
+    return out
+
+
+def _cluster_bbox(cl: list[tuple[float, float, float, float]]
+                  ) -> tuple[int, int, int, int]:
+    x0 = min(c[0] - c[2] / 2.0 for c in cl)
+    x1 = max(c[0] + c[2] / 2.0 for c in cl)
+    y0 = min(c[1] - c[3] / 2.0 for c in cl)
+    y1 = max(c[1] + c[3] / 2.0 for c in cl)
+    return (int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1)))
+
+
+def _region_usable(tr: Optional[TextRegion]) -> bool:
+    return (tr is not None and tr.sampled and tr.confidence >= _REGION_MIN_CONF
+            and bool(tr.clusters))
+
+
+def region_usable(tr: Optional[TextRegion]) -> bool:
+    """텍스트 영역이 좌표 근거로 쓸 만한가 (sampled, 신뢰 ≥0.4, 덩어리 있음) — 호출자
+    (sync_service 의 재검출 판단)용 공개 이름."""
+    return _region_usable(tr)
+
+
+def _src_len(source: Optional[str]) -> int:
+    """원문 글자 수 추정 — 공백 제외, 연속된 점(..., ･･･, …)은 1자로."""
+    n = 0
+    prev_dot = False
+    for ch in (source or ""):
+        if ch.isspace():
+            continue
+        dot = ch in ".･・…"
+        if dot and prev_dot:
+            continue
+        n += 1
+        prev_dot = dot
+    return n
+
+
+def _plausible_clusters(K: list[tuple[float, float, float, float]],
+                        sources: list[Optional[str]]
+                        ) -> list[tuple[float, float, float, float]]:
+    """가로 덩어리 중 원문 글자 수로 추정한 폭(가장 짧은 후보 기준)의 45% 에 못
+    미치는 것을 뺀다 — 세로 제목의 한 글자(は 176px), 꽃잎 잡티, 획 조각. 세로
+    (h>1.5w) 덩어리는 폭으로 판단하지 않는다. 전부 빠지면 빈 목록 (영역 안 씀)."""
+    lens = [_src_len(s) for s in sources if s]
+    if not lens:
+        return K
+    exp = min(lens) * _REGION_GLYPH_PX
+    return [c for c in K if c[3] > 1.5 * c[2] or c[2] >= _REGION_MIN_WIDTH_FRAC * exp]
+
+
+def _region_hint(
+    tr: TextRegion,
+    clusters: list[tuple[float, float, float, float]],
+    drift: Optional[tuple[float, float]],
+    diagonal: bool,
+    accent: Optional[str],
+) -> dict:
+    """typeset_director 가 읽는 힌트 — 화면에서 측정된 사실만 (px 단위).
+
+    drift 는 신뢰할 때만 (dx, dy) — 줄 길이로 외삽한 값, 아니면 None(모름).
+    layout 은 diagonal 을 덩어리 수/신뢰도로 검증한 뒤의 값. diag_start/diag_end
+    는 대각선일 때 첫/끝 글자 덩어리 중심. accent_color 는 이 줄의 텍스트에 있는
+    강조색(영역에 강조가 있어도 같은 창의 다른 줄 것이면 None).
+    """
+    if diagonal:
+        layout = "diagonal"
+    elif tr.layout in ("vertical", "scatter"):
+        layout = tr.layout
+    else:
+        layout = "horizontal"
+    frac = getattr(tr, "accent_frac", None)
+    accent_full = bool(getattr(tr, "accent_full", False)
+                       or (isinstance(frac, (int, float)) and frac >= 0.9))
+    return {
+        "layout": layout,
+        "angle_deg": float(tr.angle_deg),
+        "drift": drift,
+        "scale": float(tr.scale),
+        "accent_color": accent,
+        "accent_full": accent_full if accent else False,
+        "dark_text": bool(tr.dark_text),
+        "bbox": _cluster_bbox(clusters),
+        "clusters": [tuple(c) for c in clusters],
+        "confidence": float(tr.confidence),
+        "diag_start": (clusters[0][0], clusters[0][1]) if diagonal else None,
+        "diag_end": (clusters[-1][0], clusters[-1][1]) if diagonal else None,
+    }
+
+
+def _rect_hit(x: float, y: float, kw: float,
+              rects: list[tuple[float, float, float, float]]) -> bool:
+    x0, x1 = x - kw / 2.0, x + kw / 2.0
+    y0, y1 = y - _KOR_HALF_H, y + _KOR_HALF_H
+    return any(x0 < r[2] and x1 > r[0] and y0 < r[3] and y1 > r[1] for r in rects)
+
+
+def _cluster_rect(c: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    return (c[0] - c[2] / 2.0, c[1] - c[3] / 2.0, c[0] + c[2] / 2.0, c[1] + c[3] / 2.0)
+
+
+def _offset_place(
+    cluster: tuple[float, float, float, float],
+    kw: float,
+    occupied: list[tuple[float, float, float, float]],
+    korean: list[tuple[float, float, float, float]],
+    rx: int,
+    ry: int,
+    vertical: bool = False,
+) -> tuple[float, float]:
+    """원문 덩어리(cx, cy, w, h) 옆의 빈 자리에 번역(폭 kw)을 둔다.
+
+    후보 순서: 기본 [위, 아래, 열 맨 아래에 쌓기, 옆]; 오른쪽 가장자리에 여러 행으로
+    쌓인 원문은 [왼쪽 옆, 위, 아래, 쌓기]; 세로 기둥(vertical — 번역도 세로로
+    그린다)은 [안쪽 옆, 바깥쪽 옆, 위, 아래]. 후보는 중심이 프레임 안쪽 띠(8~92% —
+    _place_lines 의 클램프와 같은 띠라 나중에 좌표가 옮겨지지 않는다)에 있고 글자
+    상자가 x 2~98% 안이며, 다른 원문(occupied — 이 덩어리와 같은 자리는 제외돼
+    있어야 한다)·먼저 놓인 번역(korean)과 겹치지 않아야 한다. 전부 실패하면 원문
+    중심(띠 안으로 클램프). 결정적.
+    """
+    cx, cy, w, h = cluster
+    x0, x1 = cx - w / 2.0, cx + w / 2.0
+    lo_x, hi_x = _FRAME_LO * rx, _FRAME_HI * rx
+    lo_y, hi_y = _FRAME_LO * ry, _FRAME_HI * ry
+    above = (cx, cy - h / 2.0 - _OFF_GAP_PX)
+    below = (cx, cy + h / 2.0 + _OFF_GAP_PX)
+    left = (x0 - _OFF_SIDE_GAP_PX - kw / 2.0, cy)
+    right = (x1 + _OFF_SIDE_GAP_PX + kw / 2.0, cy)
+    occ_rects = [_cluster_rect(o) for o in occupied]
+
+    def stack_bottom() -> tuple[float, float]:
+        bottoms = [o[1] + o[3] / 2.0 for o in occupied
+                   if (o[0] - o[2] / 2.0) < cx + kw / 2.0 and (o[0] + o[2] / 2.0) > cx - kw / 2.0]
+        y = max(bottoms + [cy + h / 2.0]) + _OFF_GAP_PX
+        for _ in range(8):
+            if not _rect_hit(cx, y, kw, korean):
+                break
+            y += _KOR_LINE_H + _OFF_GAP_PX     # 레퍼런스의 번역 행 간격 ~145px
+        return (cx, y)
+
+    stacked = any(abs(o[0] - cx) < 0.5 * max(w, o[2], 1.0)
+                  and _STACK_DY[0] <= abs(o[1] - cy) <= _STACK_DY[1]
+                  for o in occupied)
+    if vertical:
+        cands = ([left, right] if cx >= rx / 2.0 else [right, left]) + [above, below]
+    elif x1 > _RIGHT_EDGE_FRAC * rx and stacked:
+        cands = [left, above, below, stack_bottom()]
+    else:
+        side = left if cx >= rx / 2.0 else right
+        cands = [above, below, stack_bottom(), side]
+    for x, y in cands:
+        if not (lo_x <= x <= hi_x and lo_y <= y <= hi_y
+                and x - kw / 2.0 >= 0.02 * rx and x + kw / 2.0 <= 0.98 * rx):
+            continue
+        if _rect_hit(x, y, kw, occ_rects) or _rect_hit(x, y, kw, korean):
+            continue
+        return (x, y)
+    return (min(hi_x, max(lo_x, cx)), min(hi_y, max(lo_y, cy)))
+
+
+def _region_placements(
+    pairs: list[LyricPair],
+    rows: list[_Row],
+    regions: list[Optional[TextRegion]],
+    rx: int,
+    ry: int,
+    groups: Optional[list[int]] = None,
+    visuals: Optional[list[Optional[LineVisual]]] = None,
+) -> dict[int, _RegionPlace]:
+    """텍스트 영역 → pairs 인덱스별 자리. regions·visuals 는 시간 있는 줄 순서.
+
+    줄을 시간 순서로 보며:
+      · title: bbox 중심 (세로 기둥 전체가 제목).
+      · 신뢰 낮은/없는 영역, tail(글자 스택), prologue(화면 원문이 없는 머리말)는 건너뜀.
+      · 앞 줄이 자기 텍스트로 확정한 덩어리(또는 가운데 샘플이 이 줄 시작보다
+        앞선 앞 줄 영역의 모든 덩어리)와 겹치는 덩어리는 '이전 텍스트' 로 뺀다.
+        전부 빠지면 (예: 제목 기둥만 잡힌 인트로 줄) 영역을 쓰지 않는다.
+      · 대각선(덩어리 ≥5, 신뢰 ≥0.6)은 글자 사슬 하나 — bbox 중심, 힌트에 첫/끝 글자.
+      · 다른 절의 뒤 줄이 자기 영역으로 같은 덩어리를 보고 있으면 그 줄 것 → 뺀다.
+      · 남은 덩어리(원문 글자 수 대비 너무 좁은 것 제외)를 이 줄 + 창이 겹치는 같은
+        절의 구들 + 영역 없는 같은 장면의 뒤 줄(이 창의 샘플 구간 안에서 시작)에
+        읽기 순서로 하나씩 — 더 많으면 뒤쪽(최근) 것들을, 모자라면 앞 줄부터 받고
+        나머지 줄은 자기 영역으로. 강조색은 마지막(가장 최근) 멤버의 것으로 본다.
+      · 자리는 _offset_place (원문 위/아래/옆의 빈 곳). 결정적. 예외 없음.
+    """
+    timed = [i for i, r in enumerate(rows) if r.start is not None]
+    reg: dict[int, Optional[TextRegion]] = {
+        i: (regions[k] if k < len(regions) else None) for k, i in enumerate(timed)}
+    vis: dict[int, Optional[LineVisual]] = {
+        i: (visuals[k] if visuals is not None and k < len(visuals) else None)
+        for k, i in enumerate(timed)}
+    grp = {i: (int(groups[i]) if groups is not None and i < len(groups) else -1 - i)
+           for i in timed}
+    roles = {i: _role_of(pairs, i, rows[i], reg.get(i)) for i in timed}
+    mids = {i: (rows[i].start + rows[i].end) / 2.0 for i in timed}
+    Kpx: dict[int, list[tuple[float, float, float, float]]] = {
+        i: _reading_order([_px_cluster(c, rx, ry) for c in reg[i].clusters])
+        for i in timed if _region_usable(reg[i])}
+    out: dict[int, _RegionPlace] = {}
+    own: dict[int, list[tuple[float, float, float, float]]] = {}
+    korean: list[tuple[int, int, tuple[float, float, float, float]]] = []   # (start, end, rect)
+
+    def _text_of(i: int) -> str:
+        p = pairs[i]
+        return p.translation or p.reading or p.source or ""
+
+    claims_cache: dict[int, list[tuple[float, float, float, float]]] = {}
+
+    def _claims(j: int) -> list[tuple[float, float, float, float]]:
+        """줄 j 의 영역에서 '그 창에 새로 뜬' 덩어리 — 읽기 순서의 뒤쪽 m 개 (m = j 와
+        창이 겹치는 같은 절의 구 수). 앞쪽 덩어리는 흘러서 변화로 잡힌 앞 줄 텍스트일
+        수 있다 (迫りくる/暗い闇 블록: 二度と 창에 앞 두 행이 함께 잡힌 실측)."""
+        if j not in claims_cache:
+            mates = [k for k in timed if k > j and grp[k] == grp[j]
+                     and rows[k].start <= rows[j].end and roles[k] == "verse"]
+            K = _plausible_clusters(Kpx[j], [pairs[m].source for m in [j] + mates])
+            claims_cache[j] = K[-(1 + len(mates)):] if K else []
+        return claims_cache[j]
+
+    def _dark_of(i: int) -> Optional[bool]:
+        t = reg.get(i)
+        if t is not None and t.sampled and t.confidence >= _REGION_DARK_MIN_CONF:
+            return bool(t.dark_text)
+        return None
+
+    def _same_scene(i: int, j: int) -> bool:
+        di, dj = _dark_of(i), _dark_of(j)
+        if di is not None and dj is not None:
+            return di == dj
+        vi, vj = vis.get(i), vis.get(j)
+        if vi is not None and vj is not None and vi.sampled and vj.sampled:
+            return abs(vi.brightness - vj.brightness) <= _REGION_SCENE_BRIGHT
+        return True
+
+    seen_from: dict[tuple[float, float, float, float], int] = {}
+
+    def _visible_from(o: tuple[float, float, float, float], j: int) -> int:
+        """덩어리 o (줄 j 의 영역에서 봄)가 화면에 뜬 시각 추정. j 와 창이 겹치는 줄의
+        텍스트로 확정(own)됐으면 그 줄의 시작 (흐르는 블록은 뒤 창에도 다시 잡히지만
+        그 줄 것이다: 暗い闇; 창이 안 겹치는 줄의 비슷한 자리 덩어리는 다른 텍스트). 아니면
+        영역이 '창 시작 직전 대비 변화' 만 담는다는 점을 써서 o 를 담은 영역들 중
+        가장 늦게 시작하는 창의 시작 (계획 시각이 늦은 줄의 긴 창에 다음 절의
+        텍스트가 섞인 실측: 手放せなかった 가 93.7s 창에도 있지만 95.97s 창이 그것을
+        다시 담는다 → 95.97s 부터)."""
+        key = o
+        if key not in seen_from:
+            rj = rows[j]
+            owners = [rows[e].start for e, oc in own.items()
+                      if rows[e].start <= rj.end and rows[e].end >= rj.start
+                      and any(_cluster_match(o, om) for om in oc)]
+            if owners:
+                seen_from[key] = min(owners)
+            else:
+                seen_from[key] = max([rows[m].start for m in Kpx
+                                      if any(_cluster_match(o, om) for om in Kpx[m])]
+                                     + [rows[j].start])
+        return seen_from[key]
+
+    def _occupied(i: int, c: tuple[float, float, float, float]
+                  ) -> list[tuple[float, float, float, float]]:
+        """줄 i 가 보이는 동안(1s 이상 같이) 화면에 있는 다른 원문 덩어리 — 시간이
+        겹치는 줄들의 영역·확정 덩어리 (앞 줄 원문은 계획된 끝 뒤 1.5s 까지 남아
+        있다고 봄; 뜬 시각은 _visible_from), c 와 같은 자리(교체된 자리/같은
+        텍스트)는 제외."""
+        r = rows[i]
+        occ: list[tuple[float, float, float, float]] = []
+        for j in timed:
+            rj = rows[j]
+            if (rj.start + _REGION_OCCUPY_MS >= r.end
+                    or rj.end + _REGION_LINGER_MS <= r.start + _REGION_OCCUPY_MS):
+                continue
+            for o in Kpx.get(j, []) + own.get(j, []):
+                if _same_slot(o, c) or o in occ:
+                    continue
+                if _visible_from(o, j) + _REGION_OCCUPY_MS >= r.end:
+                    continue
+                occ.append(o)
+        return occ
+
+    def _korean_rects(i: int) -> list[tuple[float, float, float, float]]:
+        r = rows[i]
+        return [rect for s, e, rect in korean
+                if min(e, r.end) - max(s, r.start) > _REGION_OCCUPY_MS]
+
+    pending: dict[int, tuple[tuple[float, float, float, float], dict, bool]] = {}
+
+    def _place(i: int, c: tuple[float, float, float, float], hint: dict,
+               leader: bool) -> None:
+        """1차: 덩어리 배정만 (소유 확정). 좌표는 모든 배정이 끝난 뒤 2차에서 —
+        자리 점유(_occupied)가 뒤 줄의 소유까지 알아야 흐르는 블록을 옳게 본다."""
+        pending[i] = (c, hint, leader)
+        out[i] = _RegionPlace(x=c[0], y=c[1], bounds=_cluster_bbox([c]),
+                              own=[c], hint=hint, leader=leader)
+        own[i] = [c]
+
+    for i in timed:
+        r = rows[i]
+        if i in out or roles[i] in ("tail", "prologue"):
+            continue
+        tr = reg.get(i)
+        if not _region_usable(tr):
+            continue
+        assert tr is not None
+        K = Kpx[i]
+        dur = max(1, int(r.end) - int(r.start))
+        # 샘플 구간은 영역이 실제로 잰 창 기준 — 재검출 창은 줄보다 2s 앞에서 시작하므로
+        # 줄 구간으로 계산하면 drift 외삽 배수(dur/span)가 최대 3배까지 부풀고 오염
+        # 판정(창 안에서 시작한 다른 줄)도 앞 2s 를 놓친다.
+        ws, we = _region_window(tr, r)
+        wdur = max(1, we - ws)
+        edge = min(_REGION_EDGE_MS, 0.25 * wdur)
+        last_sample = we - edge
+        first_sample = ws + edge
+        widened = ws < int(r.start)
+        if roles[i] == "title":
+            # 세로 기둥만 제목 (같은 창에 뜬 가로 줄은 뒤 줄이 자기 것으로 받는다)
+            Kt = [c for c in K if c[3] > 1.5 * c[2]] or K
+            bb = _cluster_bbox(Kt)
+            out[i] = _RegionPlace(x=(bb[0] + bb[2]) / 2.0, y=(bb[1] + bb[3]) / 2.0,
+                                  bounds=bb, own=Kt,
+                                  hint=_region_hint(tr, Kt, None, False, None))
+            own[i] = Kt
+            continue
+        # (a) 이전 텍스트 제거 — 영역은 '창 시작 직전 대비 변화' 라서 앞 줄의 정지
+        # 텍스트는 원래 안 잡힌다. 잡혔다면 흘렀거나(옮겨진 자리) 막 뜬 줄의 페이드가
+        # 기준 프레임에 걸린 것 — 그 둘만 앞 줄 것으로 본다. 같은 자리에 새로 뜬
+        # 다른 텍스트(春の陽を ← 美しいとは)는 옮겨지지 않았으므로 이 줄 것.
+        K2: list[tuple[float, float, float, float]] = []
+        for c in K:
+            old = False
+            for e, oc in own.items():
+                re_ = rows[e]
+                if re_.start + _REGION_APPEAR_MS > r.start or re_.end + _REGION_LINGER_MS <= r.start:
+                    continue
+                recent = re_.start >= r.start - _REGION_RECENT_MS
+                # 아직 보이는 앞 줄의 세로 기둥 안에 든 세로 조각 = 그려지는 중인 그 기둥
+                # (인트로 제목이 4.9s 창에 절반 높이로 잡힌 실측 — 크기 조건에 안 걸림)
+                drawing = re_.end > r.start
+                if any((_cluster_match(c, o) and (recent or _moved(c, o)))
+                       or (drawing and o[3] > 1.5 * o[2] and c[3] > 1.5 * c[2] and _inside(c, o))
+                       for o in oc):
+                    old = True
+                    break
+                if (e in Kpx and mids[e] <= r.start
+                        and any(_cluster_match(c, o) and (recent or _moved(c, o))
+                                for o in Kpx[e])):
+                    old = True
+                    break
+            if not old:
+                K2.append(c)
+        if not K2:
+            continue
+        clean = len(K2) == len(K)
+        polluted = any(first_sample < rows[j].start <= last_sample
+                       for j in timed if j != i)
+        if widened and not polluted:
+            # 넓힌 앞 구간에서 앞 줄이 사라지면(페이드) 첫 샘플의 bbox 는 그 텍스트다
+            polluted = any(first_sample < rows[j].end <= r.start for j in timed if j != i)
+        drift: Optional[tuple[float, float]] = None
+        single_line = all(c[3] <= _SINGLE_LINE_H_PX or c[3] > 1.5 * c[2] for c in K2)
+        if (not polluted and clean and single_line
+                and _REGION_DRIFT_SCALE[0] <= tr.scale <= _REGION_DRIFT_SCALE[1]):
+            span = max(1.0, wdur - 2.0 * edge)      # 실제 샘플 구간 (첫~끝 샘플)
+            k = min(_REGION_DRIFT_EXTRAP, dur / span)
+            drift = _cap_drift((tr.drift[0] * rx * k, tr.drift[1] * ry * k))
+        diagonal = (tr.layout == "diagonal" and len(K2) >= _DIAG_MIN_CLUSTERS
+                    and tr.confidence >= _DIAG_MIN_CONF)
+        if diagonal:
+            bb = _cluster_bbox(K2)
+            out[i] = _RegionPlace(x=(bb[0] + bb[2]) / 2.0, y=(bb[1] + bb[3]) / 2.0,
+                                  bounds=bb, own=K2,
+                                  hint=_region_hint(tr, K2, drift, True, tr.accent_color))
+            own[i] = K2
+            continue
+        # (b) 이 창의 텍스트를 나눠 갖는 줄들
+        members = [i]
+        for j in timed:
+            if j <= i or j in out or roles[j] != "verse":
+                continue
+            rj = rows[j]
+            if rj.start > r.end:
+                break
+            same_group = grp[j] == grp[i]
+            if j in Kpx:
+                if same_group:
+                    members.append(j)
+                elif rj.start >= r.start + _REGION_APPEAR_MS:
+                    # 다른 절의 뒤 줄이 자기 영역에서 새로 뜬 것으로 보는 덩어리 = 그 줄의
+                    # 텍스트 (전부 그 줄 것이면 이 줄은 영역을 못 쓴다 — 창이 늦은
+                    # 줄까지 늘어난 '포기하며' 가 다음 절 何も望まないように 를 잡은 실측)
+                    K2 = [c for c in K2 if not any(_cluster_match(c, cj) for cj in _claims(j))]
+                continue
+            if rj.start > last_sample and not same_group:
+                continue
+            if not _same_scene(i, j):
+                continue
+            members.append(j)
+        if not K2:
+            continue
+        K3 = _plausible_clusters(K2, [pairs[m].source for m in members])
+        if len(K3) >= len(members):
+            chosen = K3[-len(members):]        # 뒤쪽 = 최신 텍스트
+        else:
+            chosen = K3                        # 모자라면 앞 줄부터, 나머지는 자기 영역으로
+        for n_, (j, c) in enumerate(zip(members, chosen)):
+            last = n_ == len(chosen) - 1
+            h = _region_hint(tr, K3, drift if j == i else None, False,
+                             tr.accent_color if last else None)
+            if j == i:
+                h["drift_measured_px"] = (abs(tr.drift[0] * rx) ** 2 + abs(tr.drift[1] * ry) ** 2) ** 0.5
+            _place(j, c, h, leader=(j == i))
+
+    # 2차: 번역 자리 (시간 순서 — 먼저 놓인 번역을 피한다)
+    for i in timed:
+        if i not in pending:
+            continue
+        c, hint, leader = pending[i]
+        # 세로 원문은 번역도 세로로 그린다(디렉터 vertical_title) — 옆자리 폭은 한 글자
+        vertical = hint.get("layout") == "vertical"
+        kw = _KOR_LINE_H if vertical else _est_width(_text_of(i))
+        x, y = _offset_place(c, kw, _occupied(i, c), _korean_rects(i), rx, ry, vertical)
+        if hint.get("drift") is not None:
+            hint = dict(hint)
+            hint["drift"] = _fit_drift(x, y, hint["drift"], rx, ry)
+        rect = (x - kw / 2.0, y - _KOR_LINE_H / 2.0, x + kw / 2.0, y + _KOR_LINE_H / 2.0)
+        out[i] = _RegionPlace(x=x, y=y,
+                              bounds=tuple(int(round(v)) for v in rect),  # type: ignore[arg-type]
+                              own=[c], hint=hint, leader=leader)
+        korean.append((int(rows[i].start), int(rows[i].end), rect))
+
+    # (c) 블록 드리프트 상속 — 같은 열에 행으로 쌓여 함께 흐르는 원문(遠ざかる/白い壁/
+    # 一度も)은 창 안에서 다음 행이 뜨는 줄(bbox 드리프트 오염)이 많다. 드리프트를
+    # 믿을 수 있는(잰 값이 잡음보다 큰) 같은 블록 줄의 속도(px/s)를 이 줄 길이로 —
+    # 단 근거 줄 길이의 3배(_REGION_DRIFT_EXTRAP)까지만: 1.4s/35px 측정이 잘못
+    # 잡힌 17s 줄에서 600px 이동이 되지 않게. 끝점은 프레임 안으로.
+    sources = [(e, re_) for e, re_ in out.items()
+               if re_.hint is not None and len(re_.own) == 1
+               and re_.hint.get("drift") is not None and any(re_.hint["drift"])
+               and re_.hint.get("drift_measured_px", 0.0) >= _REGION_DRIFT_NOISE_PX]
+    for i, rp in out.items():
+        if rp.hint is None or rp.hint.get("drift") is not None or len(rp.own) != 1:
+            continue
+        if rp.hint.get("layout") != "horizontal":
+            continue
+        c = rp.own[0]
+        r = rows[i]
+        best: Optional[tuple[float, float, float]] = None
+        for e, re_ in sources:
+            if e == i:
+                continue
+            d = re_.hint.get("drift")
+            rr = rows[e]
+            # 같은 블록은 창이 겹치거나 맞닿는다 (白い壁 창 끝 = 一度も 창 시작)
+            if rr.end < r.start - _REGION_OCCUPY_MS or rr.start > r.end + _REGION_OCCUPY_MS:
+                continue
+            o = re_.own[0]
+            if not (abs(o[0] - c[0]) < 0.5 * max(c[2], o[2], 1.0)
+                    and _STACK_DY[0] <= abs(o[1] - c[1]) <= _INHERIT_DY_MAX):
+                continue
+            dur_e = max(1.0, (rr.end - rr.start) / 1000.0)
+            gap = abs(o[1] - c[1])
+            if best is None or gap < best[2]:
+                best = (d[0] / dur_e, d[1] / dur_e, gap, dur_e)
+        if best is not None:
+            dur_i = max(1.0, (r.end - r.start) / 1000.0)
+            span_i = min(dur_i, _REGION_DRIFT_EXTRAP * best[3])
+            h = dict(rp.hint)
+            h["drift"] = _fit_drift(rp.x, rp.y, _cap_drift((best[0] * span_i, best[1] * span_i)),
+                                    rx, ry)
+            h["drift_src"] = "block"
+            rp.hint = h
+    return out
+
+
+def _cap_drift(d: tuple[float, float]) -> tuple[float, float]:
+    n = (d[0] ** 2 + d[1] ** 2) ** 0.5
+    if n <= _REGION_DRIFT_CAP_PX or n <= 0:
+        return d
+    k = _REGION_DRIFT_CAP_PX / n
+    return (d[0] * k, d[1] * k)
+
+
 @dataclass(slots=True)
 class _Placed:
     """줄 1개의 배치 결정 — compose_lines / to_fx_lines 가 공유하는 중간값."""
@@ -389,6 +1039,10 @@ class _Placed:
     dark: bool
     dx: int = 0                   # 그래픽 드리프트 (px, 0 이면 \pos)
     dy: int = 0
+    pinned: bool = False          # 좌표가 화면 텍스트 영역에서 왔는지
+    bounds: Optional[tuple[int, int, int, int]] = None   # 영역 bbox (px) — 벌리기 한계
+    hint: Optional[dict] = None   # 디렉터 힌트 (없으면 None)
+    role: str = "verse"           # _role_of (영역 포함) — title|prologue|verse|tail
 
 
 def _place_lines(
@@ -397,44 +1051,79 @@ def _place_lines(
     visuals: list[LineVisual],
     play_res_x: int,
     play_res_y: int,
+    regions: Optional[list[Optional[TextRegion]]] = None,
+    groups: Optional[list[int]] = None,
 ) -> list[_Placed]:
-    """계획 + 시각 분석 → 좌표/텍스트/흑백 결정 (태그 없음).
+    """계획 + 시각 분석(+ 텍스트 영역) → 좌표/텍스트/흑백 결정 (태그 없음).
 
     compose_lines(태그 직접 생성)와 to_fx_lines(AI 연출 확장)가 같은 로직을
-    쓰도록 뽑아낸 헬퍼. visuals 는 시간 있는 줄 순서.
+    쓰도록 뽑아낸 헬퍼. visuals·regions 는 시간 있는 줄 순서.
+
+    좌표 우선순위: 텍스트 영역(_region_placements) > 등장 이벤트 중심(r.pos)
+    > 장면 돌출 중심 > 하단 중앙. 흑백: 영역 dark_text(신뢰 ≥0.2) > 장면 밝기.
+    드리프트(\\move): 영역 배치 줄은 영역 드리프트(신뢰 시 ≥40px) 만, 아니면
+    장면 변화 중심의 드리프트.
     """
     out: list[_Placed] = []
     n_stack = sum(1 for r in rows if r.stack >= 0)
+    regions = list(regions or [])
+    placed_by_region = (_region_placements(pairs, rows, regions, play_res_x, play_res_y,
+                                           groups, list(visuals))
+                        if regions else {})
     wi = 0
     for i, (p, r) in enumerate(zip(pairs, rows)):
         if r.start is None:
             continue
         v = visuals[wi] if wi < len(visuals) else None
+        tr = regions[wi] if wi < len(regions) else None
         wi += 1
         text = p.translation or p.reading or p.source
         if not text:
             continue
+        rp = placed_by_region.get(i)
         if r.pos is not None:
             cx, cy = r.pos
         elif v is not None and v.sampled and v.salient > 0.002:
             cx, cy = v.gx, v.gy
         else:
             cx, cy = 0.5, 0.83
-        x = round(min(0.92, max(0.08, cx)) * play_res_x)
-        y = round(min(0.92, max(0.08, cy)) * play_res_y)
+        x = round(min(_FRAME_HI, max(_FRAME_LO, cx)) * play_res_x)
+        y = round(min(_FRAME_HI, max(_FRAME_LO, cy)) * play_res_y)
+        if rp is not None:
+            x = int(round(min(_FRAME_HI * play_res_x, max(_FRAME_LO * play_res_x, rp.x))))
+            y = int(round(min(_FRAME_HI * play_res_y, max(_FRAME_LO * play_res_y, rp.y))))
         if r.stack >= 0:
-            # 글자 스택 — 아래→위 (완성본 패턴)
+            # 글자 스택 — 아래→위 (완성본 패턴). x 는 영역이 잡은 기둥 위치.
             y = round(play_res_y * (0.833 - r.stack * (0.6 / max(1, n_stack - 1))))
-        dark = bool(v is not None and v.sampled
-                    and v.brightness > _DARK_BRIGHTNESS)
-        drift = (abs(v.gx1 - v.gx0) + abs(v.gy1 - v.gy0)
-                 if v is not None and v.sampled and v.salient > 0.003 else 0.0)
+            if _region_usable(tr):
+                x = int(round(min(_FRAME_HI * play_res_x,
+                                  max(_FRAME_LO * play_res_x, tr.cx * play_res_x))))
+        if tr is not None and tr.sampled and tr.confidence >= _REGION_DARK_MIN_CONF:
+            dark = bool(tr.dark_text)
+        else:
+            dark = bool(v is not None and v.sampled
+                        and v.brightness > _DARK_BRIGHTNESS)
         dx = dy = 0
-        if r.stack < 0 and drift > _MOVE_DRIFT:
-            dx = round((v.gx1 - v.gx0) * play_res_x)
-            dy = round((v.gy1 - v.gy0) * play_res_y)
+        if rp is not None:
+            d = rp.hint.get("drift") if rp.hint else None
+            if r.stack < 0 and d is not None:
+                dxf, dyf = _fit_drift(x, y, d, play_res_x, play_res_y)
+                if (dxf ** 2 + dyf ** 2) ** 0.5 >= _REGION_MOVE_PX:
+                    dx, dy = int(round(dxf)), int(round(dyf))
+        else:
+            drift = (abs(v.gx1 - v.gx0) + abs(v.gy1 - v.gy0)
+                     if v is not None and v.sampled and v.salient > 0.003 else 0.0)
+            if r.stack < 0 and drift > _MOVE_DRIFT:
+                dxf, dyf = _fit_drift(x, y, ((v.gx1 - v.gx0) * play_res_x,
+                                             (v.gy1 - v.gy0) * play_res_y),
+                                      play_res_x, play_res_y)
+                dx, dy = round(dxf), round(dyf)
         out.append(_Placed(index=i, row=r, visual=v, text=text,
-                           x=x, y=y, dark=dark, dx=dx, dy=dy))
+                           x=x, y=y, dark=dark, dx=dx, dy=dy,
+                           pinned=rp is not None,
+                           bounds=rp.bounds if rp is not None else None,
+                           hint=rp.hint if rp is not None else None,
+                           role=_role_of(pairs, i, r, tr)))
     return out
 
 
@@ -444,10 +1133,32 @@ def compose_lines(
     visuals: list[LineVisual],
     play_res_x: int = 1920,
     play_res_y: int = 1080,
+    regions: Optional[list[Optional[TextRegion]]] = None,
+    groups: Optional[list[int]] = None,
 ) -> list[PlannedLine]:
-    """계획 + 시각 분석 → 태그 붙은 최종 줄. visuals 는 시간 있는 줄 순서."""
+    """계획 + 시각 분석(+ 텍스트 영역) → 태그 붙은 최종 줄. visuals·regions 는 시간 있는 줄 순서.
+
+    같은 자리(같은 영역 bbox 를 공유하는 구들 등)에 동시에 뜨는 줄은
+    _spread_collisions 로 벌린다 — 영역 좌표는 고정(pinned)이라 서로 떨어진
+    영역 줄끼리는 움직이지 않는다.
+    """
+    placed = _place_lines(pairs, rows, visuals, play_res_x, play_res_y, regions, groups)
+    # 글자 스택(꼬리)은 세로 기둥이라 벌리기에서 제외 — 글자 간격(<220px)이 충돌로 보인다.
+    body = [pl for pl in placed if pl.row.stack < 0]
+    pts = [_XY(pl.text, int(pl.row.start), int(pl.row.end), pl.x, pl.y) for pl in body]
+    _spread_collisions(pts, play_res_x, play_res_y,
+                       fixed={k for k, pl in enumerate(body) if pl.role == "title"},
+                       pinned={k for k, pl in enumerate(body) if pl.pinned},
+                       bounds={k: pl.bounds for k, pl in enumerate(body)
+                               if pl.bounds is not None})
+    for pl, pt in zip(body, pts):
+        if (pl.x, pl.y) != (pt.x, pt.y) and (pl.dx or pl.dy):
+            # 벌리기로 옮겨진 줄의 \move 끝점도 프레임 안에 (영역 줄은 pinned 라 안 옮겨짐)
+            dxf, dyf = _fit_drift(pt.x, pt.y, (pl.dx, pl.dy), play_res_x, play_res_y)
+            pl.dx, pl.dy = int(round(dxf)), int(round(dyf))
+        pl.x, pl.y = pt.x, pt.y
     out: list[PlannedLine] = []
-    for pl in _place_lines(pairs, rows, visuals, play_res_x, play_res_y):
+    for pl in placed:
         r = pl.row
         if pl.dx or pl.dy:
             motion = f"\\move({pl.x},{pl.y},{pl.x + pl.dx},{pl.y + pl.dy})"
@@ -466,7 +1177,8 @@ def compose_lines(
 
 # ---- AI 연출 경로 (effects.typeset_fx 확장) --------------------------------
 
-def _role_of(pairs: list[LyricPair], i: int, r: _Row) -> str:
+def _role_of(pairs: list[LyricPair], i: int, r: _Row,
+             region: Optional[TextRegion] = None) -> str:
     """줄의 역할 — 디렉터가 fx 를 고르는 사전정보.
 
     tail: 꼬리 글자 스택 / title: 제목 카드 / prologue: 원문이 비일본어(영어
@@ -476,6 +1188,9 @@ def _role_of(pairs: list[LyricPair], i: int, r: _Row) -> str:
     있는데 이 줄만 없고(3행 형식에서 제목 카드는 독음이 없다), 보컬/그래픽
     정렬 근거 없이 gap 으로 시간이 잡힌 경우. 2행(원문/번역)·원문만 형식은
     모든 쌍이 독음이 없으므로 첫 가사 줄을 세로 제목으로 오판하지 않는다.
+    제목 텍스트를 다시 부르는 가사 줄(星空へと続く長い坂道は, 유사도 ≥0.75)은
+    화면 텍스트 영역(region)이 세로 배치일 때만 제목으로 본다 — 레퍼런스는 그
+    줄을 세로 제목 카드로 다시 그린다.
     """
     from ai.lyric_normalize import detect_language
     p = pairs[i]
@@ -484,11 +1199,26 @@ def _role_of(pairs: list[LyricPair], i: int, r: _Row) -> str:
     if (i == 0 and not p.reading and r.via in ("gap", "-", "vocal0")
             and any(q.reading for q in pairs)):
         return "title"
+    if (i > 0 and region is not None and region.layout == "vertical"
+            and p.source and pairs[0].source and not pairs[0].reading
+            and any(q.reading for q in pairs)
+            and _letters_similarity(pairs[0].source, p.source) >= 0.75):
+        return "title"
     tr = p.translation or ""
     if (p.source and detect_language(p.source) != "ja"
             and ("\\N" in tr or "\\n" in tr or "\n" in tr)):
         return "prologue"
     return "verse"
+
+
+def _letters_similarity(a: str, b: str) -> float:
+    """글자(L/N)만 남긴 두 문자열의 SequenceMatcher 비율 (0..1)."""
+    from difflib import SequenceMatcher
+    la = "".join(ch for ch in a if unicodedata.category(ch)[0] in ("L", "N"))
+    lb = "".join(ch for ch in b if unicodedata.category(ch)[0] in ("L", "N"))
+    if not la or not lb:
+        return 0.0
+    return SequenceMatcher(None, la, lb).ratio()
 
 
 _COLLIDE_MS = 1000       # 이만큼 이상 동시에 보이면
@@ -509,10 +1239,23 @@ def _est_width(text: str) -> float:
 
 
 _COLLIDE_ANCHOR_X = 0.30  # 고정 줄(세로 제목 기둥) 옆에 무리를 둘 때의 가로 거리 (W 비율)
+_PINNED_APART_PX = 100.0  # 화면 텍스트에 고정된 두 줄이 이만큼 떨어져 있으면 충돌 아님 (원문 행 간격 실측 ~134px)
+
+
+@dataclass(slots=True)
+class _XY:
+    """_spread_collisions 입력 최소 형태 (FxLine 과 같은 속성)."""
+    text: str
+    start_ms: int
+    end_ms: int
+    x: int
+    y: int
 
 
 def _spread_collisions(lines: list, rx: int, ry: int,
-                       fixed: Optional[set[int]] = None) -> int:
+                       fixed: Optional[set[int]] = None,
+                       pinned: Optional[set[int]] = None,
+                       bounds: Optional[dict[int, tuple[int, int, int, int]]] = None) -> int:
     """동시에(≥1s) 보이면서 중심이 가까운(<220px) 줄 무리를 좌우/상하로 벌린다.
 
     같은 절의 구들(블록 페이드)과 인트로의 gap 줄들은 같은 교체 이벤트 중심을
@@ -522,10 +1265,18 @@ def _spread_collisions(lines: list, rx: int, ry: int,
     3~6줄은 1열 계단; 7줄 이상은 2~4열 격자(행 간격 220px). 무리 전체를 추정
     폭까지 포함해 프레임 안(8~92%)으로 민 뒤 클램프. fixed 에 든 줄(세로 제목 —
     프레임 높이 대부분을 차지하는 기둥)은 움직이지 않고, 같은 무리의 나머지를
-    기둥에서 0.30W 떨어진 쪽(기둥이 오른쪽이면 왼쪽)에 배치한다. 반환: 좌표가
-    바뀐 줄 수. 결정적.
+    기둥에서 0.30W 떨어진 쪽(기둥이 오른쪽이면 왼쪽)에 배치한다.
+
+    pinned 에 든 줄은 좌표가 화면 텍스트 영역에서 온 줄: 둘 다 pinned 이고
+    100px 이상 떨어져 있으면(원문의 다른 행) 충돌로 보지 않는다. 무리에
+    pinned 와 아닌 줄이 섞이면 pinned 는 그대로 두고 나머지를 그 아래(자리가
+    없으면 위)에 둔다. 같은 자리를 공유하는 pinned 들(덩어리가 모자라 bbox
+    중심을 나눠 가진 구들)은 bounds 의 합집합 중심에서 벌리되, 2열 간격은
+    bbox 폭의 절반 이상으로 한다. 반환: 좌표가 바뀐 줄 수. 결정적.
     """
     fixed = set(fixed or ())
+    pinned = set(pinned or ()) - fixed
+    bounds = dict(bounds or {})
     n = len(lines)
     parent = list(range(n))
 
@@ -535,13 +1286,20 @@ def _spread_collisions(lines: list, rx: int, ry: int,
             a = parent[a]
         return a
 
+    def _dist(i: int, j: int) -> float:
+        a, b = lines[i], lines[j]
+        return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2) ** 0.5
+
     for i in range(n):
         a = lines[i]
         for j in range(i + 1, n):
             b = lines[j]
             if min(a.end_ms, b.end_ms) - max(a.start_ms, b.start_ms) < _COLLIDE_MS:
                 continue
-            if ((a.x - b.x) ** 2 + (a.y - b.y) ** 2) ** 0.5 >= _COLLIDE_PX:
+            d = _dist(i, j)
+            if d >= _COLLIDE_PX:
+                continue
+            if i in pinned and j in pinned and d >= _PINNED_APART_PX:
                 continue
             parent[find(i)] = find(j)
     clusters: dict[int, list[int]] = {}
@@ -556,16 +1314,21 @@ def _spread_collisions(lines: list, rx: int, ry: int,
             continue
         anchors = [t for t in cluster if t in fixed]
         idxs = [t for t in cluster if t not in fixed]
+        below = False
+        if not anchors:
+            pins = [t for t in idxs if t in pinned]
+            if (pins and len(pins) < len(idxs)
+                    and all(_dist(pins[a], pins[b]) >= _PINNED_APART_PX
+                            for a in range(len(pins)) for b in range(a + 1, len(pins)))):
+                # 화면 텍스트에 고정된 줄은 그대로, 나머지만 그 아래로
+                anchors = pins
+                idxs = [t for t in idxs if t not in pinned]
+                below = True
         k = len(idxs)
         if k < 1:
             continue
         idxs.sort(key=lambda t: (lines[t].start_ms, t))
         cy = sum(lines[t].y for t in idxs) / k
-        if anchors:
-            ax = sum(lines[t].x for t in anchors) / len(anchors)
-            cx = ax - _COLLIDE_ANCHOR_X * rx if ax >= rx / 2.0 else ax + _COLLIDE_ANCHOR_X * rx
-        else:
-            cx = sum(lines[t].x for t in idxs) / k
         widths = [_est_width(lines[t].text) for t in idxs]
         if k == 1:
             ncols = 1
@@ -584,6 +1347,30 @@ def _spread_collisions(lines: list, rx: int, ry: int,
             dy = min(_COLLIDE_ROW_MAX, max(_COLLIDE_ROW_MIN, 0.6 * ry / (nrows - 1)))
         else:
             dy = _COLLIDE_GRID_ROW
+        col_x = _COLLIDE_COL_X * rx
+        if anchors and below:
+            ax = sum(lines[t].x for t in anchors) / len(anchors)
+            ay = sum(lines[t].y for t in anchors) / len(anchors)
+            cx = ax
+            top = ay + _COLLIDE_GRID_ROW
+            if top + (nrows - 1) * dy > hi_y and ay - _COLLIDE_GRID_ROW >= lo_y:
+                top = ay - _COLLIDE_GRID_ROW - (nrows - 1) * dy
+            cy = top + (nrows - 1) * dy / 2.0
+        elif anchors:
+            ax = sum(lines[t].x for t in anchors) / len(anchors)
+            cx = ax - _COLLIDE_ANCHOR_X * rx if ax >= rx / 2.0 else ax + _COLLIDE_ANCHOR_X * rx
+        elif all(t in bounds for t in idxs):
+            # 같은 영역 bbox 를 나눠 가진 구들 — 그 bbox 안(폭이 모자라면 겹치지 않을 만큼)에서
+            bx0 = min(bounds[t][0] for t in idxs)
+            bx1 = max(bounds[t][2] for t in idxs)
+            by0 = min(bounds[t][1] for t in idxs)
+            by1 = max(bounds[t][3] for t in idxs)
+            cx, cy = (bx0 + bx1) / 2.0, (by0 + by1) / 2.0
+            if ncols == 2:
+                col_x = max((bx1 - bx0) / 4.0,
+                            (widths[0] + widths[1]) / 4.0 + _COLLIDE_GAP_PX / 2.0)
+        else:
+            cx = sum(lines[t].x for t in idxs) / k
         pts: list[tuple[float, float]] = []
         for s in range(k):
             col, row = s % ncols, s // ncols
@@ -592,7 +1379,7 @@ def _spread_collisions(lines: list, rx: int, ry: int,
             elif ncols == 1:
                 ox = (_COLLIDE_WOBBLE_X if s % 2 else -_COLLIDE_WOBBLE_X) * rx
             elif ncols == 2:
-                ox = (_COLLIDE_COL_X if col else -_COLLIDE_COL_X) * rx
+                ox = col_x if col else -col_x
             else:
                 ox = (col - (ncols - 1) / 2.0) * _COLLIDE_COL3_X * rx
             oy = (row - (nrows - 1) / 2.0) * dy
@@ -613,21 +1400,26 @@ def _spread_collisions(lines: list, rx: int, ry: int,
     return moved
 
 
-def to_fx_lines(
+def place_fx_lines(
     pairs: list[LyricPair],
     rows: list[_Row],
     visuals: list[LineVisual],
     play_res: tuple[int, int] = (1920, 1080),
-) -> "tuple[list, list[str], list[int]]":
-    """계획 + 시각 분석 → 태그 없는 FxLine 목록 (AI 연출 디렉터 입력).
+    regions: Optional[list[Optional[TextRegion]]] = None,
+    groups: Optional[list[int]] = None,
+) -> "tuple[list, list[str], list[int], list[Optional[dict]]]":
+    """계획 + 시각 분석(+ 텍스트 영역) → 태그 없는 FxLine 목록 (AI 연출 디렉터 입력).
 
     compose_lines 와 같은 좌표/텍스트/스타일/흑백 결정을 공유하되, 동시에 같은
     자리에 뜨는 줄들은 _spread_collisions 로 좌우/계단 배치한다 (디렉터·확장기
-    전 단계 — 글자별/잔상/막대 연출이 한 점에 쌓이지 않게).
+    전 단계 — 글자별/잔상/막대 연출이 한 점에 쌓이지 않게). 텍스트 영역에서
+    온 좌표는 pinned(서로 떨어진 영역 줄은 안 움직임), 대각선 영역 줄의 (x,y)
+    는 첫 글자 덩어리 중심(char_diagonal 의 시작점).
 
     Returns:
-        (fx_lines, roles, row_indices) — 병렬 리스트. roles 는
-        title|prologue|verse|tail, row_indices 는 각 FxLine 의 pairs 인덱스.
+        (fx_lines, roles, row_indices, hints) — 병렬 리스트. roles 는
+        title|prologue|verse|tail, row_indices 는 각 FxLine 의 pairs 인덱스,
+        hints 는 typeset_director.hint_fx 가 읽는 화면 측정 힌트(없으면 None).
 
     꼬리 글자 스택(rows[i].stack>=0)은 개별 줄로 두지 않고 하나의 FxLine
     ("뛰쳐올라가", 첫 시작~공통 끝)으로 합쳐 char_stack 에 맡긴다 — 근거:
@@ -643,22 +1435,34 @@ def to_fx_lines(
     from effects.typeset_fx_schema import FxLine
 
     rx, ry = int(play_res[0]), int(play_res[1])
-    placed = _place_lines(pairs, rows, visuals, rx, ry)
+    placed = _place_lines(pairs, rows, visuals, rx, ry, regions, groups)
     fx_lines: list = []
     roles: list[str] = []
     row_indices: list[int] = []
+    hints: list[Optional[dict]] = []
+    pinned: set[int] = set()
+    bounds: dict[int, tuple[int, int, int, int]] = {}
     tail: list[_Placed] = []
     for pl in placed:
         r = pl.row
         if r.stack >= 0:
             tail.append(pl)
             continue
+        x, y = pl.x, pl.y
+        if pl.hint and pl.hint.get("layout") == "diagonal" and pl.hint.get("diag_start"):
+            sx, sy = pl.hint["diag_start"]
+            x, y = int(round(sx)), int(round(sy))
+        if pl.pinned:
+            pinned.add(len(fx_lines))
+        if pl.bounds is not None:
+            bounds[len(fx_lines)] = pl.bounds
         fx_lines.append(FxLine(
             text=pl.text, start_ms=int(r.start), end_ms=int(r.end),
             style=DARK_STYLE if pl.dark else LIGHT_STYLE,
-            x=pl.x, y=pl.y, dark=pl.dark))
-        roles.append(_role_of(pairs, pl.index, r))
+            x=x, y=y, dark=pl.dark))
+        roles.append(pl.role)
         row_indices.append(pl.index)
+        hints.append(pl.hint)
     if tail:
         tail.sort(key=lambda t: t.row.stack)
         first = tail[0]
@@ -671,13 +1475,29 @@ def to_fx_lines(
             x=first.x, y=first.y, dark=first.dark))
         roles.append("tail")
         row_indices.append(first.index)
+        hints.append(None)
     _spread_collisions(fx_lines, rx, ry,
-                       fixed={k for k, role in enumerate(roles) if role == "title"})
+                       fixed={k for k, role in enumerate(roles) if role == "title"},
+                       pinned=pinned, bounds=bounds)
     # 시작 시간 순서 유지 (꼬리 합본은 원래도 마지막이지만 안전하게)
     order = sorted(range(len(fx_lines)),
                    key=lambda k: (fx_lines[k].start_ms, row_indices[k]))
     return ([fx_lines[k] for k in order], [roles[k] for k in order],
-            [row_indices[k] for k in order])
+            [row_indices[k] for k in order], [hints[k] for k in order])
+
+
+def to_fx_lines(
+    pairs: list[LyricPair],
+    rows: list[_Row],
+    visuals: list[LineVisual],
+    play_res: tuple[int, int] = (1920, 1080),
+    regions: Optional[list[Optional[TextRegion]]] = None,
+    groups: Optional[list[int]] = None,
+) -> "tuple[list, list[str], list[int]]":
+    """place_fx_lines 의 (fx_lines, roles, row_indices) — 힌트가 필요 없는 호출자용."""
+    fx_lines, roles, row_indices, _hints = place_fx_lines(
+        pairs, rows, visuals, play_res, regions, groups)
+    return fx_lines, roles, row_indices
 
 
 def fx_visuals(
