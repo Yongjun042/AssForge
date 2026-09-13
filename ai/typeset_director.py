@@ -64,6 +64,10 @@ _DIGEST_FLOOR_FX: dict[str, int] = {
     "fly_rotate": _FLY_LETTERS, "char_scatter": _SHORT_LETTERS,
     "char_diagonal": _LONG_LETTERS, "ghost_trail": _SHORT_LETTERS,
 }
+# 화면 힌트가 없는(원문 배치를 못 잰) 줄에 LLM 이 고를 수 없는 fx — 정지한 원문을
+# 글자별로 흩뿌리거나 대각선으로 늘어놓으면 화면과 어긋난다 (실측 88.5s '포기하며' 가
+# scatter 로 뭉개짐). 배치를 잰 줄은 힌트가 fx 를 확정하므로 여기 해당하지 않는다.
+_NO_HINT_FORBIDDEN_FX: frozenset[str] = frozenset({"char_scatter", "char_diagonal"})
 
 
 @dataclass(slots=True)
@@ -556,12 +560,17 @@ def direct_by_rules(
     roles: 'title' | 'prologue' | 'verse' | 'tail' (모르면 verse 취급).
     같은 group 의 verse 줄들은 같은 fx 계열을 쓴다 (첫 줄이 계열을 정함).
     hints: 줄별 화면 측정 힌트(dict|None) — hint_fx 가 fx 를 정하면 사이클·장면
-    분석보다 우선하고, 힌트 없는 같은 절의 구는 그 계열을 따른다.
+    분석보다 우선하고, 힌트 없는 같은 절의 구는 그 계열을 따른다. 힌트 목록이 주어진
+    실행(화면을 잰 파이프라인)에서 힌트가 fx 를 정하지 못한 줄은 _NO_HINT_FORBIDDEN_FX
+    (char_scatter/char_diagonal) 대신 plain — 정지한 원문을 글자별로 흩뿌리지 않는다
+    (LLM 응답 누락·검증 실패·use_llm=False 어느 경로든 규칙 결과가 그대로 나가므로
+    여기서 막는다). hints=None(측정 없는 호출)이면 종전대로 사이클/장면 규칙.
     """
     out: list[FxDirective] = []
     if not lines:
         return out
     n = len(lines)
+    measured = hints is not None
     roles = [str(roles[i]) if i < len(roles) and roles[i] else "verse" for i in range(n)]
     groups = [int(groups[i]) if i < len(groups) else i for i in range(n)]
     visuals = [visuals[i] if i < len(visuals) else None for i in range(n)]
@@ -596,8 +605,12 @@ def direct_by_rules(
                     fam = family_by_group.get(g)
                     if fam is None:
                         fam = _verse_family(line, v, slot, max_letters.get(g, 0))
+                        if measured and fam in _NO_HINT_FORBIDDEN_FX:
+                            fam = "plain"
                         family_by_group[g] = fam
                     d = _build_verse(line, v, fam, slot, play_res)
+                    if measured and d.fx in _NO_HINT_FORBIDDEN_FX:
+                        d = _rule_plain(line, v)
             if validate_directive(d):
                 d = FxDirective("plain", _defaults("plain"))
         except Exception:  # noqa: BLE001 — 규칙 디렉터는 절대 예외를 내지 않는다
@@ -921,7 +934,10 @@ def direct_typeset(
     n = len(lines)
     roles = [str(roles[i]) if i < len(roles) and roles[i] else "verse" for i in range(n)]
     visuals = [visuals[i] if i < len(visuals) else None for i in range(n)]
-    hints = [hints[i] if hints is not None and i < len(hints) else None for i in range(n)]
+    # hints=None(화면 측정 없는 호출)은 그대로 넘긴다 — 규칙 디렉터의 '힌트 없는 줄 fx 금지' 는
+    # 힌트 목록이 주어진(화면을 잰) 실행에만 적용된다 (direct_by_rules 참조).
+    if hints is not None:
+        hints = [hints[i] if i < len(hints) else None for i in range(n)]
     proposal = _direct_typeset_core(lines, visuals, roles, groups, digest, provider,
                                     use_llm, play_res, hints)
     if lines:
@@ -943,8 +959,9 @@ def _direct_typeset_core(
     proposal = TypesetProposal()
     n = len(lines)
     groups = [int(groups[i]) if i < len(groups) else i for i in range(n)]
+    measured = hints is not None      # 화면을 잰 실행인지 — 규칙 디렉터의 힌트 없는 줄 fx 금지 기준
     hints = [hints[i] if hints is not None and i < len(hints) else None for i in range(n)]
-    fallback = direct_by_rules(lines, visuals, roles, groups, play_res, hints)
+    fallback = direct_by_rules(lines, visuals, roles, groups, play_res, hints if measured else None)
     proposal.directives = list(fallback)
     if not lines:
         return proposal
@@ -1011,6 +1028,14 @@ def _direct_typeset_core(
         if forced is not None and d.fx != forced:
             proposal.notes.append(
                 f"{i}번 줄: 화면 측정 힌트는 {forced} (LLM: {d.fx}) → 규칙 대체")
+            continue
+        if (forced is None and roles[i] not in _ROLE_FIXED_FX
+                and d.fx in _NO_HINT_FORBIDDEN_FX):
+            proposal.notes.append(
+                f"{i}번 줄: 화면 힌트 없는 줄에 {d.fx} 불가 (LLM: {d.fx}) → 규칙 대체")
+            if proposal.directives[i].fx in _NO_HINT_FORBIDDEN_FX:
+                # 규칙 결과는 direct_by_rules 가 이미 걸렀지만(hints 목록 전달) 방어적으로
+                proposal.directives[i] = _rule_plain(lines[i], visuals[i])
             continue
         if forced is not None:
             # 같은 fx 라도 잰 값(대각선 끝점·드리프트·강조색)은 LLM 파라미터보다 우선

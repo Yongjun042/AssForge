@@ -2592,10 +2592,18 @@ class MainWindow(QMainWindow):
             fx_line += "\n"
         else:
             fx_line = ""
+        # 화면 텍스트 트랙(원문 그래픽의 표시 구간)이 시간·위치를 준 줄 수 — 0 이면
+        # 보컬 정렬/등장 이벤트 계획만으로 만든 것이라 사용자가 싱크를 더 의심해야 한다.
+        n_tracks = int(getattr(result, "n_tracks", 0) or 0)
+        n_track_lines = int(getattr(result, "n_track_lines", 0) or 0)
+        track_line = (f"화면 텍스트 추적: 트랙 {n_tracks}개 → {n_track_lines}줄이 "
+                      f"원문 표시 구간을 그대로 사용.\n" if n_tracks
+                      else "화면 텍스트 추적: 트랙 없음 — 보컬/이벤트 타이밍만 사용.\n")
         QMessageBox.information(
             self, "가사 타이프셋 완료",
             f"{len(new_events)}줄 생성 — 그래픽 타이밍 {result.n_graphic}줄, "
             f"감지 이벤트 {result.n_events}개.\n"
+            f"{track_line}"
             f"{fx_line}"
             f"스타일 {LIGHT_STYLE}/{DARK_STYLE} 은 스타일 편집기에서 폰트 등을 "
             f"바꿀 수 있습니다.")

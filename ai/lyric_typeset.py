@@ -79,6 +79,10 @@ class _Row:
     pos: Optional[tuple[float, float]] = None
     via: str = "-"
     stack: int = -1     # 글자 스택 인덱스 (해당 없으면 -1)
+    # 화면 텍스트 트랙(media.text_timeline.TextTrack)이 시간·위치를 준 줄 — 배정된
+    # 트랙과 그 안의 구 단위 덩어리 (cx, cy, w, h — px). via 는 'track'/'stack'.
+    track: Optional[object] = None
+    unit: Optional[tuple[float, float, float, float]] = None
 
 
 def _nletters(s: Optional[str]) -> int:
@@ -379,6 +383,642 @@ def _sequence_gap_runs(pairs: list[LyricPair], rows: list[_Row]) -> int:
                     rk.end = max(new_end, rk.start + 300)
                     changed += 1
     return changed
+
+
+# ---- 화면 텍스트 트랙 배정 (media.text_timeline) ------------------------------
+#
+# track_text_presence 는 영상 전체를 훑어 화면에 그려진 텍스트 덩어리 하나하나의
+# 등장~소멸 구간(TextTrack)을 준다. 가사 줄(순서)과 트랙(시간순)을 단조 배정
+# DP 로 맞추면 줄의 시작·끝·위치를 화면에서 직접 받는다 — 보컬 정렬(plan_times)은
+# '어느 트랙이 이 줄 것인지' 고르는 사전정보와 트랙이 없는 줄의 폴백으로만 쓴다.
+#
+# 점수 (줄 묶음 → 트랙 묶음):
+#   · 신뢰 보컬(matched≥3·ratio≥0.4)과 트랙 시각의 관계 — 트랙이 보컬 시작보다
+#     0.7s 뒤 ~ 3.5s 앞에 뜨면 +10 (그래픽은 보컬보다 먼저 뜬다), 보컬 구간과
+#     겹치면 +5, 2s 안이면 −2, 멀면 −8.
+#   · 원문 글자 수 × 86px 로 추정한 폭 vs 덩어리 폭(세로는 높이, 대각선은 대각
+#     길이) — 비율 1 이면 +4, 2배/절반 이면 0, 그 밖은 −8 까지. 한 덩어리를
+#     나눠 갖는 줄들은 글자 수를 합쳐 잰다 (揺れ動く...心の侭に... 가 한 덩어리).
+#   · 제목 역할은 세로 기둥(h > 1.5w) 트랙이면 +8, 아니면 −8.
+#   · 같은 절의 구 k 개가 같은 시각(±400ms)에 시작한 트랙 묶음의 덩어리 수와 맞으면
+#     +2, 남는 덩어리는 −1 씩. 덩어리는 읽기 순(행 위→아래, 행 안 좌→우)으로 배정.
+#   · 트랙 건너뜀 −2.5 (700ms 미만 −1, 신뢰 <0.5 는 잡음으로 보고 배정 불가·비용 0),
+#     줄 건너뜀 −3 (신뢰 보컬) / −1.5 (근거 없음) / 0 (프롤로그 — 화면 원문이 없다).
+#
+# 배정 못 받은 줄은 plan_times 결과를 이웃 트랙 줄 사이로 클램프하고, 같은 절에
+# 트랙 줄이 있으면 그 블록 끝을 따른다. 제목은 세로 트랙(같은 시각의 별 장식은
+# 묶음으로 흡수), 꼬리 글자 분할은 마지막 트랙들의 글자 덩어리를 아래→위 순으로.
+
+_TRACK_MIN_CONF = 0.5          # 이 미만 신뢰의 트랙은 잡음 — 배정하지 않고 건너뜀 비용도 없다
+_TRACK_BUNDLE_MS = 400         # 같은 시각에 시작한 트랙 묶음 (text_timeline 의 묶기와 같은 값)
+_TRACK_TITLE_BUNDLE_MS = 1000  # 제목 카드는 별/머리 글자가 기둥보다 먼저 뜬다 (실측 0.5s)
+_TRACK_VOCAL_LEAD_MS = 3500    # 트랙이 보컬 시작보다 이만큼까지 앞서 뜨면 '그 줄'
+_TRACK_VOCAL_LEAD_NEAR_MS = 2500  # …이 안이면 +10, 그 밖(3.5s 까지)은 +7
+_TRACK_VOCAL_LAG_MS = 700      # …보컬 시작 뒤 이만큼까지 허용 (페이드 첫 프레임이 짧아 1프레임 늦는 실측)
+_TRACK_VOCAL_NEAR_MS = 2000
+_TRACK_SKIP_MS = 700           # 이보다 짧은 트랙은 건너뜀 비용이 작다
+_TRACK_SHORT_SKIP = 1.0
+_TRACK_SKIP = 2.5
+_TRACK_LINE_SKIP_TRUSTED = 3.0
+_TRACK_LINE_SKIP = 1.5
+_TRACK_MOVE_PX = 40.0          # 트랙 드리프트(첫→마지막 안정 프레임, px)가 이 이상이면 \move
+_TRACK_ORDER_PENALTY = 12.0    # 같은 절의 앞 구를 건너뛴 채 뒤 구를 배정하는 것의 감점
+_TRACK_DARK_MIN_CONF = 0.2
+_VERT_SIDE_PX = 60.0           # 세로 제목 번역 = 원문 기둥 중심에서 우측 60px (레퍼런스 1025 vs 962)
+_STACK_SIDE_PX = 120.0         # 글자 스택 번역 = 원문 글자 기둥에서 우측 120px (레퍼런스 1084 vs 960)
+_DIAG_SIDE_PX = 120.0          # 대각선 번역 = 원문 진행선과 평행하게 좌하로 (글자 반폭을 더한다)
+_TRACK_ATTACH_MS = 1000        # 자리 점유/번역 회피는 이만큼 이상 같이 보이는 것만 (_REGION_OCCUPY_MS 와 같음)
+_TAIL_GAP_MS = 4000            # 꼬리 글자 첫 트랙은 마지막 배정 트랙 끝(없으면 보컬 끝) 뒤 이만큼 안에 떠야 한다
+_TAIL_LEAD_MS = 2000           # …그 끝보다 이만큼까지 먼저 떠도 된다 (마지막 줄과 겹쳐 뜨는 글자)
+_TAIL_CHAIN_MS = 1500          # 다음 꼬리 글자 트랙은 앞 글자 트랙 시작 뒤 이만큼 안에 (실측 0.3~0.8s)
+_TAIL_UNIT_MAX_PX = 2 * 86.0   # 꼬리 글자 덩어리의 폭·높이 상한 (글자 2개 = 2×_REGION_GLYPH_PX) — 크레딧 줄 제외
+
+
+def _track_len(source: Optional[str], translation: Optional[str]) -> int:
+    n = _src_len(source)
+    return n if n > 0 else max(1, _nletters(translation))
+
+
+def _unit_px(c: tuple[float, float, float, float], rx: int, ry: int
+             ) -> tuple[float, float, float, float]:
+    return (float(c[0]) * rx, float(c[1]) * ry, float(c[2]) * rx, float(c[3]) * ry)
+
+
+def _track_tall(t) -> bool:
+    return float(t.h) * 1080.0 > 1.5 * float(t.w) * 1920.0
+
+
+def _track_kind(t) -> str:
+    """트랙의 배치 종류 'vertical' | 'diagonal' | 'horizontal' — 배정 단위(_track_units)·
+    힌트(_track_hint)·드리프트(_track_drift)·배치(_track_placements)가 모두 같은 판정을 쓴다
+    (힌트는 diagonal 인데 배치는 세로면 디렉터가 끝점 없는 char_diagonal 을 자동 상자로
+    그려 원문을 가로지른다).
+
+    · 잰 layout 이 vertical → 세로.
+    · diagonal 은 글자 덩어리가 2개 이상이라 진행선(첫→끝 글자)을 잴 수 있을 때만 — 단
+      세로로 긴(h > 1.5w) 트랙은 _DIAG_MIN_CLUSTERS(5)개 이상이어야 한다 (실측 転がり落ち
+      そうな 7개는 대각선, 별 장식 때문에 diagonal 로 잰 제목 기둥 cl=1 은 세로).
+    · 나머지는 세로로 길면 세로, 아니면 가로.
+    """
+    n = len(t.clusters or [])
+    if t.layout == "vertical":
+        return "vertical"
+    tall = _track_tall(t)
+    if t.layout == "diagonal" and n >= 2 and (not tall or n >= _DIAG_MIN_CLUSTERS):
+        return "diagonal"
+    return "vertical" if tall else "horizontal"
+
+
+def _track_units(t, min_len: int, rx: int, ry: int
+                 ) -> list[tuple[float, float, float, float]]:
+    """트랙의 배정 단위(px). 세로/대각선 트랙(_track_kind)은 bbox 하나 (글자 사슬 = 한 줄);
+    가로 트랙은 구 단위 클러스터 중 원문 글자 수(가장 짧은 후보)로 추정한 폭의 45%
+    이상인 것(세로 조각은 높이로) — 점·획 조각을 뺀다. 남는 게 없으면 bbox."""
+    if _track_kind(t) != "horizontal":
+        return [_unit_px((t.cx, t.cy, t.w, t.h), rx, ry)]
+    exp = _REGION_MIN_WIDTH_FRAC * max(1, min_len) * _REGION_GLYPH_PX
+    K = [_unit_px(c, rx, ry) for c in (t.clusters or [])]
+    K2 = [c for c in K if c[2] >= exp or (c[3] > 1.5 * c[2] and c[3] >= exp)]
+    if not K2:
+        K2 = [_unit_px((t.cx, t.cy, t.w, t.h), rx, ry)]
+    return K2
+
+
+def _split_unit(t, unit: tuple[float, float, float, float], lens: list[int], rx: int,
+                whole: bool) -> list[tuple[float, float, float, float]]:
+    """한 덩어리를 나눠 갖는 구들 — 원문 글자 수 비례로 가로 분할. whole(그 트랙의 유일한
+    단위)이면 트랙의 경로 중앙값 bbox 를 쓴다 (첫 프레임 클러스터에는 뒤에 뜬 구가 빠져
+    있다: 揺れ動く...心の侭に...); 여러 단위 중 하나면 그 덩어리 폭만."""
+    bw = max(float(unit[2]), float(t.w) * rx) if whole else float(unit[2])
+    bx = float(t.cx) * rx if bw > float(unit[2]) else float(unit[0])
+    total = max(1, sum(lens))
+    out: list[tuple[float, float, float, float]] = []
+    x0 = bx - bw / 2.0
+    for ln in lens:
+        w = bw * ln / total
+        out.append((x0 + w / 2.0, float(unit[1]), w, float(unit[3])))
+        x0 += w
+    return out
+
+
+def _width_score(unit: tuple[float, float, float, float], layout: str, total_len: int) -> float:
+    import math
+    exp = max(1, total_len) * _REGION_GLYPH_PX
+    if layout == "vertical" or unit[3] > 1.5 * unit[2]:
+        meas = unit[3]
+    elif layout == "diagonal":
+        meas = math.hypot(unit[2], unit[3])
+    else:
+        meas = unit[2]
+    r = max(1e-3, meas) / exp
+    return max(-8.0, min(4.0, 4.0 - 6.0 * abs(math.log(r))))
+
+
+def _vocal_score(al: LineAlignment, t) -> float:
+    vs, ve = int(al.start_ms), int(al.end_ms)
+    lead = vs - int(t.start_ms)
+    if -_TRACK_VOCAL_LAG_MS <= lead <= _TRACK_VOCAL_LEAD_MS:
+        # 실측 그래픽 선행 1~2s; 2.5s 를 넘는 선행은 블록의 뒤 구(같이 뜬 뒤 나중에 부름)라
+        # 조금 약하게 — 검출 안 된 구가 이웃 덩어리를 훔치는 근거가 되지 않게
+        return 10.0 if lead <= _TRACK_VOCAL_LEAD_NEAR_MS else 7.0
+    if int(t.start_ms) < ve and int(t.end_ms) > vs:
+        return 5.0
+    if int(t.start_ms) > ve + _TRACK_VOCAL_NEAR_MS or int(t.end_ms) < vs - _TRACK_VOCAL_NEAR_MS:
+        return -8.0
+    return -2.0
+
+
+def _trusted(al: Optional[LineAlignment]) -> bool:
+    return (al is not None and int(al.matched_token_count) >= 3
+            and float(al.match_ratio) >= 0.4)
+
+
+def _vocal_weight(al: Optional[LineAlignment]) -> float:
+    """보컬 정렬의 근거 가중치 — 신뢰(3토큰·0.4) 1.0, 약한 근거(2토큰·0.5) 0.5, 아니면 0."""
+    if _trusted(al):
+        return 1.0
+    if al is not None and int(al.matched_token_count) >= 2 and float(al.match_ratio) >= 0.5:
+        return 0.5
+    return 0.0
+
+
+def _line_kinds(pairs: list[LyricPair]) -> tuple[list[str], list[int]]:
+    """줄별 역할('title'|'prologue'|'verse'|'tail') 과 꼬리 인덱스 — plan_times 와
+    _role_of 의 규칙을 트랙 배정 전(시간이 없을 때)에 적용한 것."""
+    n = len(pairs)
+    tail: list[int] = []
+    for i in range(n - 1, -1, -1):
+        if pairs[i].source and _nletters(pairs[i].source) <= _TAIL_MAX_LETTERS:
+            tail.append(i)
+        else:
+            break
+    tail.reverse()
+    kinds = ["verse"] * n
+    for i in tail:
+        kinds[i] = "tail"
+    for i in range(n):
+        if kinds[i] == "tail":
+            continue
+        role = _role_of(pairs, i, _Row(start=0, end=1, via="gap"))
+        if role in ("title", "prologue"):
+            kinds[i] = role
+    return kinds, tail
+
+
+def assign_tracks(
+    pairs: list[LyricPair],
+    groups: list[int],
+    aligns: list[Optional[LineAlignment]],
+    tracks: list,
+    events: list[GraphicEvent],
+    vocal_end_ms: int,
+    base_rows: Optional[list[_Row]] = None,
+    play_res: tuple[int, int] = (1920, 1080),
+) -> list[_Row]:
+    """가사 줄 ↔ 화면 텍스트 트랙 단조 배정 → 줄별 _Row (시간·위치는 트랙에서).
+
+    Args:
+        tracks: media.text_timeline.track_text_presence 결과 (좌표 0..1). 비면
+            base_rows(또는 plan_times 결과)를 그대로 돌려준다.
+        base_rows: 이미 계산한 plan_times 결과 — 배정 못 받은 줄의 폴백. 없으면
+            여기서 plan_times 를 부른다.
+    결과 _Row: 배정 줄은 start/end = 트랙(묶음) 구간, pos = 덩어리 중심(0..1),
+    via='track', track/unit 채움. 꼬리 글자는 via='stack', stack=k. 결정적, 예외 없음.
+    """
+    n = len(pairs)
+    base = (list(base_rows) if base_rows is not None and len(base_rows) == n
+            else plan_times(pairs, groups, aligns, events, vocal_end_ms))
+    tr = sorted((t for t in (tracks or []) if int(t.end_ms) > int(t.start_ms)),
+                key=lambda t: (int(t.start_ms), float(t.cy), float(t.cx)))
+    if not tr or n == 0:
+        return base
+    rx, ry = int(play_res[0]), int(play_res[1])
+    kinds, tail = _line_kinds(pairs)
+    L = tail[0] if tail else n
+    m = len(tr)
+    usable = [float(t.confidence) >= _TRACK_MIN_CONF for t in tr]
+    lens = [_track_len(p.source, p.translation) for p in pairs]
+    trusted = [_trusted(aligns[i] if i < len(aligns) else None) for i in range(n)]
+    vweight = [_vocal_weight(aligns[i] if i < len(aligns) else None) for i in range(n)]
+
+    def skip_line(i: int) -> float:
+        if kinds[i] == "prologue":
+            return 0.0
+        if kinds[i] == "title":
+            return 2.0
+        return _TRACK_LINE_SKIP_TRUSTED if trusted[i] else _TRACK_LINE_SKIP
+
+    def skip_track(j: int) -> float:
+        if not usable[j]:
+            return 0.0
+        t = tr[j]
+        return _TRACK_SKIP if int(t.end_ms) - int(t.start_ms) >= _TRACK_SKIP_MS else _TRACK_SHORT_SKIP
+
+    unit_cache: dict[tuple[int, int], list[tuple[float, float, float, float]]] = {}
+
+    def units_of(j: int, min_len: int) -> list[tuple[float, float, float, float]]:
+        key = (j, min_len)
+        if key not in unit_cache:
+            unit_cache[key] = _track_units(tr[j], min_len, rx, ry)
+        return unit_cache[key]
+
+    def score(lines: list[int], bundle: list[int]
+              ) -> tuple[float, list[tuple[int, tuple[float, float, float, float]]]]:
+        """(점수, 줄별 (트랙 인덱스, 덩어리 px))."""
+        min_len = min(lens[i] for i in lines)
+        units: list[tuple[tuple[float, float, float, float], int]] = []
+        for j in bundle:
+            for u in units_of(j, min_len):
+                units.append((u, j))
+        k, c = len(lines), len(units)
+        if c == 0:
+            return (-1e9, [])
+        by_unit = {u: j for u, j in units}
+        if k <= c:
+            top = sorted(units, key=lambda z: -(z[0][2] * z[0][3]))[:k]
+            chosen = [u for u, _j in top]
+            rest = [u for u, _j in units if u not in chosen]
+        else:
+            chosen = [u for u, _j in units]
+            rest = []
+        order = _reading_order(chosen)
+        assign: list[tuple[int, tuple[float, float, float, float]]] = []
+        if k <= c:
+            assign = [(by_unit[u], u) for u in order]
+        else:
+            # 마지막 덩어리를 남은 구들이 나눠 갖는다 — 트랙 bbox 를 글자 수 비례로 분할
+            for u in order[:-1]:
+                assign.append((by_unit[u], u))
+            last = order[-1]
+            sharers = lines[len(order) - 1:]
+            whole = sum(1 for _u, jj in units if jj == by_unit[last]) == 1
+            for su in _split_unit(tr[by_unit[last]], last, [lens[i] for i in sharers], rx, whole):
+                assign.append((by_unit[last], su))
+        s = 0.0
+        n_split = max(0, k - len(order))
+        for t_, (j, u) in enumerate(assign):
+            i = lines[t_]
+            t = tr[j]
+            if kinds[i] == "title":
+                s += 8.0 if _track_tall(t) else -8.0
+            else:
+                ws = _width_score(u, t.layout, lens[i])
+                s += ws
+                if n_split and t_ >= len(order) - 1 and ws < 0:
+                    # 나눠 가진 bbox 가 구들을 담기에 좁다 — 검출 안 된 구(저대비 색 원문)를
+                    # 이웃 덩어리에 억지로 태우는 것. 비신뢰 폭의 공유는 크게 감점.
+                    s -= 6.0
+            if vweight[i] > 0:
+                s += vweight[i] * _vocal_score(aligns[i], t)
+        # 남는 덩어리 — 고른 것의 절반 이상 크기면(다른 구) −1 씩, 작은 조각(별 장식·머리
+        # 글자)은 묶음에 흡수. 덩어리 수가 구 수와 맞으면 줄마다 +1.
+        min_area = min(u[2] * u[3] for u in chosen)
+        big_rest = [u for u in rest if u[2] * u[3] >= 0.5 * min_area]
+        if not big_rest and k >= c - len(rest):
+            s += 1.0 * k
+        s -= 1.0 * len(big_rest)
+        # 같은 시각에 시작한 다음 트랙을 묶음에서 뺐다 — 같이 뜬 구들은 한 묶음이 정상 (−2)
+        nxt = bundle[-1] + 1
+        if (nxt < m and usable[nxt]
+                and int(tr[nxt].start_ms) <= int(tr[bundle[0]].start_ms) + _TRACK_BUNDLE_MS):
+            s -= 2.0
+        return (s, assign)
+
+    NEG = float("-inf")
+    # 상태 (i, j, f): 줄 i개·트랙 j개 소비, f=1 이면 직전 줄을 건너뛰었다. 같은 절의 앞
+    # 구를 건너뛴 채 뒤 구부터 배정하는 것은 −12 — 화면의 구 덩어리는 읽기 순 = 구 순이라
+    # 덩어리가 모자라면 뒤 구가 빠진 것이지 앞 구가 빠진 게 아니다 (검출 안 된 저대비
+    # 원문(春の陽を)에 신뢰 보컬이 있어도 앞 구의 덩어리를 훔치지 않게).
+    best = [[[NEG, NEG] for _ in range(m + 1)] for _ in range(L + 1)]
+    back: list[list[list[Optional[tuple]]]] = [[[None, None] for _ in range(m + 1)] for _ in range(L + 1)]
+    best[0][0][0] = 0.0
+
+    def relax(i2: int, j2: int, f2: int, val: float, how: tuple) -> None:
+        if val > best[i2][j2][f2]:
+            best[i2][j2][f2] = val
+            back[i2][j2][f2] = how
+
+    for i in range(L + 1):
+        for j in range(m + 1):
+            for f in (0, 1):
+                cur = best[i][j][f]
+                if cur == NEG:
+                    continue
+                if i < L:
+                    relax(i + 1, j, 1, cur - skip_line(i), ("L", f))
+                if j < m:
+                    relax(i, j + 1, f, cur - skip_track(j), ("T", f))
+                if not (i < L and j < m and kinds[i] != "prologue" and usable[j]):
+                    continue
+                order_pen = 0.0
+                if (f == 1 and i > 0 and kinds[i] == "verse" and kinds[i - 1] == "verse"
+                        and groups[i - 1] == groups[i]):
+                    order_pen = _TRACK_ORDER_PENALTY
+                tol = _TRACK_TITLE_BUNDLE_MS if kinds[i] == "title" else _TRACK_BUNDLE_MS
+                bundles: list[list[int]] = []
+                b = [j]
+                bundles.append(list(b))
+                for j2 in range(j + 1, m):
+                    if int(tr[j2].start_ms) > int(tr[j].start_ms) + tol or not usable[j2]:
+                        break
+                    b.append(j2)
+                    bundles.append(list(b))
+                line_sets: list[list[int]] = [[i]]
+                if kinds[i] == "verse":
+                    ls = [i]
+                    for i2 in range(i + 1, L):
+                        if kinds[i2] != "verse" or groups[i2] != groups[i]:
+                            break
+                        ls.append(i2)
+                        line_sets.append(list(ls))
+                for bundle in bundles:
+                    for lines in line_sets:
+                        s, asg = score(lines, bundle)
+                        relax(i + len(lines), j + len(bundle), 0, cur + s - order_pen,
+                              ("A", f, lines, bundle, asg))
+
+    rows = [_Row() for _ in range(n)]
+    i, j = L, m
+    f = 0 if best[L][m][0] >= best[L][m][1] else 1
+    last_used = -1
+    assigned: dict[int, tuple[int, list[int], tuple[float, float, float, float]]] = {}
+    while i > 0 or j > 0:
+        how = back[i][j][f]
+        if how is None:
+            break
+        if how[0] == "L":
+            i -= 1
+            f = how[1]
+        elif how[0] == "T":
+            j -= 1
+            f = how[1]
+        else:
+            _tag, f, lines, bundle, asg = how
+            for t_, li in enumerate(lines):
+                assigned[li] = (asg[t_][0], list(bundle), asg[t_][1])
+            i -= len(lines)
+            j -= len(bundle)
+    used_tracks = sorted({tj for tj, _b, _u in assigned.values()})
+    for li, (tj, bundle, u) in assigned.items():
+        last_used = max(last_used, max(bundle))
+        t = tr[tj]
+        r = rows[li]
+        shared = [x for x, (_xj, xb, _u) in assigned.items() if xb == bundle]
+        if len(shared) == 1:
+            r.start = min(int(tr[jj].start_ms) for jj in bundle)
+        else:
+            r.start = int(t.start_ms)
+        # 끝은 실제로 덩어리를 준 트랙(들)의 끝 — 묶음에 인접성 검사 없이 흡수된 작은 잡음
+        # 트랙(별·꽃잎)이 더 오래 남아도 줄의 끝을 늘리지 않는다
+        givers = {xj for x, (xj, xb, _u) in assigned.items() if xb == bundle}
+        r.end = max(int(tr[jj].end_ms) for jj in givers)
+        r.pos = (u[0] / rx, u[1] / ry)
+        r.via = "track"
+        r.track = t
+        r.unit = u
+
+    # 배정 못 받은 줄 — plan_times 결과를 이웃 트랙 줄 사이로 클램프
+    for i in range(L):
+        if rows[i].start is not None:
+            continue
+        b = base[i]
+        prev_s = max((rows[k].start for k in range(i) if rows[k].start is not None), default=None)
+        nxt = [rows[k] for k in range(i + 1, L) if rows[k].start is not None]
+        next_s = nxt[0].start if nxt else None
+        start = b.start
+        if start is None:
+            start = (prev_s + 300) if prev_s is not None else (next_s - 300 if next_s is not None else 0)
+        if prev_s is not None and start < prev_s:
+            start = prev_s + 300
+        if next_s is not None and start > next_s:
+            start = (prev_s + 300) if prev_s is not None and prev_s + 300 < next_s else max(0, next_s - 300)
+        mates = [rows[k].end for k in range(L) if k != i and groups[k] == groups[i]
+                 and rows[k].via == "track" and rows[k].end is not None]
+        # 끝: 같은 절의 트랙 줄이 있으면 블록 공통 끝, 아니면 다음 트랙 줄의 시작
+        # (화면 텍스트는 다음 줄이 뜰 때까지 남는 게 보통 — 프롤로그는 첫 가사에서 사라진다)
+        if mates and max(mates) > start:
+            end = max(mates)
+        elif next_s is not None and next_s > start:
+            end = next_s
+        else:
+            end = b.end if b.end is not None and b.end > start else start + 4000
+        rows[i].start, rows[i].end = int(start), int(max(end, start + 300))
+        rows[i].pos = b.pos
+        rows[i].via = b.via if b.via != "-" else "gap"
+
+    # 꼬리 글자 분할 — 마지막 배정 트랙 뒤의 글자 덩어리 트랙들을 아래→위, 시간순으로.
+    # 후보는 (a) 글자 크기 덩어리(폭·높이 ≤ 2글자)를 가진 트랙 중 (b) 첫 트랙은 마지막 배정
+    # 트랙 끝(없으면 보컬 끝)의 −2s~+4s 안에 뜨고, 다음 트랙은 앞 글자 트랙 시작 뒤 1.5s
+    # 안에 잇따라 뜨는 것 — 엔딩 크레딧·뒤 장식 트랙이 글자 스택의 끝을 늘리거나 자리를
+    # 차지하지 않게. 끝은 실제로 글자를 준 트랙들의 최대 끝.
+    if tail:
+        anchor = (max(int(tr[j].end_ms) for j in used_tracks) if used_tracks
+                  else int(vocal_end_ms))
+        tail_tracks = []
+        for j in range(last_used + 1, m):
+            if not usable[j]:
+                continue
+            t = tr[j]
+            cl = [_unit_px(c, rx, ry) for c in (t.clusters or [])] or [_unit_px((t.cx, t.cy, t.w, t.h), rx, ry)]
+            letters = [c for c in cl if c[2] <= _TAIL_UNIT_MAX_PX and c[3] <= _TAIL_UNIT_MAX_PX]
+            if not letters:
+                continue
+            s_ms = int(t.start_ms)
+            if not tail_tracks:
+                if s_ms > anchor + _TAIL_GAP_MS:
+                    break
+                if s_ms < anchor - _TAIL_LEAD_MS:
+                    continue
+            elif s_ms > int(tail_tracks[-1][0].start_ms) + _TAIL_CHAIN_MS:
+                break
+            tail_tracks.append((t, letters))
+        if tail_tracks:
+            units: list[tuple[int, tuple[float, float, float, float], int]] = []
+            for ti, (t, letters) in enumerate(tail_tracks):
+                for c in sorted(letters, key=lambda c: -c[1]):
+                    units.append((int(t.start_ms), c, ti))
+            units.sort(key=lambda z: (z[0], -z[1][1]))
+            nt = len(tail)
+            units = units[:nt]
+            end_ms = max(int(tail_tracks[ti][0].end_ms) for _s, _c, ti in units)
+            for k, i in enumerate(tail):
+                if k < len(units):
+                    s_ms, u, _ti = units[k]
+                else:
+                    s_last, u, _ti = units[-1]
+                    s_ms = s_last + (end_ms - s_last) * (k - len(units) + 1) // (nt - len(units) + 1)
+                rows[i].start, rows[i].end = int(s_ms), int(end_ms)
+                rows[i].pos = (u[0] / rx, u[1] / ry)
+                rows[i].via, rows[i].stack = "stack", k
+                rows[i].track, rows[i].unit = tail_tracks[0][0], u
+        else:
+            for k, i in enumerate(tail):
+                rows[i] = base[i]
+
+    # 같은 절의 트랙 줄이 거의 같이(≤1s) 끝나면 블록 공통 끝
+    by_group: dict[int, list[int]] = {}
+    for i in range(L):
+        if rows[i].via == "track":
+            by_group.setdefault(groups[i], []).append(i)
+    for idxs in by_group.values():
+        ends = [rows[i].end for i in idxs]
+        if len(idxs) >= 2 and max(ends) - min(ends) <= 1000:
+            for i in idxs:
+                rows[i].end = max(ends)
+
+    prev = 0
+    for r in rows:
+        if r.start is None:
+            continue
+        r.start = max(int(r.start), prev)
+        r.end = max(int(r.end), r.start + 300)
+        prev = r.start
+    return rows
+
+
+def _track_hint(t, unit: tuple[float, float, float, float],
+                drift: Optional[tuple[float, float]], rx: int, ry: int,
+                diag: Optional[tuple[tuple[float, float], tuple[float, float]]] = None,
+                kind: Optional[str] = None) -> dict:
+    """트랙에서 만든 디렉터 힌트 (typeset_director.hint_fx 가 읽는 꼴, px). layout 은
+    배치가 쓴 kind(_track_kind; 제목 역할이면 vertical) 와 같다 — diag 없는 diagonal 은 내지 않는다."""
+    import math
+    clusters = [_unit_px(c, rx, ry) for c in (t.clusters or [])] or [unit]
+    layout = kind or _track_kind(t)
+    if layout == "diagonal" and diag is None:
+        layout = "horizontal"
+    angle = 0.0
+    if diag is not None:
+        angle = math.degrees(math.atan2(diag[1][1] - diag[0][1], diag[1][0] - diag[0][0]))
+    # 밝은 장면(검은 글자)의 강조색은 꽃잎 같은 배경 색을 잡은 것 (실측 63s/82s 분홍) — 쓰지 않는다
+    accent = t.accent_color if (t.accent_color and not t.dark_text) else None
+    return {
+        "layout": layout,
+        "angle_deg": angle,
+        "drift": drift,
+        "scale": 1.0,
+        "accent_color": accent,
+        "accent_full": False,
+        "dark_text": bool(t.dark_text),
+        "bbox": _cluster_bbox([unit]),
+        "clusters": clusters,
+        "confidence": float(t.confidence),
+        "diag_start": diag[0] if diag else None,
+        "diag_end": diag[1] if diag else None,
+        "source": "track",
+    }
+
+
+def _track_drift(t, rx: int, ry: int) -> Optional[tuple[float, float]]:
+    """트랙의 첫→마지막 안정 프레임 이동(px). 가로 한 줄(높이 ≤150px)일 때만 믿는다 —
+    여러 행이 붙은 트랙은 행이 뜨고 지며 bbox 중심이 흔들린다. 세로/대각선은 None
+    (배치가 연출을 정한다)."""
+    if _track_kind(t) != "horizontal":
+        return None
+    if float(t.h) * ry > _SINGLE_LINE_H_PX or float(t.confidence) < _TRACK_MIN_CONF:
+        return None
+    d = (float(t.drift[0]) * rx, float(t.drift[1]) * ry)
+    if (d[0] ** 2 + d[1] ** 2) ** 0.5 < _TRACK_MOVE_PX:
+        return (0.0, 0.0)
+    return _cap_drift(d)
+
+
+def _track_placements(
+    pairs: list[LyricPair],
+    rows: list[_Row],
+    tracks: Optional[list],
+    rx: int,
+    ry: int,
+) -> dict[int, _RegionPlace]:
+    """트랙이 배정된 줄의 번역 자리 (px) — pairs 인덱스별 _RegionPlace.
+
+    · 세로 기둥(제목·세로 원문): 기둥 중심 우측 60px (프레임 밖이면 좌측).
+    · 대각선: 원문 첫 글자→끝 글자 진행선과 평행하게, 그 아래(좌하)로 120px +
+      글자 반폭 비켜 놓는다 — (x,y) 는 시작점, 힌트의 diag_end 는 같은 만큼 옮긴 끝점.
+    · 가로: _offset_place (원문 위 → 아래 → 열 맨 아래 → 옆) — 같은 시간에 화면에
+      있는 다른 원문 덩어리(모든 트랙의 클러스터, 신뢰 ≥0.5)와 먼저 놓인 번역을 피한다.
+    꼬리(stack)는 _place_lines 가 기둥 규칙으로 놓는다. 결정적, 예외 없음.
+    """
+    out: dict[int, _RegionPlace] = {}
+    timed = [i for i, r in enumerate(rows) if r.start is not None and r.track is not None
+             and r.unit is not None and r.stack < 0]
+    if not timed:
+        return out
+    all_tracks = [t for t in (tracks or []) if float(t.confidence) >= _TRACK_MIN_CONF]
+    seen = {id(t) for t in all_tracks}
+    for i in timed:
+        t = rows[i].track
+        if id(t) not in seen:
+            all_tracks.append(t)
+            seen.add(id(t))
+    jp: list[tuple[int, int, tuple[float, float, float, float]]] = []
+    for t in all_tracks:
+        cl = [_unit_px(c, rx, ry) for c in (t.clusters or [])] or [_unit_px((t.cx, t.cy, t.w, t.h), rx, ry)]
+        for c in cl:
+            jp.append((int(t.start_ms), int(t.end_ms), c))
+    korean: list[tuple[int, int, tuple[float, float, float, float]]] = []
+    lo_x, hi_x = _FRAME_LO * rx, _FRAME_HI * rx
+    lo_y, hi_y = _FRAME_LO * ry, _FRAME_HI * ry
+
+    def _text_of(i: int) -> str:
+        p = pairs[i]
+        return p.translation or p.reading or p.source or ""
+
+    for i in sorted(timed, key=lambda k: (rows[k].start, k)):
+        r = rows[i]
+        t, c = r.track, r.unit
+        role = _role_of(pairs, i, r)
+        kind = _track_kind(t)
+        vertical = role == "title" or kind == "vertical"
+        drift = _track_drift(t, rx, ry)
+        if drift is not None and not any(drift):
+            drift = None
+        diag = None
+        if not vertical and kind == "diagonal":
+            cl = sorted((_unit_px(k, rx, ry) for k in t.clusters), key=lambda k: (k[0], k[1]))
+            sx, sy = cl[0][0], cl[0][1]
+            ex, ey = cl[-1][0], cl[-1][1]
+            dx, dy = ex - sx, ey - sy
+            norm = (dx ** 2 + dy ** 2) ** 0.5 or 1.0
+            dx, dy = dx / norm, dy / norm
+            # 진행선의 아래쪽 법선 (y 가 커지는 쪽)
+            nx, ny = (-dy, dx) if dx >= 0 else (dy, -dx)
+            half = 0.5 * sorted(max(k[2], k[3]) for k in cl)[len(cl) // 2]
+            off = _DIAG_SIDE_PX + half
+            sx2, sy2, ex2, ey2 = sx + nx * off, sy + ny * off, ex + nx * off, ey + ny * off
+            # 두 끝점이 프레임 띠 안에 남도록 평행 이동
+            shift_x = max(lo_x - min(sx2, ex2), 0.0) or min(hi_x - max(sx2, ex2), 0.0)
+            shift_y = max(lo_y - min(sy2, ey2), 0.0) or min(hi_y - max(sy2, ey2), 0.0)
+            diag = ((sx2 + shift_x, sy2 + shift_y), (ex2 + shift_x, ey2 + shift_y))
+        hint = _track_hint(t, c, drift, rx, ry, diag, "vertical" if vertical else kind)
+        kw = _KOR_LINE_H if vertical else _est_width(_text_of(i))
+        if vertical:
+            x = c[0] + _VERT_SIDE_PX
+            if x + kw / 2.0 > hi_x:
+                x = c[0] - _VERT_SIDE_PX
+            x, y = min(hi_x, max(lo_x, x)), min(hi_y, max(lo_y, c[1]))
+            bounds = _cluster_bbox([c])
+        elif diag is not None:
+            x, y = diag[0]
+            bounds = _cluster_bbox([(min(diag[0][0], diag[1][0]) + abs(diag[1][0] - diag[0][0]) / 2.0,
+                                     min(diag[0][1], diag[1][1]) + abs(diag[1][1] - diag[0][1]) / 2.0,
+                                     abs(diag[1][0] - diag[0][0]) + kw / 4.0,
+                                     abs(diag[1][1] - diag[0][1]) + _KOR_LINE_H)])
+        else:
+            occ = [o for s, e, o in jp
+                   if min(e, r.end) - max(s, r.start) >= _TRACK_ATTACH_MS and not _same_slot(o, c)]
+            kor = [rect for s, e, rect in korean
+                   if min(e, r.end) - max(s, r.start) >= _TRACK_ATTACH_MS]
+            x, y = _offset_place(c, kw, occ, kor, rx, ry)
+            bounds = tuple(int(round(v)) for v in
+                           (x - kw / 2.0, y - _KOR_LINE_H / 2.0, x + kw / 2.0, y + _KOR_LINE_H / 2.0))
+        if hint.get("drift") is not None:
+            hint["drift"] = _fit_drift(x, y, hint["drift"], rx, ry)
+        rect = (x - kw / 2.0, y - _KOR_LINE_H / 2.0, x + kw / 2.0, y + _KOR_LINE_H / 2.0)
+        korean.append((int(r.start), int(r.end), rect))
+        out[i] = _RegionPlace(x=float(x), y=float(y), bounds=bounds, own=[c], hint=hint,  # type: ignore[arg-type]
+                              leader=True)
+    return out
 
 
 # ---- 화면 텍스트 영역 기반 배치 ---------------------------------------------
@@ -689,7 +1329,8 @@ def _offset_place(
                   and _STACK_DY[0] <= abs(o[1] - cy) <= _STACK_DY[1]
                   for o in occupied)
     if vertical:
-        cands = ([left, right] if cx >= rx / 2.0 else [right, left]) + [above, below]
+        # 세로 기둥 옆의 세로 번역 — 레퍼런스는 기둥 중심 우측 60px (1025 vs 962)
+        cands = [(cx + _VERT_SIDE_PX, cy), (cx - _VERT_SIDE_PX, cy), left, right, above, below]
     elif x1 > _RIGHT_EDGE_FRAC * rx and stacked:
         cands = [left, above, below, stack_bottom()]
     else:
@@ -1053,16 +1694,19 @@ def _place_lines(
     play_res_y: int,
     regions: Optional[list[Optional[TextRegion]]] = None,
     groups: Optional[list[int]] = None,
+    tracks: Optional[list] = None,
 ) -> list[_Placed]:
-    """계획 + 시각 분석(+ 텍스트 영역) → 좌표/텍스트/흑백 결정 (태그 없음).
+    """계획 + 시각 분석(+ 텍스트 영역/트랙) → 좌표/텍스트/흑백 결정 (태그 없음).
 
     compose_lines(태그 직접 생성)와 to_fx_lines(AI 연출 확장)가 같은 로직을
     쓰도록 뽑아낸 헬퍼. visuals·regions 는 시간 있는 줄 순서.
 
-    좌표 우선순위: 텍스트 영역(_region_placements) > 등장 이벤트 중심(r.pos)
-    > 장면 돌출 중심 > 하단 중앙. 흑백: 영역 dark_text(신뢰 ≥0.2) > 장면 밝기.
-    드리프트(\\move): 영역 배치 줄은 영역 드리프트(신뢰 시 ≥40px) 만, 아니면
-    장면 변화 중심의 드리프트.
+    좌표 우선순위: 화면 텍스트 트랙(_track_placements — assign_tracks 가 rows 에
+    남긴 track/unit) > 텍스트 영역(_region_placements) > 등장 이벤트 중심(r.pos)
+    > 장면 돌출 중심 > 하단 중앙. 흑백: 트랙 dark_text > 영역 dark_text(신뢰 ≥0.2)
+    > 장면 밝기. 드리프트(\\move): 트랙/영역 배치 줄은 그 드리프트(신뢰 시 ≥40px)
+    만, 아니면 장면 변화 중심의 드리프트. tracks 는 자리 점유(같은 시간의 다른
+    원문) 계산용 — 없으면 rows 에 배정된 트랙만.
     """
     out: list[_Placed] = []
     n_stack = sum(1 for r in rows if r.stack >= 0)
@@ -1070,6 +1714,9 @@ def _place_lines(
     placed_by_region = (_region_placements(pairs, rows, regions, play_res_x, play_res_y,
                                            groups, list(visuals))
                         if regions else {})
+    placed_by_track = (_track_placements(pairs, rows, tracks, play_res_x, play_res_y)
+                       if any(r.track is not None for r in rows) else {})
+    placed_by_region.update(placed_by_track)
     wi = 0
     for i, (p, r) in enumerate(zip(pairs, rows)):
         if r.start is None:
@@ -1093,12 +1740,20 @@ def _place_lines(
             x = int(round(min(_FRAME_HI * play_res_x, max(_FRAME_LO * play_res_x, rp.x))))
             y = int(round(min(_FRAME_HI * play_res_y, max(_FRAME_LO * play_res_y, rp.y))))
         if r.stack >= 0:
-            # 글자 스택 — 아래→위 (완성본 패턴). x 는 영역이 잡은 기둥 위치.
+            # 글자 스택 — 아래→위 (완성본 패턴). x 는 트랙(원문 글자 기둥 우측 120px)
+            # 또는 영역이 잡은 기둥 위치.
             y = round(play_res_y * (0.833 - r.stack * (0.6 / max(1, n_stack - 1))))
-            if _region_usable(tr):
+            if r.unit is not None:
+                sx = r.unit[0] + _STACK_SIDE_PX
+                if sx > _FRAME_HI * play_res_x:
+                    sx = r.unit[0] - _STACK_SIDE_PX
+                x = int(round(min(_FRAME_HI * play_res_x, max(_FRAME_LO * play_res_x, sx))))
+            elif _region_usable(tr):
                 x = int(round(min(_FRAME_HI * play_res_x,
                                   max(_FRAME_LO * play_res_x, tr.cx * play_res_x))))
-        if tr is not None and tr.sampled and tr.confidence >= _REGION_DARK_MIN_CONF:
+        if r.track is not None and float(r.track.confidence) >= _TRACK_DARK_MIN_CONF:
+            dark = bool(r.track.dark_text)
+        elif tr is not None and tr.sampled and tr.confidence >= _REGION_DARK_MIN_CONF:
             dark = bool(tr.dark_text)
         else:
             dark = bool(v is not None and v.sampled
@@ -1135,14 +1790,15 @@ def compose_lines(
     play_res_y: int = 1080,
     regions: Optional[list[Optional[TextRegion]]] = None,
     groups: Optional[list[int]] = None,
+    tracks: Optional[list] = None,
 ) -> list[PlannedLine]:
-    """계획 + 시각 분석(+ 텍스트 영역) → 태그 붙은 최종 줄. visuals·regions 는 시간 있는 줄 순서.
+    """계획 + 시각 분석(+ 텍스트 영역/트랙) → 태그 붙은 최종 줄. visuals·regions 는 시간 있는 줄 순서.
 
     같은 자리(같은 영역 bbox 를 공유하는 구들 등)에 동시에 뜨는 줄은
     _spread_collisions 로 벌린다 — 영역 좌표는 고정(pinned)이라 서로 떨어진
     영역 줄끼리는 움직이지 않는다.
     """
-    placed = _place_lines(pairs, rows, visuals, play_res_x, play_res_y, regions, groups)
+    placed = _place_lines(pairs, rows, visuals, play_res_x, play_res_y, regions, groups, tracks)
     # 글자 스택(꼬리)은 세로 기둥이라 벌리기에서 제외 — 글자 간격(<220px)이 충돌로 보인다.
     body = [pl for pl in placed if pl.row.stack < 0]
     pts = [_XY(pl.text, int(pl.row.start), int(pl.row.end), pl.x, pl.y) for pl in body]
@@ -1196,10 +1852,14 @@ def _role_of(pairs: list[LyricPair], i: int, r: _Row,
     p = pairs[i]
     if r.stack >= 0:
         return "tail"
-    if (i == 0 and not p.reading and r.via in ("gap", "-", "vocal0")
+    if (i == 0 and not p.reading and r.via in ("gap", "-", "vocal0", "track")
             and any(q.reading for q in pairs)):
         return "title"
-    if (i > 0 and region is not None and region.layout == "vertical"
+    layout = region.layout if region is not None else None
+    if r.track is not None:
+        # 트랙이 배정된 줄은 트랙의 배치가 우선 (세로 기둥 = 제목 카드 재등장)
+        layout = getattr(r.track, "layout", layout)
+    if (i > 0 and layout == "vertical"
             and p.source and pairs[0].source and not pairs[0].reading
             and any(q.reading for q in pairs)
             and _letters_similarity(pairs[0].source, p.source) >= 0.75):
@@ -1407,8 +2067,9 @@ def place_fx_lines(
     play_res: tuple[int, int] = (1920, 1080),
     regions: Optional[list[Optional[TextRegion]]] = None,
     groups: Optional[list[int]] = None,
+    tracks: Optional[list] = None,
 ) -> "tuple[list, list[str], list[int], list[Optional[dict]]]":
-    """계획 + 시각 분석(+ 텍스트 영역) → 태그 없는 FxLine 목록 (AI 연출 디렉터 입력).
+    """계획 + 시각 분석(+ 텍스트 영역/트랙) → 태그 없는 FxLine 목록 (AI 연출 디렉터 입력).
 
     compose_lines 와 같은 좌표/텍스트/스타일/흑백 결정을 공유하되, 동시에 같은
     자리에 뜨는 줄들은 _spread_collisions 로 좌우/계단 배치한다 (디렉터·확장기
@@ -1435,7 +2096,7 @@ def place_fx_lines(
     from effects.typeset_fx_schema import FxLine
 
     rx, ry = int(play_res[0]), int(play_res[1])
-    placed = _place_lines(pairs, rows, visuals, rx, ry, regions, groups)
+    placed = _place_lines(pairs, rows, visuals, rx, ry, regions, groups, tracks)
     fx_lines: list = []
     roles: list[str] = []
     row_indices: list[int] = []
@@ -1493,10 +2154,11 @@ def to_fx_lines(
     play_res: tuple[int, int] = (1920, 1080),
     regions: Optional[list[Optional[TextRegion]]] = None,
     groups: Optional[list[int]] = None,
+    tracks: Optional[list] = None,
 ) -> "tuple[list, list[str], list[int]]":
     """place_fx_lines 의 (fx_lines, roles, row_indices) — 힌트가 필요 없는 호출자용."""
     fx_lines, roles, row_indices, _hints = place_fx_lines(
-        pairs, rows, visuals, play_res, regions, groups)
+        pairs, rows, visuals, play_res, regions, groups, tracks)
     return fx_lines, roles, row_indices
 
 

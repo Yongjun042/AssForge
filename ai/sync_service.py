@@ -369,6 +369,7 @@ _GRAPHIC_TAIL_MS = 7000    # 끝(소멸/교체) 탐색 상한
 _SWAP_DIST = 0.18          # 같은 자리 교체 판정 거리 (화면 대각선 대비)
 _FADE_DIST = 0.35          # 근처 소멸 판정 거리
 _EVENT_SENSITIVITY = 2.5   # 움직이는 배경 위 작은 가사 텍스트까지 감지
+_TRACK_TAIL_MARGIN_MS = 5000  # 화면 텍스트 추적 구간을 전사 끝 뒤로 이만큼 넓힌다 (꼬리 글자)
 
 
 def _snap_suggestions_to_video(
@@ -455,6 +456,8 @@ class LyricTypesetResult:
     # | "none" (디렉터/확장 실패 → compose_lines 기본 배치, 연출 없음)
     fx_status: str = ""
     n_regions: int = 0   # 화면 텍스트 영역이 검출된 줄 수 (위치·연출 근거)
+    n_tracks: int = 0    # 화면 텍스트 트랙 수 (track_text_presence) — 0 이면 plan_times 결과 그대로
+    n_track_lines: int = 0  # 트랙에서 시간·위치를 받은 줄 수 (via 'track'/'stack')
 
 
 def run_lyric_typeset(
@@ -489,8 +492,10 @@ def run_lyric_typeset(
         play_res: 스크립트의 PlayResX/Y — \\pos/\\move/\\clip 좌표계 (기본 1920x1080).
     """
     from ai.lyric_text import creation_sync_targets
-    from ai.lyric_typeset import _REGION_RETRY_BACK_MS, compose_lines, plan_times, region_usable
+    from ai.lyric_typeset import (_REGION_RETRY_BACK_MS, assign_tracks, compose_lines,
+                                  plan_times, region_usable)
     from media.text_region import detect_text_regions
+    from media.text_timeline import track_text_presence
     from media.video_analysis import analyze_line_windows, detect_graphic_events
 
     def _p(frac: float, msg: str) -> None:
@@ -543,6 +548,29 @@ def run_lyric_typeset(
         (g.end_ms for g in result.segments if g.end_ms - g.start_ms >= 1000),
         default=audio_end_ms)
     rows = plan_times(pairs, groups, aligns, events, vocal_end)
+    res_xy = (int(play_res[0]) or 1920, int(play_res[1]) or 1080)
+
+    # 4b) 화면 텍스트 트랙 — 줄의 시작·끝·위치는 화면에 그려진 원문 그래픽의 표시
+    # 구간에서 직접 받는다 (보컬 정렬은 어느 트랙이 이 줄 것인지 고르는 사전정보).
+    # 예외를 던지지 않는 모듈이지만 방어적으로 감싼다 — 트랙이 없으면 plan_times 그대로.
+    _check_cancel(cancel_event)
+    _p(0.86, "화면 텍스트 표시 구간 추적 중...")
+    # 구간 지정이 없으면 전사 끝 뒤로 여유를 둔다 — 꼬리 글자(駈け上がる)는 마지막 보컬 뒤에도
+    # 떠 있고, 주입된 전사의 끝이 영상보다 이르면 마지막 트랙이 잘린다 (영상 끝 넘어도 안전)
+    hi_track = hi if clip else hi + _TRACK_TAIL_MARGIN_MS
+    try:
+        tracks = track_text_presence(
+            video_path, lo, hi_track, play_res=res_xy,
+            cancel_check=(cancel_event.is_set if cancel_event else None),
+        ) or []
+    except Exception:  # noqa: BLE001 — 추적 실패는 치명적이지 않다
+        log.exception("텍스트 구간 추적 실패 — 보컬/이벤트 계획으로 진행")
+        tracks = []
+    _check_cancel(cancel_event)
+    if tracks:
+        rows = assign_tracks(pairs, groups, aligns, tracks, events, vocal_end,
+                             base_rows=rows, play_res=res_xy)
+    n_track_lines = sum(1 for r in rows if r.via in ("track", "stack") and r.track is not None)
 
     # 5) 장면 분석 (밝기 → 흑/백 스타일, 드리프트 → \move)
     _p(0.90, "장면 밝기/위치 분석 중...")
@@ -552,7 +580,6 @@ def run_lyric_typeset(
         cancel_check=(cancel_event.is_set if cancel_event else None),
     ) or []
     _check_cancel(cancel_event)
-    res_xy = (int(play_res[0]) or 1920, int(play_res[1]) or 1080)
 
     # 5b) 화면 텍스트 영역 — 위치·연출의 정답은 화면에 그려진 원문 텍스트 자리다.
     # 창별 글자 덩어리/배치/드리프트/강조색을 얻어 rows 와 병렬로 둔다 (검출 실패
@@ -607,7 +634,7 @@ def run_lyric_typeset(
         try:
             lines, used_llm, fx_notes = _direct_lyric_effects(
                 pairs, groups, rows, vis, reference_ass, use_llm, cancel_event,
-                play_res=res_xy, progress=_p, regions=regions)
+                play_res=res_xy, progress=_p, regions=regions, tracks=tracks)
             fx_status = "llm" if used_llm else "rules"
         except SyncCancelled:
             raise
@@ -618,17 +645,18 @@ def run_lyric_typeset(
             lines = None
         _check_cancel(cancel_event)
     if lines is None:
-        lines = compose_lines(pairs, rows, vis, res_xy[0], res_xy[1], regions, groups)
-    n_graphic = sum(1 for r in rows if r.via == "graphic")
-    log.info("가사 타이프셋 계획: %d줄 (그래픽 근거 %d, 이벤트 %d개, 텍스트 영역 %d/%d, "
-             "AI 연출=%s, 상태=%s)",
-             len(lines), n_graphic, len(events), n_regions, len(windows),
-             ai_effects, fx_status or "-")
+        lines = compose_lines(pairs, rows, vis, res_xy[0], res_xy[1], regions, groups, tracks)
+    # 그래픽 근거 = 등장 이벤트 또는 화면 텍스트 트랙이 시간을 준 줄
+    n_graphic = sum(1 for r in rows if r.via in ("graphic", "track"))
+    log.info("가사 타이프셋 계획: %d줄 (그래픽 근거 %d, 이벤트 %d개, 트랙 %d개→%d줄, "
+             "텍스트 영역 %d/%d, AI 연출=%s, 상태=%s)",
+             len(lines), n_graphic, len(events), len(tracks), n_track_lines,
+             n_regions, len(windows), ai_effects, fx_status or "-")
     _p(1.0, f"타이프셋 계획 완료 — {len(lines)}줄")
     return LyricTypesetResult(
         lines=lines, language=lang, n_graphic=n_graphic, n_events=len(events),
         used_llm=used_llm, fx_notes=fx_notes, fx_status=fx_status,
-        n_regions=n_regions)
+        n_regions=n_regions, n_tracks=len(tracks), n_track_lines=n_track_lines)
 
 
 def _direct_lyric_effects(
@@ -642,11 +670,13 @@ def _direct_lyric_effects(
     play_res: tuple[int, int] = (1920, 1080),
     progress: Optional[Callable[[float, str], None]] = None,
     regions: Optional[list] = None,
+    tracks: Optional[list] = None,
 ) -> tuple[list, bool, list[str]]:
     """place_fx_lines → 스타일 다이제스트 → 디렉터(화면 힌트 포함) → expand_planned.
 
     regions: media.text_region.detect_text_regions 결과 (시간 있는 줄 순서, None
     허용) — 좌표는 텍스트 영역 우선, 디렉터에는 줄별 힌트(layout/drift/accent)로.
+    tracks: media.text_timeline 트랙 (rows 의 track/unit 이 가리키는 것 + 자리 점유용).
 
     LLM 호출(claude/codex CLI, 최대 수 분) 동안 cancel_event 를 감시하는 스레드가
     CliCancelToken 으로 CLI 프로세스 트리를 죽인다 — 취소 버튼이 CLI 타임아웃까지
@@ -663,7 +693,7 @@ def _direct_lyric_effects(
 
     play_res = (int(play_res[0]), int(play_res[1]))
     fx_lines, roles, row_indices, hints = place_fx_lines(
-        pairs, rows, vis, play_res, regions, groups)
+        pairs, rows, vis, play_res, regions, groups, tracks)
     if not fx_lines:
         return [], False, ["연출할 줄이 없습니다."]
     line_vis = fx_visuals(rows, vis, row_indices)
