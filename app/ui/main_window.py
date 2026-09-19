@@ -527,23 +527,24 @@ class _AiSyncOptionsDialog(QDialog):
         self._typeset.setEnabled(False)
         form.addRow(self._typeset)
 
-        # AI 연출 — 수작업 완성본의 연출(글자별 분할·고스트 잔상·그림자
-        # 막대·세로 제목·부분 색상)을 디렉터(LLM 또는 규칙)가 줄마다 고르고
-        # 여러 이벤트로 확장한다. 레퍼런스 .ass 를 주면 그 스타일 요약을
-        # LLM 프롬프트에 넣는다. 타이프셋이 켜져 있을 때만 의미가 있다.
+        # 연출(글자색·글로우·이동/크기·흔들림·강조 글자 색·화면 전환 번짐·세로
+        # 제목)은 이 체크와 무관하게 항상 화면에서 잰 값으로만 붙는다 (측정 근거가
+        # 없는 줄은 기본 배치). 이 체크는 LLM 사용 여부 — LLM 은 '색으로 강조된 원문
+        # 글자가 번역문의 어느 부분인지' 만 판단한다. 타이프셋이 켜져 있을 때만 의미가 있다.
         self._fx = QCheckBox(
-            "AI 연출 적용 (완성본 스타일 재현 — 글자 분할·잔상·그림자·세로 제목)")
+            "AI(LLM)로 강조 글자의 번역 부분 판단 (연출 자체는 화면 측정값으로 항상 적용)")
         self._fx.setToolTip(
-            "타이프셋 줄을 완성본 스타일의 연출로 확장합니다: 글자별 3D 흩뿌리기,\n"
-            "대각선/세로 스택 배치, 고스트 잔상, 그림자 막대, 세로 제목+★,\n"
-            "부분 색상 등. 설치된 LLM CLI(claude/codex)가 있으면 줄별 연출을\n"
-            "LLM 이 고르고, 없으면 규칙으로 정합니다. 모든 태그는 화이트리스트\n"
-            "안에서만 생성됩니다.")
+            "연출은 영상에서 잰 것만 씁니다: 원문 가사 그래픽의 글자색·글로우, 이동·크기\n"
+            "변화, 제자리 흔들림, 일부 글자만 다른 색(강조), 화면 전환 번짐, 세로 제목의\n"
+            "자리. 잰 근거가 없는 줄은 기본 배치(\\pos+\\fad)입니다.\n"
+            "이 항목을 켜면 설치된 LLM CLI(claude/codex)가 '강조된 원문 글자가 번역문의\n"
+            "어느 부분인지' 를 판단합니다. 끄거나 LLM 을 못 쓰면 글자 위치 비례로 정합니다.\n"
+            "모든 태그는 화이트리스트 안에서만 생성됩니다.")
         self._fx.setChecked(settings.value("aiSyncFxEnabled", True, type=bool))
         form.addRow(self._fx)
 
         self._fx_ref = QLineEdit()
-        self._fx_ref.setPlaceholderText("(선택) 레퍼런스 완성본 .ass — 비우면 내장 스타일 프로필 사용")
+        self._fx_ref.setPlaceholderText("(선택) 레퍼런스 완성본 .ass — 연출은 화면 측정값만 쓰므로 결과에 영향 없음")
         self._fx_ref.setText(settings.value("aiSyncFxReference", "", type=str) or "")
         self._fx_ref_btn = QPushButton("찾아보기")
         self._fx_ref_btn.clicked.connect(self._browse_fx_reference)
@@ -600,7 +601,7 @@ class _AiSyncOptionsDialog(QDialog):
         super().accept()
 
     def _update_fx_enabled(self, *_args) -> None:
-        """AI 연출 위젯은 타이프셋이 활성+체크일 때만 쓸 수 있다."""
+        """LLM 사용 위젯은 타이프셋이 활성+체크일 때만 쓸 수 있다."""
         on = self._typeset.isEnabled() and self._typeset.isChecked()
         self._fx.setEnabled(on)
         self._fx_ref_widget.setEnabled(on)
@@ -659,7 +660,8 @@ class _AiSyncOptionsDialog(QDialog):
         return self._typeset.isEnabled() and self._typeset.isChecked()
 
     def fx_enabled(self) -> bool:
-        """AI 연출 적용 여부 — 타이프셋이 켜져 있을 때만 True 가 될 수 있다."""
+        """LLM 사용 여부(강조 부분 판단) — 타이프셋이 켜져 있을 때만 True 가 될 수 있다.
+        측정 기반 연출은 이 값과 무관하게 적용된다."""
         return self.lyric_typeset() and self._fx.isEnabled() and self._fx.isChecked()
 
     def fx_reference(self) -> Optional[str]:
@@ -2492,8 +2494,8 @@ class MainWindow(QMainWindow):
                              reference_ass: Optional[str] = None) -> None:
         """백그라운드 타이프셋 계획 실행 — 완료 시 줄+스타일을 한 번에 생성.
 
-        ai_effects: 완성본 스타일 연출(디렉터+확장기) 적용.
-        reference_ass: 레퍼런스 완성본 .ass 경로 (LLM 스타일 다이제스트용).
+        ai_effects: LLM 사용 여부 (강조 글자의 번역 부분 판단). 측정 기반 연출은 항상 적용.
+        reference_ass: 레퍼런스 완성본 .ass 경로 (호환용 — 연출 선택에 쓰이지 않음).
         """
         self._ai_progress = QProgressDialog(
             "가사 타이프셋 분석 시작 중...", "취소", 0, 100, self)
@@ -2575,23 +2577,22 @@ class MainWindow(QMainWindow):
         self.grid.select_by_id(new_events[0].id)
         worker_fx = bool(getattr(worker, "_ai_effects", False))
         fx_notes = list(getattr(result, "fx_notes", []) or [])
-        if worker_fx:
-            # 세 갈래: LLM 배정 반영 / 규칙 디렉터 / 실패(연출 없는 기본 배치)
-            status = getattr(result, "fx_status", "") or (
-                "llm" if getattr(result, "used_llm", False) else "rules")
-            if status == "llm":
-                fx_line = "AI 연출: LLM 배정 반영"
-            elif status == "rules":
-                fx_line = "AI 연출: 규칙 디렉터 (LLM 미사용 또는 반영 0줄)"
-            else:
-                fx_line = "AI 연출 실패 — 기본 배치(연출 없음)"
-            if fx_notes:
-                fx_line += f" (노트 {len(fx_notes)}건 — 로그 참조)"
-                for n in fx_notes:
-                    log.info("AI 연출 노트: %s", n)
-            fx_line += "\n"
+        # 연출은 LLM 체크와 무관하게 화면 측정값으로 적용된다 — 세 갈래:
+        # 측정+LLM 판단 반영 / 측정만(LLM 끔·불가·반영 0줄) / 실패(연출 없는 기본 배치)
+        status = getattr(result, "fx_status", "") or (
+            "llm" if getattr(result, "used_llm", False) else "rules")
+        if status == "llm":
+            fx_line = "연출: 화면 측정값 + LLM 의 강조 부분 판단 반영"
+        elif status == "rules":
+            fx_line = ("연출: 화면 측정값 (강조 부분은 글자 위치 비례 — "
+                       + ("LLM 미반영" if worker_fx else "LLM 사용 안 함") + ")")
         else:
-            fx_line = ""
+            fx_line = "연출 실패 — 기본 배치(연출 없음)"
+        if fx_notes:
+            fx_line += f" (노트 {len(fx_notes)}건 — 로그 참조)"
+            for n in fx_notes:
+                log.info("연출 노트: %s", n)
+        fx_line += "\n"
         # 화면 텍스트 트랙(원문 그래픽의 표시 구간)이 시간·위치를 준 줄 수 — 0 이면
         # 보컬 정렬/등장 이벤트 계획만으로 만든 것이라 사용자가 싱크를 더 의심해야 한다.
         n_tracks = int(getattr(result, "n_tracks", 0) or 0)

@@ -83,6 +83,9 @@ class _Row:
     # 트랙과 그 안의 구 단위 덩어리 (cx, cy, w, h — px). via 는 'track'/'stack'.
     track: Optional[object] = None
     unit: Optional[tuple[float, float, float, float]] = None
+    # unit 이 가리키는 트랙 구(track.clusters 인덱스) — −1 이면 트랙 전체(그 트랙의 유일한 줄,
+    # 세로/대각선, 나눠 가진 bbox). 구별 시작 시각·강조 글자(accent)를 줄에 잇는 열쇠.
+    cluster: int = -1
 
 
 def _nletters(s: Optional[str]) -> int:
@@ -421,7 +424,7 @@ _TRACK_SHORT_SKIP = 1.0
 _TRACK_SKIP = 2.5
 _TRACK_LINE_SKIP_TRUSTED = 3.0
 _TRACK_LINE_SKIP = 1.5
-_TRACK_MOVE_PX = 40.0          # 트랙 드리프트(첫→마지막 안정 프레임, px)가 이 이상이면 \move
+_TRACK_MOVE_PX = 12.0          # 번역 자리의 시작→끝 차(첫·마지막 안정 프레임 기준, px)가 이보다 크면 \move
 _TRACK_ORDER_PENALTY = 12.0    # 같은 절의 앞 구를 건너뛴 채 뒤 구를 배정하는 것의 감점
 _TRACK_DARK_MIN_CONF = 0.2
 _VERT_SIDE_PX = 60.0           # 세로 제목 번역 = 원문 기둥 중심에서 우측 60px (레퍼런스 1025 vs 962)
@@ -450,7 +453,7 @@ def _track_tall(t) -> bool:
 
 def _track_kind(t) -> str:
     """트랙의 배치 종류 'vertical' | 'diagonal' | 'horizontal' — 배정 단위(_track_units)·
-    힌트(_track_hint)·드리프트(_track_drift)·배치(_track_placements)가 모두 같은 판정을 쓴다
+    힌트(_track_hint)·이동(_track_motion)·배치(_track_placements)가 모두 같은 판정을 쓴다
     (힌트는 diagonal 인데 배치는 세로면 디렉터가 끝점 없는 char_diagonal 을 자동 상자로
     그려 원문을 가로지른다).
 
@@ -776,6 +779,9 @@ def assign_tracks(
         r.via = "track"
         r.track = t
         r.unit = u
+        r.cluster = _unit_cluster(t, u, rx, ry)
+    _whole_track_units(rows, rx, ry)
+    _late_cluster_starts(rows)
 
     # 배정 못 받은 줄 — plan_times 결과를 이웃 트랙 줄 사이로 클램프
     for i in range(L):
@@ -876,12 +882,189 @@ def assign_tracks(
     return rows
 
 
+def _unit_cluster(t, unit: tuple[float, float, float, float], rx: int, ry: int) -> int:
+    """unit(px) 이 트랙의 어느 구(clusters 인덱스)인가 — 상자가 사실상 같은 구만. 나눠 가진
+    bbox·트랙 전체 bbox 는 −1."""
+    for k, c in enumerate(getattr(t, "clusters", None) or []):
+        cp = _unit_px(c, rx, ry)
+        if (abs(cp[0] - unit[0]) <= 2.0 and abs(cp[1] - unit[1]) <= 2.0
+                and abs(cp[2] - unit[2]) <= 4.0 and abs(cp[3] - unit[3]) <= 4.0):
+            return k
+    return -1
+
+
+def _whole_track_units(rows: list[_Row], rx: int, ry: int) -> None:
+    """가로 트랙을 혼자 받은 줄의 unit = 받은 덩어리 + 같은 행의 글자 크기 덩어리들의 합집합.
+
+    배정은 구 수보다 줄이 적으면 큰 덩어리부터 고르므로, 한 줄이 두 덩어리로 끊겨 잡힌
+    트랙(실측 春の陽｜を..., 思ったことが｜ない)은 그중 하나만 unit 이 된다 — 번역 자리와
+    강조 글자 범위가 줄의 일부만 보게 된다. 줄이 하나뿐이면 같은 행의 덩어리는 전부 그
+    줄이다. 점·획 조각·꽃잎(폭 <100px 또는 높이가 받은 덩어리의 60% 미만)과 다른 행은 뺀다."""
+    by_track: dict[int, list[_Row]] = {}
+    for r in rows:
+        if r.track is not None and r.via == "track":
+            by_track.setdefault(id(r.track), []).append(r)
+    for rs in by_track.values():
+        if len(rs) != 1:
+            continue
+        r = rs[0]
+        t = r.track
+        cl = [_unit_px(c, rx, ry) for c in (getattr(t, "clusters", None) or [])]
+        if len(cl) < 2 or _track_kind(t) != "horizontal" or r.unit is None:
+            continue
+        u = r.unit
+        cl = [c for c in cl
+              if c[2] >= 100.0 and c[3] >= 0.6 * u[3]
+              and (min(c[1] + c[3] / 2.0, u[1] + u[3] / 2.0) - max(c[1] - c[3] / 2.0, u[1] - u[3] / 2.0)
+                   >= 0.5 * min(c[3], u[3]))]
+        if len(cl) < 2 or not any(abs(c[0] - u[0]) <= 2.0 and abs(c[2] - u[2]) <= 4.0 for c in cl):
+            continue
+        x0, y0, x1, y1 = _cluster_bbox(cl)
+        r.unit = ((x0 + x1) / 2.0, (y0 + y1) / 2.0, float(x1 - x0), float(y1 - y0))
+        r.pos = (r.unit[0] / rx, r.unit[1] / ry)
+        r.cluster = -1
+
+
+def _late_cluster_starts(rows: list[_Row]) -> None:
+    """한 트랙 안에서 늦게 뜬 구(cluster_starts_ms)를 받은 줄은 그 시각에 시작한다
+    (실측 揺れ動く… 15.0s / 心の侭に… 16.33s). 트랙 구간 밖의 값은 무시."""
+    for r in rows:
+        t = r.track
+        if t is None or r.via != "track" or r.cluster < 0 or r.start is None:
+            continue
+        starts = list(getattr(t, "cluster_starts_ms", None) or [])
+        if r.cluster >= len(starts):
+            continue
+        cs = int(starts[r.cluster])
+        if int(r.start) < cs < int(t.end_ms) - 300 and (r.end is None or cs < int(r.end) - 300):
+            r.start = cs
+
+
+_DOT_CHARS = ".･・…‥。"
+
+
+def _src_glyphs(source: Optional[str]) -> list[str]:
+    """원문의 화면 글자 목록 — 공백 제외, 끝의 말줄임 점 제외 (media.text_timeline 의
+    cluster_glyphs 와 같은 셈법: 괄호는 글자로 센다)."""
+    g = [ch for ch in (source or "") if not ch.isspace()]
+    while g and g[-1] in _DOT_CHARS:
+        g.pop()
+    return g
+
+
+def _is_letter(ch: str) -> bool:
+    return unicodedata.category(ch)[0] in ("L", "N")
+
+
+def _is_kanji(ch: str) -> bool:
+    """한자(CJK 통합 한자·확장 A·반복 부호 々) 한 글자인가."""
+    return len(ch) == 1 and ("一" <= ch <= "鿿" or "㐀" <= ch <= "䶿" or ch == "々")
+
+
+def _kanji_compound(glyphs: list[str], lo: int, hi: int) -> tuple[str, int]:
+    """강조가 한자 한 글자(lo == hi)이고 이웃도 한자면 (그 한자 복합어, 복합어 안의 위치).
+
+    生命 의 生 → ('生命', 0), 必死 의 死 → ('必死', 1). 한자어 번역은 한자 한 글자가 한 음절에
+    대응하므로('생명'·'필사') LLM 이 복합어 전체를 답해도 같은 위치의 음절만 칠할 수 있다.
+    복합어가 아니면 ('', -1)."""
+    if lo != hi or not (0 <= lo < len(glyphs)) or not _is_kanji(glyphs[lo]):
+        return "", -1
+    a0 = a1 = lo
+    while a0 > 0 and _is_kanji(glyphs[a0 - 1]):
+        a0 -= 1
+    while a1 + 1 < len(glyphs) and _is_kanji(glyphs[a1 + 1]):
+        a1 += 1
+    if a1 == a0:
+        return "", -1
+    return "".join(glyphs[a0:a1 + 1]), lo - a0
+
+
+def _line_accents(t, cluster: int, sole: bool,
+                  unit: tuple[float, float, float, float],
+                  source: Optional[str], rx: int, ry: int) -> list[dict]:
+    """트랙의 강조 글자(TextAccent) 중 이 줄의 것 → 원문 글자 범위로 옮긴 dict 목록.
+
+    cluster ≥ 0 이면 그 구의 accent 만, 트랙을 혼자 받은 줄(sole)은 전부(앞 구들의 글자
+    수만큼 인덱스를 민다), 나눠 가진 bbox 는 accent 구의 중심이 unit 안에 있을 때만.
+    잰 글자 수가 원문 글자 수 안에 들면 인덱스를 그대로, 넘으면(점·장식이 글자로 세어진
+    구) 비율로 옮긴다. 결과의 from/to/n 은 '글자(L/N)만 센' 원문 인덱스 — 번역문의
+    어느 부분인지는 디렉터(LLM 의미 판단 → 비례 폴백)가 정한다."""
+    import math
+    out: list[dict] = []
+    accents = list(getattr(t, "accents", None) or [])
+    if not accents:
+        return out
+    glyphs = _src_glyphs(source)
+    n_src = len(glyphs)
+    if n_src == 0:
+        return out
+    counts = [int(v) for v in (getattr(t, "cluster_glyphs", None) or [])]
+    clusters = list(getattr(t, "clusters", None) or [])
+    letter_pos = [k for k, g in enumerate(glyphs) if _is_letter(g)]
+    for a in accents:
+        ac = int(getattr(a, "cluster", 0))
+        n_c = int(getattr(a, "n_glyphs", 0) or (counts[ac] if 0 <= ac < len(counts) else 0))
+        if n_c <= 0:
+            continue
+        if sole:
+            # 트랙을 혼자 받은 줄의 source 는 트랙 전체 원문 — unit 이 그중 한 구여도(cluster ≥ 0)
+            # 인덱스는 앞 구들의 글자 수만큼 밀고, 다른 구의 강조도 이 줄의 것이다
+            offset = sum(counts[:ac]) if ac < len(counts) else 0
+            n_line = max(sum(counts), offset + n_c)
+        elif cluster >= 0:
+            if ac != cluster:
+                continue
+            offset, n_line = 0, n_c
+        else:
+            if not (0 <= ac < len(clusters)):
+                continue
+            cp = _unit_px(clusters[ac], rx, ry)
+            if not (unit[0] - unit[2] / 2.0 <= cp[0] <= unit[0] + unit[2] / 2.0):
+                continue
+            offset, n_line = 0, n_c
+        lo = offset + int(getattr(a, "glyph_from", 0))
+        hi = offset + int(getattr(a, "glyph_to", 0))
+        if hi < lo:
+            lo, hi = hi, lo
+        if offset + n_c > n_src:
+            lo = int(math.floor(lo * n_src / float(n_line)))
+            hi = int(math.ceil((hi + 1) * n_src / float(n_line))) - 1
+        lo = max(0, min(n_src - 1, lo))
+        hi = max(lo, min(n_src - 1, hi))
+        sel = [j for j, k in enumerate(letter_pos) if lo <= k <= hi]
+        if not sel:
+            continue
+        color = str(getattr(a, "color", "") or "")
+        compound, compound_at = _kanji_compound(glyphs, lo, hi)
+        out.append({
+            "color": color.upper(),
+            "src": "".join(glyphs[lo:hi + 1]),
+            "from": sel[0], "to": sel[-1], "n": len(letter_pos),
+            # 한자 복합어 안의 한 글자 강조 (生命 의 生) — 디렉터가 LLM 의 복합어 답을 한 음절로 좁힌다
+            "compound": compound, "compound_at": compound_at,
+            "glow": bool(getattr(a, "glow", False)),
+            "glow_color": getattr(a, "glow_color", None),
+            "cover": getattr(a, "cover", None),
+            "start_ms": int(getattr(a, "start_ms", 0)),
+            "end_ms": int(getattr(a, "end_ms", 0)),
+        })
+    return out
+
+
 def _track_hint(t, unit: tuple[float, float, float, float],
                 drift: Optional[tuple[float, float]], rx: int, ry: int,
                 diag: Optional[tuple[tuple[float, float], tuple[float, float]]] = None,
-                kind: Optional[str] = None) -> dict:
+                kind: Optional[str] = None, scale: float = 1.0,
+                accents: Optional[list[dict]] = None,
+                src_text: Optional[str] = None) -> dict:
     """트랙에서 만든 디렉터 힌트 (typeset_director.hint_fx 가 읽는 꼴, px). layout 은
-    배치가 쓴 kind(_track_kind; 제목 역할이면 vertical) 와 같다 — diag 없는 diagonal 은 내지 않는다."""
+    배치가 쓴 kind(_track_kind; 제목 역할이면 vertical) 와 같다 — diag 없는 diagonal 은 내지 않는다.
+
+    전부 화면에서 잰 값: drift = 번역 자리의 시작→끝 이동(첫·마지막 안정 프레임의 원문
+    상자 각각에 대해 계산한 자리의 차), scale = 글자 크기 비, fill_color/halo = 글자색·
+    글로우, deform = 제자리 일그러짐, accents = 이 줄의 강조 글자(원문 글자 범위),
+    exit_smear_ms = 화면 전환 번짐 시작. 옛 accent_color(강조색만 있고 어느 글자인지
+    모르는 값)는 쓰지 않는다 — 어느 부분을 칠할지 추측하게 되기 때문."""
     import math
     clusters = [_unit_px(c, rx, ry) for c in (t.clusters or [])] or [unit]
     layout = kind or _track_kind(t)
@@ -890,14 +1073,13 @@ def _track_hint(t, unit: tuple[float, float, float, float],
     angle = 0.0
     if diag is not None:
         angle = math.degrees(math.atan2(diag[1][1] - diag[0][1], diag[1][0] - diag[0][0]))
-    # 밝은 장면(검은 글자)의 강조색은 꽃잎 같은 배경 색을 잡은 것 (실측 63s/82s 분홍) — 쓰지 않는다
-    accent = t.accent_color if (t.accent_color and not t.dark_text) else None
+    smear = getattr(t, "exit_smear_ms", None)
     return {
         "layout": layout,
         "angle_deg": angle,
         "drift": drift,
-        "scale": 1.0,
-        "accent_color": accent,
+        "scale": float(scale),
+        "accent_color": None,
         "accent_full": False,
         "dark_text": bool(t.dark_text),
         "bbox": _cluster_bbox([unit]),
@@ -906,21 +1088,161 @@ def _track_hint(t, unit: tuple[float, float, float, float],
         "diag_start": diag[0] if diag else None,
         "diag_end": diag[1] if diag else None,
         "source": "track",
+        "fill_color": getattr(t, "fill_color", None),
+        "halo": getattr(t, "halo", None),
+        "halo_color": getattr(t, "halo_color", None),
+        "deform": float(getattr(t, "deform", 0.0) or 0.0),
+        "accents": list(accents or []),
+        "exit_smear_ms": int(smear) if smear is not None else None,
+        "unit_w": float(unit[2]),
+        "src_text": src_text or "",
     }
 
 
-def _track_drift(t, rx: int, ry: int) -> Optional[tuple[float, float]]:
-    """트랙의 첫→마지막 안정 프레임 이동(px). 가로 한 줄(높이 ≤150px)일 때만 믿는다 —
-    여러 행이 붙은 트랙은 행이 뜨고 지며 bbox 중심이 흔들린다. 세로/대각선은 None
-    (배치가 연출을 정한다)."""
-    if _track_kind(t) != "horizontal":
-        return None
-    if float(t.h) * ry > _SINGLE_LINE_H_PX or float(t.confidence) < _TRACK_MIN_CONF:
-        return None
-    d = (float(t.drift[0]) * rx, float(t.drift[1]) * ry)
-    if (d[0] ** 2 + d[1] ** 2) ** 0.5 < _TRACK_MOVE_PX:
-        return (0.0, 0.0)
-    return _cap_drift(d)
+_TITLE_HEAD_FS_MIN = 56.0      # 제목 머리 글자 크기 하한 (원문 머리 星空 ≈ 54px 보다 작으면 읽기 어렵다)
+_DIAG_MIN_STEP = 64 * 1.02     # 대각선 번역의 글자 간격 하한 = 확장기의 최소 글자 크기(_DIAG_MIN_FS) × 간격 계수
+_BOX_SCALE_TOL_W = 0.10        # 첫·마지막 상자의 폭 비가 내용 배율과 이 안에서 맞아야 상자를 믿는다
+_BOX_SCALE_TOL_H = 0.22        # …높이 비는 획 끝(탁점·받침)에 따라 더 흔들린다
+
+
+def _track_motion(t, unit: tuple[float, float, float, float], rx: int, ry: int
+                  ) -> tuple[tuple[float, float, float, float], float]:
+    """unit(첫 안정 프레임의 원문 상자, px) → (마지막 안정 프레임의 같은 상자, 글자 크기 비).
+
+    가로 트랙만 — 세로/대각선은 배치가 연출을 정한다. box_first→box_last 의 크기 비가
+    잰 배율(scale, 내용 정합)과 맞으면 상자 사상을 그대로 쓴다 (오른쪽 정렬로 커지는
+    줄은 중심이 왼쪽으로 옮겨 간다: 迫りくる 1470→1440). 안 맞으면 마지막 상자에 다른
+    것이 섞인 것(뒤에 뜬 구·꽃잎: 必死に 96→196px)이라 검증된 drift 와 배율만 쓴다."""
+    s = float(getattr(t, "scale", 1.0) or 1.0)
+    if not (0.3 <= s <= 3.0):
+        s = 1.0
+    if _track_kind(t) != "horizontal" or float(t.confidence) < _TRACK_MIN_CONF:
+        return unit, 1.0
+    bf = getattr(t, "box_first", None)
+    bl = getattr(t, "box_last", None)
+    if bf and bl and bf[2] > 0 and bf[3] > 0 and bl[2] > 0 and bl[3] > 0:
+        rw, rh = float(bl[2]) / float(bf[2]), float(bl[3]) / float(bf[3])
+        if (abs(rw - s) <= _BOX_SCALE_TOL_W * max(1.0, s)
+                and abs(rh - s) <= _BOX_SCALE_TOL_H * max(1.0, s)):
+            f = _unit_px(bf, rx, ry)
+            l = _unit_px(bl, rx, ry)
+            return ((l[0] + (unit[0] - f[0]) * rw, l[1] + (unit[1] - f[1]) * rh,
+                     unit[2] * rw, unit[3] * rh), s)
+    dx, dy = _cap_drift((float(t.drift[0]) * rx, float(t.drift[1]) * ry))
+    return ((unit[0] + dx, unit[1] + dy, unit[2] * s, unit[3] * s), s)
+
+
+def _title_layout(t, tracks: list, n_body: int, rx: int, ry: int) -> dict:
+    """세로 제목 카드의 잰 자리 — 머리(星空) 중심 y, 몸통(へと続く坂道) 위~아래, 글자 크기 비.
+
+    머리는 같은 기둥(x 가 기둥 폭 안) 위쪽에 1s 안에 함께 뜬 다른 트랙(별과 머리 글자가
+    기둥보다 0.5s 먼저 뜬다) 중 가장 위 것, 없으면 기둥 트랙 자신의 맨 위 구(구가 2개
+    이상일 때). 번역 기둥의 x 는 원문 기둥 중심 +60px 이되 원문 글자(아래로 갈수록 커진다)와
+    겹치지 않게 원문 오른끝 + 번역 끝 글자 반폭만큼은 띄운다 (프레임을 넘으면 왼쪽)."""
+    col = _unit_px((t.cx, t.cy, t.w, t.h), rx, ry)
+    top, bottom = col[1] - col[3] / 2.0, col[1] + col[3] / 2.0
+    right = col[0] + col[2] / 2.0
+    left = col[0] - col[2] / 2.0
+    bl = getattr(t, "box_last", None)
+    if bl and bl[2] > 0:
+        l = _unit_px(bl, rx, ry)
+        right = min(right, l[0] + l[2] / 2.0)
+        left = max(left, l[0] - l[2] / 2.0)
+    head: Optional[tuple[float, float, float, float]] = None
+    for o in tracks or []:
+        if o is t or float(o.confidence) < _TRACK_MIN_CONF:
+            continue
+        if abs(int(o.start_ms) - int(t.start_ms)) > _TRACK_TITLE_BUNDLE_MS:
+            continue
+        ov = min(int(o.end_ms), int(t.end_ms)) - max(int(o.start_ms), int(t.start_ms))
+        if ov < 0.5 * min(int(o.end_ms) - int(o.start_ms), int(t.end_ms) - int(t.start_ms)):
+            continue
+        oc = [_unit_px(c, rx, ry) for c in (o.clusters or [])] or [_unit_px((o.cx, o.cy, o.w, o.h), rx, ry)]
+        for c in oc:
+            if abs(c[0] - col[0]) <= max(col[2], 150.0) and c[1] < top and (head is None or c[1] < head[1]):
+                head = c
+    if head is None:
+        own = sorted((_unit_px(c, rx, ry) for c in (t.clusters or [])), key=lambda c: c[1])
+        if len(own) >= 2:
+            head = own[0]
+            top = min(c[1] - c[3] / 2.0 for c in own[1:])
+    ramp = float(getattr(t, "glyph_ramp", 1.0) or 1.0)
+    ramp_c = min(2.2, max(1.0, ramp))          # 확장기의 클램프와 같은 범위
+    n = max(1, n_body)
+    s0 = min(160.0, max(40.0, (bottom - top) / (0.9 * n) * 2.0 / (1.0 + ramp_c)))
+    s_max = s0 * ramp_c
+    x = max(col[0] + _VERT_SIDE_PX, right + s_max / 2.0 + 12.0)
+    if x + s_max / 2.0 > 0.98 * rx:
+        x = min(col[0] - _VERT_SIDE_PX, left - s_max / 2.0 - 12.0)
+    # 머리 글자 크기 — 잰 머리 구의 높이를 번역 머리(3글자)가 채우는 크기, 읽을 수 있는 하한 56
+    head_fs = (min(120.0, max(_TITLE_HEAD_FS_MIN, head[3] / (3 * 0.9))) if head is not None else 0.0)
+    return {
+        "x": float(x),
+        "head_pos": (float(x), float(head[1])) if head is not None else None,
+        "body_top": float(top), "body_bottom": float(bottom), "ramp": ramp,
+        "head_fs": float(head_fs),
+    }
+
+
+def _glyph_rects(text: str, p0: tuple[float, float], p1: tuple[float, float],
+                 fs: float = 96.0, pad: float = 16.0
+                 ) -> list[tuple[float, float, float, float]]:
+    """p0→p1 선 위에 고르게 놓이는 글자별 상자 (글자 크기 + 여유) — 글자 분할 연출이
+    차지하는 자리를 다른 번역이 피하도록."""
+    n = max(1, _nletters(text))
+    h = fs / 2.0 + pad
+    out = []
+    for k in range(n):
+        f = k / (n - 1) if n > 1 else 0.0
+        x, y = p0[0] + (p1[0] - p0[0]) * f, p0[1] + (p1[1] - p0[1]) * f
+        out.append((x - h, y - h, x + h, y + h))
+    return out
+
+
+def _est_width_wide(text: str, fs: float = 96.0) -> float:
+    """번역 폭의 넉넉한 추정 — 글자·문장부호 0.95em, 공백 0.35em (충돌 회피용 상한)."""
+    t = (text or "").replace("\\N", " ").replace("\\n", " ")
+    return sum(0.35 if ch.isspace() else 0.95 for ch in t) * fs
+
+
+def _est_width_real(text: str, fs: float = 96.0) -> float:
+    """번역의 실제 조판 폭 추정 — 한글 전각 0.88em, 공백·마침표 0.3em, 말줄임(자간 축소) 0.5em
+    (렌더 실측). 옆에 나란히 둘 때 끝 글자·말줄임이 원문에 닿지 않게 하는 데 쓴다."""
+    t = (text or "").replace("\\N", " ").replace("\\n", " ")
+    return sum(0.3 if (ch.isspace() or ch in ".,") else (0.5 if ch == "…" else 0.88) for ch in t) * fs
+
+
+def _push_clear(
+    cluster: tuple[float, float, float, float], kw: float, kw_wide: float,
+    occ_rects: list[tuple[float, float, float, float]],
+    korean: list[tuple[float, float, float, float]],
+    glyphs: list[tuple[float, float, float, float]],
+    rx: int, ry: int,
+    extra: float = 0.0,
+) -> Optional[tuple[float, float]]:
+    """원문 아래(안 되면 위)로 8px 씩 밀어 첫 빈 자리 — 글자 상자가 프레임 안에 드는 한.
+    _offset_place 의 후보(위·아래·쌓기·옆)가 전부 막혔을 때 원문 위에 겹쳐 놓지 않기 위한
+    마지막 후보 (실측 必死に… 줄: 위·아래가 대각선 번역 글자들과 겹친다 → 프레임 맨 아래)."""
+    cx, cy, _w, h = cluster
+    x = min(0.98 * rx - kw / 2.0, max(0.02 * rx + kw / 2.0, cx))
+    half = _KOR_LINE_H / 2.0
+
+    def free(y: float) -> bool:
+        return not (_rect_hit(x, y, kw, occ_rects, half + extra)
+                    or _rect_hit(x, y, kw, korean, half)
+                    or _rect_hit(x, y, kw_wide, glyphs, half))
+
+    y = cy + h / 2.0 + _OFF_GAP_BELOW_PX + extra
+    while y <= ry - half - 8.0:
+        if free(y):
+            return (x, y)
+        y += 8.0
+    y = cy - h / 2.0 - _OFF_GAP_PX - extra
+    while y >= half + 8.0:
+        if free(y):
+            return (x, y)
+        y -= 8.0
+    return None
 
 
 def _track_placements(
@@ -932,11 +1254,23 @@ def _track_placements(
 ) -> dict[int, _RegionPlace]:
     """트랙이 배정된 줄의 번역 자리 (px) — pairs 인덱스별 _RegionPlace.
 
-    · 세로 기둥(제목·세로 원문): 기둥 중심 우측 60px (프레임 밖이면 좌측).
+    · 세로 기둥(제목·세로 원문): _title_layout — 머리는 원문 머리 구의 높이에, 몸통은
+      원문 기둥의 위~아래에, x 는 원문 기둥 우측(겹치지 않게).
     · 대각선: 원문 첫 글자→끝 글자 진행선과 평행하게, 그 아래(좌하)로 120px +
       글자 반폭 비켜 놓는다 — (x,y) 는 시작점, 힌트의 diag_end 는 같은 만큼 옮긴 끝점.
-    · 가로: _offset_place (원문 위 → 아래 → 열 맨 아래 → 옆) — 같은 시간에 화면에
-      있는 다른 원문 덩어리(모든 트랙의 클러스터, 신뢰 ≥0.5)와 먼저 놓인 번역을 피한다.
+      같은 시간의 다른 원문에 닿으면 시작점을 둔 채 줄이되(글자 간격 64×1.02px 하한 — 확장기가
+      그 아래로는 끝점을 다시 늘린다), 그래도 안 되면 진행선의 반대편(위쪽)에 놓는다.
+      트랙이 '날아가는 글자' 의 경로를 실제로 쟀고(TextTrack.flyer) 번역이 2어절 이상이면
+      마지막 어절은 그 글자(날아가는 心)의 번역 — 힌트 fly(잰 경로와 나란한 경로·도착 시각)로
+      떼어 낸다. 덩어리 수 < 글자 수 같은 간접 근거로는 떼지 않는다.
+    · 가로: _offset_place (원문 위 → 아래 → 열 맨 아래 → 옆), 전부 막히면 _push_clear
+      — 같은 시간에 화면에 있는 다른 원문 덩어리(모든 트랙의 클러스터, 신뢰 ≥0.5)와
+      먼저 놓인 번역(글자별로 나뉘는 번역은 글자 상자마다)을 피한다. 자리는 첫 안정
+      프레임의 원문 상자에 대해 정하고, 마지막 안정 프레임의 상자(_track_motion)에 같은
+      상대 자리를 배율만큼 늘려 적용한 것과의 차가 힌트의 drift(\\move) 다 — 그 끝 자리가
+      끝 시각의 다른 원문과 겹치면 이동을 줄인다. 제자리에서 커지는 원문은 마지막 상자까지를
+      자리로 보고, 번역이 글자 상자보다 두꺼워지는 만큼(검은 글로우 30px·커지는 글자·그림자
+      층)을 원문과의 간격에 더한다. 아래 후보의 간격은 위보다 크다(_OFF_GAP_BELOW_PX).
     꼬리(stack)는 _place_lines 가 기둥 규칙으로 놓는다. 결정적, 예외 없음.
     """
     out: dict[int, _RegionPlace] = {}
@@ -952,13 +1286,19 @@ def _track_placements(
             all_tracks.append(t)
             seen.add(id(t))
     jp: list[tuple[int, int, tuple[float, float, float, float]]] = []
+    jp_end: list[tuple[int, int, tuple[float, float, float, float]]] = []   # 같은 덩어리의 마지막 자리
     for t in all_tracks:
         cl = [_unit_px(c, rx, ry) for c in (t.clusters or [])] or [_unit_px((t.cx, t.cy, t.w, t.h), rx, ry)]
         for c in cl:
             jp.append((int(t.start_ms), int(t.end_ms), c))
+            jp_end.append((int(t.start_ms), int(t.end_ms), _track_motion(t, c, rx, ry)[0]))
     korean: list[tuple[int, int, tuple[float, float, float, float]]] = []
+    glyphs: list[tuple[int, int, tuple[float, float, float, float]]] = []
     lo_x, hi_x = _FRAME_LO * rx, _FRAME_HI * rx
     lo_y, hi_y = _FRAME_LO * ry, _FRAME_HI * ry
+    n_on_track: dict[int, int] = {}
+    for i in timed:
+        n_on_track[id(rows[i].track)] = n_on_track.get(id(rows[i].track), 0) + 1
 
     def _text_of(i: int) -> str:
         p = pairs[i]
@@ -970,14 +1310,17 @@ def _track_placements(
         role = _role_of(pairs, i, r)
         kind = _track_kind(t)
         vertical = role == "title" or kind == "vertical"
-        drift = _track_drift(t, rx, ry)
-        if drift is not None and not any(drift):
-            drift = None
+        text = _text_of(i)
         diag = None
+        diag_up = None
+        src_diag = None
+        fly_path = None
+        fly_ms: Optional[tuple[int, int]] = None
         if not vertical and kind == "diagonal":
             cl = sorted((_unit_px(k, rx, ry) for k in t.clusters), key=lambda k: (k[0], k[1]))
             sx, sy = cl[0][0], cl[0][1]
             ex, ey = cl[-1][0], cl[-1][1]
+            src_diag = ((sx, sy), (ex, ey))
             dx, dy = ex - sx, ey - sy
             norm = (dx ** 2 + dy ** 2) ** 0.5 or 1.0
             dx, dy = dx / norm, dy / norm
@@ -990,15 +1333,79 @@ def _track_placements(
             shift_x = max(lo_x - min(sx2, ex2), 0.0) or min(hi_x - max(sx2, ex2), 0.0)
             shift_y = max(lo_y - min(sy2, ey2), 0.0) or min(hi_y - max(sy2, ey2), 0.0)
             diag = ((sx2 + shift_x, sy2 + shift_y), (ex2 + shift_x, ey2 + shift_y))
-        hint = _track_hint(t, c, drift, rx, ry, diag, "vertical" if vertical else kind)
-        kw = _KOR_LINE_H if vertical else _est_width(_text_of(i))
+            # 반대편(진행선 위쪽) 후보 — 아래쪽이 다른 원문에 막혀 줄일 수도 없을 때
+            ux2, uy2, vx2, vy2 = sx - nx * off, sy - ny * off, ex - nx * off, ey - ny * off
+            sh_x = max(lo_x - min(ux2, vx2), 0.0) or min(hi_x - max(ux2, vx2), 0.0)
+            sh_y = max(lo_y - min(uy2, vy2), 0.0) or min(hi_y - max(uy2, vy2), 0.0)
+            diag_up = ((ux2 + sh_x, uy2 + sh_y), (vx2 + sh_x, vy2 + sh_y))
+            # 날아가는 글자는 media.text_timeline 이 경로를 실제로 잰 트랙(flyer)만 — 덩어리 수가
+            # 글자 수보다 적다는 것만으로는(붙어 잡힌 글자) 날아가는 글자가 있다는 근거가 아니다.
+            # 그 번역은 원문 진행선의 위쪽(번역 대각선의 반대편)으로, 진행선 바로 위를 나는 원문
+            # 글자 하나(2×반폭)를 넘겨 비켜서 잰 경로와 나란히 난다 (반폭만 비키면 날아가는 心 과
+            # 내내 겹친다). 잰 경로가 대각선 끝 글자까지 갔으면 도착점은 그다음 칸(내려앉는 자리).
+            fl = getattr(t, "flyer", None)
+            if fl is not None and len(fl) >= 6:
+                step = norm / max(1, len(cl) - 1)
+                up = 3.0 * half + 0.6 * 70.0
+                p0 = (float(fl[0]) * rx, float(fl[1]) * ry)
+                p1 = (float(fl[2]) * rx, float(fl[3]) * ry)
+                if ((p1[0] - ex) ** 2 + (p1[1] - ey) ** 2) ** 0.5 <= 1.5 * step:
+                    p1 = (ex + dx * step, ey + dy * step)
+                fly_path = ((p0[0] - nx * up, p0[1] - ny * up), (p1[0] - nx * up, p1[1] - ny * up))
+                fly_ms = (int(fl[4]), int(fl[5]))
+        sole = n_on_track.get(id(t), 1) == 1
+        accents = _line_accents(t, r.cluster, sole, c, pairs[i].source, rx, ry)
+        drift: Optional[tuple[float, float]] = None
+        scale = 1.0
+        kw = _KOR_LINE_H if vertical else _est_width(text)
+        title: Optional[dict] = None
         if vertical:
-            x = c[0] + _VERT_SIDE_PX
-            if x + kw / 2.0 > hi_x:
-                x = c[0] - _VERT_SIDE_PX
-            x, y = min(hi_x, max(lo_x, x)), min(hi_y, max(lo_y, c[1]))
+            n_let = _nletters(text)
+            title = _title_layout(t, all_tracks, n_let - 3 if n_let >= 6 else n_let, rx, ry)
+            x = min(0.98 * rx - kw / 2.0, max(0.02 * rx + kw / 2.0, title["x"]))
+            y = min(hi_y, max(lo_y, c[1]))
+            if title["head_pos"] is not None:
+                title["head_pos"] = (x, title["head_pos"][1])
             bounds = _cluster_bbox([c])
         elif diag is not None:
+            # 번역 대각선의 글자가 같은 시간에 떠 있는 다른 원문(뒤에 뜨는 必死に… 줄)에
+            # 닿으면 시작점을 둔 채 닿지 않을 때까지 줄인다 (글자 간격은 확장기가 fs 로 맞춘다)
+            own_cl = [_unit_px(k, rx, ry) for k in t.clusters]
+            occ_d = [_cluster_rect(o) for s, e, o in jp
+                     if min(e, r.end) - max(s, r.start) >= _TRACK_ATTACH_MS and o not in own_cl]
+            words_d = text.replace("\\N", " ").replace("\\n", " ").split()
+            diag_txt = " ".join(words_d[:-1]) if fly_path is not None and len(words_d) >= 2 else text
+            # 확장기는 글자 간격이 64×1.02px 아래로 내려가면 끝점을 다시 늘린다 — 그보다 짧게는
+            # 줄이지 않는다 (줄여도 늘어나 회피가 무효가 되고, 등록한 글자 상자와 실제가 달라진다)
+            n_d = max(2, len([ch for ch in diag_txt if not ch.isspace()]))
+            full_len = ((diag[1][0] - diag[0][0]) ** 2 + (diag[1][1] - diag[0][1]) ** 2) ** 0.5 or 1.0
+            f_min = min(1.0, _DIAG_MIN_STEP * (n_d - 1) / full_len)
+            shrunk = False
+            # 아래쪽을 줄여 보고, 안 되면 반대편(위쪽 — 날아가는 글자의 번역이 그쪽을 쓰면 제외).
+            # 위쪽은 원문 글자·먼저 놓인 번역 글자와도 안 겹쳐야 한다.
+            sides = [(diag, occ_d)]
+            if diag_up is not None and fly_path is None:
+                kor_d = [rect for s_, e_, rect in korean + glyphs
+                         if min(e_, r.end) - max(s_, r.start) >= _TRACK_ATTACH_MS]
+                sides.append((diag_up, occ_d + kor_d))
+            for cand, blocked in sides:
+                for f in (1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5):
+                    if f < f_min:
+                        break
+                    end_f = (cand[0][0] + (cand[1][0] - cand[0][0]) * f,
+                             cand[0][1] + (cand[1][1] - cand[0][1]) * f)
+                    rects = _glyph_rects(diag_txt, cand[0], end_f)
+                    if not any(g[0] < o[2] and g[2] > o[0] and g[1] < o[3] and g[3] > o[1]
+                               for g in rects for o in blocked):
+                        diag = (cand[0], end_f)
+                        shrunk = True
+                        break
+                if shrunk:
+                    break
+            if not shrunk:
+                f = max(f_min, 0.5)
+                diag = (diag[0], (diag[0][0] + (diag[1][0] - diag[0][0]) * f,
+                                  diag[0][1] + (diag[1][1] - diag[0][1]) * f))
             x, y = diag[0]
             bounds = _cluster_bbox([(min(diag[0][0], diag[1][0]) + abs(diag[1][0] - diag[0][0]) / 2.0,
                                      min(diag[0][1], diag[1][1]) + abs(diag[1][1] - diag[0][1]) / 2.0,
@@ -1009,13 +1416,77 @@ def _track_placements(
                    if min(e, r.end) - max(s, r.start) >= _TRACK_ATTACH_MS and not _same_slot(o, c)]
             kor = [rect for s, e, rect in korean
                    if min(e, r.end) - max(s, r.start) >= _TRACK_ATTACH_MS]
-            x, y = _offset_place(c, kw, occ, kor, rx, ry)
+            gl = [rect for s, e, rect in glyphs
+                  if min(e, r.end) - max(s, r.start) >= _TRACK_ATTACH_MS]
+            # 제자리에서 일그러지는 원문은 마지막 상자까지 세로로 부푼다 — 그 범위를 피한다
+            c_fit = c
+            bl = getattr(t, "box_last", None)
+            if bl and float(getattr(t, "deform", 0.0) or 0.0) >= 0.25:
+                l = _unit_px(bl, rx, ry)
+                y0 = min(c[1] - c[3] / 2.0, l[1] - l[3] / 2.0)
+                y1 = max(c[1] + c[3] / 2.0, l[1] + l[3] / 2.0)
+                c_fit = (c[0], (y0 + y1) / 2.0, c[2], y1 - y0)
+            # 제자리에서 커지는 원문(중심이 글자 반높이 안에 머문다)은 마지막 상자까지가 그 자리다
+            c_last, scale = _track_motion(t, c, rx, ry)
+            if abs(scale - 1.0) > 0.03 and abs(c_last[1] - c[1]) <= c[3] / 2.0:
+                y0 = min(c_fit[1] - c_fit[3] / 2.0, c_last[1] - c_last[3] / 2.0)
+                y1 = max(c_fit[1] + c_fit[3] / 2.0, c_last[1] + c_last[3] / 2.0)
+                c_fit = (c_fit[0], (y0 + y1) / 2.0, c_fit[2], y1 - y0)
+            # 번역이 글자 상자보다 두꺼워지는 만큼(검은 글로우·커지는 글자·그림자 층) 더 띄운다
+            extra = 0.0
+            if getattr(t, "halo", None) == "dark":
+                extra += _GLOW_CLEAR_PX
+            if scale > 1.0:
+                extra += (scale - 1.0) * _KOR_LINE_H / 2.0
+            if any(a.get("cover") == "shadow" for a in accents):
+                extra += _SHADOW_CLEAR_PX
+            placed = _offset_place(c_fit, kw, occ, kor, rx, ry, glyphs=gl,
+                                   kw_wide=_est_width_wide(text), strict=True, nudge=True,
+                                   extra=extra, side_w=_est_width_real(text))
+            if placed is None:
+                placed = _push_clear(c_fit, kw, _est_width_wide(text),
+                                     [_cluster_rect(o) for o in occ], kor, gl, rx, ry,
+                                     extra=extra)
+            if placed is None:
+                placed = (min(hi_x, max(lo_x, c[0])), min(hi_y, max(lo_y, c[1])))
+            x, y = placed
             bounds = tuple(int(round(v)) for v in
                            (x - kw / 2.0, y - _KOR_LINE_H / 2.0, x + kw / 2.0, y + _KOR_LINE_H / 2.0))
-        if hint.get("drift") is not None:
-            hint["drift"] = _fit_drift(x, y, hint["drift"], rx, ry)
-        rect = (x - kw / 2.0, y - _KOR_LINE_H / 2.0, x + kw / 2.0, y + _KOR_LINE_H / 2.0)
-        korean.append((int(r.start), int(r.end), rect))
+            # 이동·크기: 마지막 안정 프레임의 원문 상자에 같은 상대 자리(배율만큼 늘려)
+            ex_, ey_ = c_last[0] + (x - c[0]) * scale, c_last[1] + (y - c[1]) * scale
+            d = _fit_drift(x, y, _cap_drift((ex_ - x, ey_ - y)), rx, ry)
+            # 끝 자리가 같은 시간의 다른 원문과 겹치면 겹치지 않을 때까지 이동을 줄인다
+            # (함께 흐르는 블록의 이웃 원문은 끝 시각엔 옮겨 가 있다 — 첫 자리와 견주면 거짓 충돌)
+            occ_r = [_cluster_rect(oe) for (s_, e_, o), (_s2, _e2, oe) in zip(jp, jp_end)
+                     if min(e_, r.end) - max(s_, r.start) >= _TRACK_ATTACH_MS and not _same_slot(o, c)]
+            for k_d in (1.0, 0.75, 0.5, 0.25, 0.0):
+                if not _rect_hit(x + d[0] * k_d, y + d[1] * k_d, kw * scale, occ_r,
+                                 _KOR_HALF_H * scale):
+                    d = (d[0] * k_d, d[1] * k_d)
+                    break
+            # None = 정지(또는 모름) — 문턱 이하의 떨림은 이동이 아니다
+            drift = d if (d[0] ** 2 + d[1] ** 2) ** 0.5 > _TRACK_MOVE_PX else None
+        hint = _track_hint(t, c, drift, rx, ry, diag, "vertical" if vertical else kind,
+                           scale=scale, accents=accents, src_text=pairs[i].source)
+        if title is not None:
+            hint.update(head_pos=title["head_pos"], body_top=title["body_top"],
+                        body_bottom=title["body_bottom"], ramp=title["ramp"],
+                        head_fs=title["head_fs"])
+        if diag is not None and src_diag is not None:
+            words = text.replace("\\N", " ").replace("\\n", " ").split()
+            diag_text = text
+            if fly_path is not None and len(words) >= 2:
+                # 잰 날아가는 글자가 있다 — 원문 끝 글자(心)의 번역인 마지막 어절을 떼어 그 경로로
+                diag_text = " ".join(words[:-1])
+                hint["fly"] = {"text": words[-1], "from": fly_path[0], "to": fly_path[1],
+                               "start_ms": fly_ms[0] if fly_ms else None,
+                               "end_ms": fly_ms[1] if fly_ms else None}
+                hint["diag_text"] = diag_text
+            for rect in _glyph_rects(diag_text, diag[0], diag[1]):
+                glyphs.append((int(r.start), int(r.end), rect))
+        else:
+            rect = (x - kw / 2.0, y - _KOR_LINE_H / 2.0, x + kw / 2.0, y + _KOR_LINE_H / 2.0)
+            korean.append((int(r.start), int(r.end), rect))
         out[i] = _RegionPlace(x=float(x), y=float(y), bounds=bounds, own=[c], hint=hint,  # type: ignore[arg-type]
                               leader=True)
     return out
@@ -1069,6 +1540,10 @@ _REGION_GLYPH_PX = 86.0       # 원문 1자 폭 추정 (1080p, 실측 fs≈96)
 _DIAG_MIN_CLUSTERS = 5        # 대각선 판정에 필요한 글자 덩어리 수 (실측 7; 잡티 4개 오판 방지)
 _DIAG_MIN_CONF = 0.6
 _OFF_GAP_PX = 40.0            # 번역 중심 = 원문 상단(하단) ± 이 값 (레퍼런스 실측 21~51)
+_OFF_GAP_BELOW_PX = 64.0      # 아래에 둘 때: 번역 반높이(_KOR_LINE_H/2) + 16 — 글자의 시각 중심이 위로 치우쳐
+                              # 40px 로는 글자 윗선이 원문 아랫선에 닿는다 (트랙 상자 h 는 실제 글자보다 8~12px 작다)
+_GLOW_CLEAR_PX = 30.0         # 검은 글로우(bord 30) 줄이 원문에서 더 떨어져야 하는 거리
+_SHADOW_CLEAR_PX = 56.0       # 그림자에 잠식되는(eclipse) 줄: 그림자 층 반높이(≈fs×1.08) − 글자 반높이
 _OFF_SIDE_GAP_PX = 20.0       # 옆에 둘 때 원문 끝과 번역 끝 사이 여백
 _KOR_HALF_H = 34.0            # 충돌 판정용 번역 반높이 (fs 96 한글 실높이 ~70) — _OFF_GAP_PX 보다 작아야 위/아래 후보가 원문과 안 겹친다
 _KOR_LINE_H = 96.0            # 아래로 쌓을 때 행 간격의 기준
@@ -1276,9 +1751,10 @@ def _region_hint(
 
 
 def _rect_hit(x: float, y: float, kw: float,
-              rects: list[tuple[float, float, float, float]]) -> bool:
+              rects: list[tuple[float, float, float, float]],
+              half: float = _KOR_HALF_H) -> bool:
     x0, x1 = x - kw / 2.0, x + kw / 2.0
-    y0, y1 = y - _KOR_HALF_H, y + _KOR_HALF_H
+    y0, y1 = y - half, y + half
     return any(x0 < r[2] and x1 > r[0] and y0 < r[3] and y1 > r[1] for r in rects)
 
 
@@ -1294,8 +1770,25 @@ def _offset_place(
     rx: int,
     ry: int,
     vertical: bool = False,
-) -> tuple[float, float]:
+    glyphs: Optional[list[tuple[float, float, float, float]]] = None,
+    kw_wide: Optional[float] = None,
+    strict: bool = False,
+    nudge: bool = False,
+    extra: float = 0.0,
+    side_w: Optional[float] = None,
+) -> Optional[tuple[float, float]]:
     """원문 덩어리(cx, cy, w, h) 옆의 빈 자리에 번역(폭 kw)을 둔다.
+
+    side_w: 옆(좌/우) 후보에 쓸 실제 조판 폭 (_est_width_real) — 없으면 kw.
+
+    extra: 번역이 글자 상자보다 더 차지하는 두께(검은 글로우·커지는 글자·그림자 층, px) —
+    원문과의 간격과 원문 충돌 판정 반높이에 더한다.
+
+    glyphs: 글자별로 나뉘어 놓인 다른 번역의 글자 상자들(대각선 등) — 넉넉한 폭(kw_wide)
+    과 글자 크기 높이로 피한다. strict 면 전부 실패했을 때 원문 중심 대신 None (호출자가
+    _push_clear 로 더 찾는다). nudge 면 위/아래 후보가 *먼저 놓인 번역과만* 가로로 겹칠 때
+    번역 폭의 절반 안에서 옆으로 비켜 본다 (원문 두 구가 나란하고 번역이 원문보다 넓을 때:
+    絶えず｜久方の 위의 '질 줄 모르고'｜'찬란히 비추는' — 레퍼런스 659/1263).
 
     후보 순서: 기본 [위, 아래, 열 맨 아래에 쌓기, 옆]; 오른쪽 가장자리에 여러 행으로
     쌓인 원문은 [왼쪽 옆, 위, 아래, 쌓기]; 세로 기둥(vertical — 번역도 세로로
@@ -1309,20 +1802,28 @@ def _offset_place(
     x0, x1 = cx - w / 2.0, cx + w / 2.0
     lo_x, hi_x = _FRAME_LO * rx, _FRAME_HI * rx
     lo_y, hi_y = _FRAME_LO * ry, _FRAME_HI * ry
-    above = (cx, cy - h / 2.0 - _OFF_GAP_PX)
-    below = (cx, cy + h / 2.0 + _OFF_GAP_PX)
-    left = (x0 - _OFF_SIDE_GAP_PX - kw / 2.0, cy)
-    right = (x1 + _OFF_SIDE_GAP_PX + kw / 2.0, cy)
+    above = (cx, cy - h / 2.0 - _OFF_GAP_PX - extra)
+    below = (cx, cy + h / 2.0 + _OFF_GAP_BELOW_PX + extra)
+    # 옆 후보는 실제 조판 폭(공백·말줄임 포함)으로 — 글자 수 기반 폭은 '고개 한 번…' 같은 줄에서 80px
+    # 모자라 말줄임이 원문 첫 글자에 맞닿는다
+    kw_side = max(kw, side_w) if side_w is not None else kw
+    left = (x0 - _OFF_SIDE_GAP_PX - extra - kw_side / 2.0, cy)
+    right = (x1 + _OFF_SIDE_GAP_PX + extra + kw_side / 2.0, cy)
     occ_rects = [_cluster_rect(o) for o in occupied]
+    occ_half = _KOR_HALF_H + extra
 
     def stack_bottom() -> tuple[float, float]:
         bottoms = [o[1] + o[3] / 2.0 for o in occupied
                    if (o[0] - o[2] / 2.0) < cx + kw / 2.0 and (o[0] + o[2] / 2.0) > cx - kw / 2.0]
-        y = max(bottoms + [cy + h / 2.0]) + _OFF_GAP_PX
+        y = max(bottoms + [cy + h / 2.0]) + _OFF_GAP_BELOW_PX + extra
         for _ in range(8):
-            if not _rect_hit(cx, y, kw, korean):
+            hits = [k for k in korean
+                    if cx - kw / 2.0 < k[2] and cx + kw / 2.0 > k[0]
+                    and y - _KOR_HALF_H < k[3] and y + _KOR_HALF_H > k[1]]
+            if not hits:
                 break
-            y += _KOR_LINE_H + _OFF_GAP_PX     # 레퍼런스의 번역 행 간격 ~145px
+            # 걸린 번역 바로 아래 행 (번역 행 간격 = 글자 높이 + 16)
+            y = max(y + 8.0, max(k[3] for k in hits) + _KOR_LINE_H / 2.0 + 16.0)
         return (cx, y)
 
     stacked = any(abs(o[0] - cx) < 0.5 * max(w, o[2], 1.0)
@@ -1336,13 +1837,40 @@ def _offset_place(
     else:
         side = left if cx >= rx / 2.0 else right
         cands = [above, below, stack_bottom(), side]
+    def _nudged(x: float, y: float) -> Optional[float]:
+        """(x,y) 가 먼저 놓인 번역과만 겹칠 때 그 번역들을 벗어나는 가장 가까운 x."""
+        hits = [r for r in korean
+                if x - kw / 2.0 < r[2] and x + kw / 2.0 > r[0]
+                and y - _KOR_HALF_H < r[3] and y + _KOR_HALF_H > r[1]]
+        if not hits:
+            return None
+        right = max(r[2] for r in hits) + _COLLIDE_GAP_PX + kw / 2.0
+        left = min(r[0] for r in hits) - _COLLIDE_GAP_PX - kw / 2.0
+        for nx in sorted((right, left), key=lambda v: abs(v - x)):
+            if (abs(nx - x) <= kw / 2.0 and lo_x <= nx <= hi_x
+                    and nx - kw / 2.0 >= 0.02 * rx and nx + kw / 2.0 <= 0.98 * rx
+                    and not _rect_hit(nx, y, kw, occ_rects, occ_half)
+                    and not _rect_hit(nx, y, kw, korean)):
+                return nx
+        return None
+
     for x, y in cands:
         if not (lo_x <= x <= hi_x and lo_y <= y <= hi_y
                 and x - kw / 2.0 >= 0.02 * rx and x + kw / 2.0 <= 0.98 * rx):
             continue
-        if _rect_hit(x, y, kw, occ_rects) or _rect_hit(x, y, kw, korean):
+        if (nudge and not vertical and (x, y) in (above, below)
+                and not _rect_hit(x, y, kw, occ_rects, occ_half) and _rect_hit(x, y, kw, korean)):
+            nx = _nudged(x, y)
+            if nx is not None:
+                x = nx
+        if _rect_hit(x, y, kw, occ_rects, occ_half) or _rect_hit(x, y, kw, korean):
+            continue
+        if glyphs and _rect_hit(x, y, kw_wide if kw_wide is not None else kw, glyphs,
+                                _KOR_LINE_H / 2.0):
             continue
         return (x, y)
+    if strict:
+        return None
     return (min(hi_x, max(lo_x, cx)), min(hi_y, max(lo_y, cy)))
 
 
@@ -1737,8 +2265,14 @@ def _place_lines(
         x = round(min(_FRAME_HI, max(_FRAME_LO, cx)) * play_res_x)
         y = round(min(_FRAME_HI, max(_FRAME_LO, cy)) * play_res_y)
         if rp is not None:
+            # 트랙 자리(_push_clear)는 글자 상자가 프레임 안이면 안쪽 띠 밖(맨 아래 줄)도 된다
+            by_track = bool(rp.hint and rp.hint.get("source") == "track")
+            y_lo = min(_FRAME_LO * play_res_y, _KOR_LINE_H / 2.0 + 8.0) if by_track \
+                else _FRAME_LO * play_res_y
+            y_hi = max(_FRAME_HI * play_res_y, play_res_y - _KOR_LINE_H / 2.0 - 8.0) if by_track \
+                else _FRAME_HI * play_res_y
             x = int(round(min(_FRAME_HI * play_res_x, max(_FRAME_LO * play_res_x, rp.x))))
-            y = int(round(min(_FRAME_HI * play_res_y, max(_FRAME_LO * play_res_y, rp.y))))
+            y = int(round(min(y_hi, max(y_lo, rp.y))))
         if r.stack >= 0:
             # 글자 스택 — 아래→위 (완성본 패턴). x 는 트랙(원문 글자 기둥 우측 120px)
             # 또는 영역이 잡은 기둥 위치.
@@ -1759,12 +2293,16 @@ def _place_lines(
             dark = bool(v is not None and v.sampled
                         and v.brightness > _DARK_BRIGHTNESS)
         dx = dy = 0
+        hint = dict(rp.hint) if rp is not None and rp.hint else None
         if rp is not None:
-            d = rp.hint.get("drift") if rp.hint else None
+            d = hint.get("drift") if hint else None
             if r.stack < 0 and d is not None:
                 dxf, dyf = _fit_drift(x, y, d, play_res_x, play_res_y)
-                if (dxf ** 2 + dyf ** 2) ** 0.5 >= _REGION_MOVE_PX:
+                min_move = _TRACK_MOVE_PX if hint.get("source") == "track" else _REGION_MOVE_PX
+                if (dxf ** 2 + dyf ** 2) ** 0.5 >= min_move:
                     dx, dy = int(round(dxf)), int(round(dyf))
+                # 힌트의 drift 는 실제로 쓸 \\move 와 같게 — 디렉터가 같은 값으로 drift_scale 을 정한다
+                hint["drift"] = (float(dx), float(dy)) if (dx or dy) else None
         else:
             drift = (abs(v.gx1 - v.gx0) + abs(v.gy1 - v.gy0)
                      if v is not None and v.sampled and v.salient > 0.003 else 0.0)
@@ -1777,7 +2315,7 @@ def _place_lines(
                            x=x, y=y, dark=dark, dx=dx, dy=dy,
                            pinned=rp is not None,
                            bounds=rp.bounds if rp is not None else None,
-                           hint=rp.hint if rp is not None else None,
+                           hint=hint,
                            role=_role_of(pairs, i, r, tr)))
     return out
 
@@ -2060,6 +2598,55 @@ def _spread_collisions(lines: list, rx: int, ry: int,
     return moved
 
 
+_NARR_MIN_MS = 2500     # 나레이션 한 덩어리가 최소 이만큼은 보여야 한다
+_NARR_GAP_MS = 150      # 덩어리 사이 빈 시간
+_NARR_TITLE_LEAD_MS = 100   # 제목 카드가 뜬 뒤 이만큼 있다가 첫 덩어리 (레퍼런스 4.00 → 4.10)
+
+
+def narration_chunks(text: str, start_ms: int, end_ms: int) -> list[tuple[str, int, int]]:
+    """여러 행 나레이션 → 순차 표시할 (한 줄 텍스트, 시작, 끝) 덩어리들.
+
+    붙여넣은 행(\\N)을 순서대로 공백으로 이어 붙여 k 덩어리로 묶는다 — k 는 모든 덩어리가
+    _NARR_MIN_MS 이상 보이는 최대 개수(행 수 이하)이고, 묶음 경계는 가장 긴 덩어리의 글자
+    수가 최소가 되는 연속 분할. 시간은 글자 수 비례, 덩어리 사이 _NARR_GAP_MS. 레퍼런스:
+    4행·7.4s → '겨울날 해질녘, 혹독한 바람이 부는 가운데' / '소녀의 그림자가 … 시작되었다.'
+    결정적, 예외 없음."""
+    from itertools import combinations
+    parts = [seg.strip() for seg in
+             (text or "").replace("\\n", "\\N").replace("\n", "\\N").split("\\N")]
+    parts = [seg for seg in parts if seg]
+    start_ms, end_ms = int(start_ms), int(end_ms)
+    if not parts:
+        return []
+    if end_ms <= start_ms:
+        return [(" ".join(parts), start_ms, max(end_ms, start_ms))]
+    lens = [max(1, _nletters(seg)) for seg in parts]
+    n = len(parts)
+    dur = end_ms - start_ms
+    for k in range(min(n, max(1, dur // _NARR_MIN_MS), 8), 0, -1):
+        best: Optional[tuple[int, tuple[int, ...]]] = None
+        for cuts in combinations(range(1, n), k - 1):
+            edges = (0,) + cuts + (n,)
+            worst = max(sum(lens[a:b]) for a, b in zip(edges, edges[1:]))
+            if best is None or worst < best[0]:
+                best = (worst, edges)
+        assert best is not None
+        edges = best[1]
+        sizes = [sum(lens[a:b]) for a, b in zip(edges, edges[1:])]
+        avail = dur - _NARR_GAP_MS * (k - 1)
+        spans = [avail * z / float(sum(sizes)) for z in sizes]
+        if k > 1 and min(spans) < _NARR_MIN_MS:
+            continue
+        out: list[tuple[str, int, int]] = []
+        t = float(start_ms)
+        for idx, (a, b) in enumerate(zip(edges, edges[1:])):
+            e = end_ms if idx == k - 1 else t + spans[idx]
+            out.append((" ".join(parts[a:b]), int(round(t / 10.0)) * 10, int(round(e / 10.0)) * 10))
+            t = e + _NARR_GAP_MS
+        return out
+    return [(" ".join(parts), start_ms, end_ms)]
+
+
 def place_fx_lines(
     pairs: list[LyricPair],
     rows: list[_Row],
@@ -2092,6 +2679,16 @@ def place_fx_lines(
         stagger_ms + 공통 end 와 같은 모델이라 정보 손실이 없다.
     합쳐진 줄의 row_indices 는 첫 꼬리 쌍의 인덱스, 좌표는 맨 아래 글자의
     자리(stack 0), 흑백은 첫 꼬리 줄의 장면 분석을 따른다.
+
+    한 쌍이 여러 FxLine 이 되는 경우 (row_indices 는 같은 값):
+      · 프롤로그(나레이션): narration_chunks 로 나눈 덩어리들이 제목 카드 구간
+        [제목 시작+0.1s, 첫 가사 줄 시작) 에 순차로 — 그 줄과 실제로 겹치는 제목이 있을
+        때만(곡 중간의 프롤로그는 옮기지 않는다), 그 구간이 자기 구간·최소 표시 시간보다
+        짧으면 자기 끝까지. 같은 제목 구간을 받는 프롤로그가 여러 쌍이면 글자 수 비례로
+        나눠 순차. 좌표는 쓰이지 않는다(subtitle = 기본 하단) — 벌리기에서도 제외.
+      · 대각선 줄의 힌트에 fly 가 있으면(_track_placements — 잰 flyer 가 있을 때만) 마지막
+        어절을 떼어 잰 경로와 나란히 날아가는 줄(힌트 layout='fly')로 따로 낸다.
+      · 꼬리 합본의 힌트: 글자마다 원문 글자 트랙을 받았으면 그 중심 y 와 등장 시각(ys/starts).
     """
     from effects.typeset_fx_schema import FxLine
 
@@ -2104,26 +2701,102 @@ def place_fx_lines(
     pinned: set[int] = set()
     bounds: dict[int, tuple[int, int, int, int]] = {}
     tail: list[_Placed] = []
+    free: set[int] = set()        # 벌리기에서 빼는 줄 (하단 나레이션, 날아가는 단어)
+    title_spans = [(int(pl.row.start), int(pl.row.end)) for pl in placed if pl.role == "title"]
+
+    def _narr_window(q: _Placed) -> tuple[int, int, Optional[int]]:
+        """프롤로그 줄의 표시 구간 (시작, 끝, 덮는 제목의 시작|None). 제목 카드가 실제로 이 줄과
+        겹칠 때만(제목이 먼저/같이 뜨고, 이 줄이 제목 구간 안에서 시작) 제목 구간 [제목+0.1s, 첫
+        가사 줄)을 쓴다. 그 구간이 이 줄 자신의 구간이나 최소 표시 시간보다 짧으면(측정 실패로
+        첫 가사가 이르게 잡힌 경우) 자신의 끝까지 — 하단 자막은 본문과 자리를 다투지 않는다."""
+        n0, n1 = int(q.row.start), int(q.row.end)
+        cover = [ts for ts, te in title_spans if ts <= n0 + 1000 and n0 < te]
+        if not cover:
+            return n0, n1, None
+        ts = max(cover)
+        w0 = ts + _NARR_TITLE_LEAD_MS
+        after = [int(o.row.start) for o in placed
+                 if o.role not in ("title", "prologue") and int(o.row.start) > w0]
+        w1 = min(after) if after else n1
+        if w1 - w0 < max(_NARR_MIN_MS, n1 - n0):
+            w1 = max(w1, n1, w0 + _NARR_MIN_MS)
+        return w0, w1, ts
+
+    # 같은 제목 구간을 받는 프롤로그가 여러 쌍이면 글자 수 비례로 나눠 순차 표시
+    narr_win: dict[int, tuple[int, int]] = {}
+    by_title: dict[int, list[_Placed]] = {}
+    for q in placed:
+        if q.role == "prologue" and q.row.stack < 0:
+            w0, w1, ts = _narr_window(q)
+            narr_win[q.index] = (w0, w1)
+            if ts is not None:
+                by_title.setdefault(ts, []).append(q)
+    for qs in by_title.values():
+        if len(qs) < 2:
+            continue
+        qs.sort(key=lambda q: (int(q.row.start), q.index))
+        w0 = min(narr_win[q.index][0] for q in qs)
+        w1 = max(narr_win[q.index][1] for q in qs)
+        lens = [max(1, _nletters(q.text)) for q in qs]
+        avail = max(0, (w1 - w0) - _NARR_GAP_MS * (len(qs) - 1))
+        t_cur = float(w0)
+        for q, ln in zip(qs, lens):
+            t_end = t_cur + avail * ln / float(sum(lens))
+            narr_win[q.index] = (int(round(t_cur)), int(round(t_end)))
+            t_cur = t_end + _NARR_GAP_MS
     for pl in placed:
         r = pl.row
         if r.stack >= 0:
             tail.append(pl)
             continue
+        style = DARK_STYLE if pl.dark else LIGHT_STYLE
+        if pl.role == "prologue":
+            n_start, n_end = narr_win.get(pl.index, (int(r.start), int(r.end)))
+            for ctext, cs, ce in narration_chunks(pl.text, n_start, n_end):
+                free.add(len(fx_lines))
+                fx_lines.append(FxLine(text=ctext, start_ms=cs, end_ms=max(ce, cs + 10),
+                                       style=style, x=rx // 2, y=int(ry * _FRAME_HI), dark=pl.dark))
+                roles.append("prologue")
+                row_indices.append(pl.index)
+                hints.append(None)
+            continue
         x, y = pl.x, pl.y
+        text = pl.text
+        fly = None
         if pl.hint and pl.hint.get("layout") == "diagonal" and pl.hint.get("diag_start"):
             sx, sy = pl.hint["diag_start"]
             x, y = int(round(sx)), int(round(sy))
+            fly = pl.hint.get("fly")
+            if fly and pl.hint.get("diag_text"):
+                text = str(pl.hint["diag_text"])
         if pl.pinned:
             pinned.add(len(fx_lines))
         if pl.bounds is not None:
             bounds[len(fx_lines)] = pl.bounds
         fx_lines.append(FxLine(
-            text=pl.text, start_ms=int(r.start), end_ms=int(r.end),
-            style=DARK_STYLE if pl.dark else LIGHT_STYLE,
-            x=x, y=y, dark=pl.dark))
+            text=text, start_ms=int(r.start), end_ms=int(r.end),
+            style=style, x=x, y=y, dark=pl.dark))
         roles.append(pl.role)
         row_indices.append(pl.index)
         hints.append(pl.hint)
+        if fly and fly.get("text"):
+            fx0, fy0 = fly["from"]
+            fx1, fy1 = fly["to"]
+            free.add(len(fx_lines))
+            fx_lines.append(FxLine(
+                text=str(fly["text"]), start_ms=int(r.start), end_ms=int(r.end),
+                style=style, x=int(round(fx1)), y=int(round(fy1)), dark=pl.dark))
+            roles.append(pl.role)
+            row_indices.append(pl.index)
+            hints.append({
+                "layout": "fly", "fly_from": (float(fx0), float(fy0)),
+                "fly_to": (float(fx1), float(fy1)), "source": "track",
+                "fly_end_ms": fly.get("end_ms"),
+                "fill_color": pl.hint.get("fill_color"), "halo": pl.hint.get("halo"),
+                "halo_color": pl.hint.get("halo_color"), "dark_text": pl.hint.get("dark_text"),
+                "confidence": pl.hint.get("confidence", 0.0), "accents": [], "drift": None,
+                "scale": 1.0, "deform": 0.0, "exit_smear_ms": None,
+            })
     if tail:
         tail.sort(key=lambda t: t.row.stack)
         first = tail[0]
@@ -2136,10 +2809,23 @@ def place_fx_lines(
             x=first.x, y=first.y, dark=first.dark))
         roles.append("tail")
         row_indices.append(first.index)
-        hints.append(None)
-    _spread_collisions(fx_lines, rx, ry,
-                       fixed={k for k, role in enumerate(roles) if role == "title"},
-                       pinned=pinned, bounds=bounds)
+        # 글자마다 원문 글자 트랙을 받았으면 그 행(중심 y)과 등장 시각을 그대로 쓴다 — 원문 글자
+        # 행은 위로 갈수록 간격이 좁아진다 (균등 배치는 둘째 글자부터 60~90px 어긋난다)
+        tail_hint: Optional[dict] = None
+        if len(tail) >= 2 and all(t.row.unit is not None and t.row.track is not None for t in tail):
+            tail_hint = {
+                "layout": "stack", "source": "track",
+                "ys": [float(t.row.unit[1]) for t in tail],
+                "starts": [max(0, int(t.row.start) - start) for t in tail],
+            }
+        hints.append(tail_hint)
+    # 벌리기 — 하단 나레이션·날아가는 단어는 자리를 다투지 않는다
+    idx = [k for k in range(len(fx_lines)) if k not in free]
+    back = {k: j for j, k in enumerate(idx)}
+    _spread_collisions([fx_lines[k] for k in idx], rx, ry,
+                       fixed={back[k] for k in idx if roles[k] == "title"},
+                       pinned={back[k] for k in pinned if k in back},
+                       bounds={back[k]: b for k, b in bounds.items() if k in back})
     # 시작 시간 순서 유지 (꼬리 합본은 원래도 마지막이지만 안전하게)
     order = sorted(range(len(fx_lines)),
                    key=lambda k: (fx_lines[k].start_ms, row_indices[k]))

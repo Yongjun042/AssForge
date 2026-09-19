@@ -450,10 +450,10 @@ class LyricTypesetResult:
     language: str
     n_graphic: int       # 그래픽 이벤트가 시간 근거인 줄 수
     n_events: int        # 감지된 그래픽 이벤트 수
-    used_llm: bool = False          # AI 연출을 LLM 이 정했는지 (False = 규칙)
+    used_llm: bool = False          # LLM 의 강조 부분 판단이 1줄 이상 반영됐는지 (False = 측정+비례 폴백만)
     fx_notes: list = field(default_factory=list)  # 연출 폴백/검증 노트
-    # AI 연출 상태: "" (연출 안 함) | "llm" (LLM 배정 반영) | "rules" (규칙 디렉터)
-    # | "none" (디렉터/확장 실패 → compose_lines 기본 배치, 연출 없음)
+    # 연출 상태: "llm" (측정 기반 연출 + LLM 의 강조 부분 판단 반영) | "rules" (측정 기반
+    # 연출, LLM 미사용/반영 0줄) | "none" (디렉터/확장 실패 → compose_lines 기본 배치)
     fx_status: str = ""
     n_regions: int = 0   # 화면 텍스트 영역이 검출된 줄 수 (위치·연출 근거)
     n_tracks: int = 0    # 화면 텍스트 트랙 수 (track_text_presence) — 0 이면 plan_times 결과 그대로
@@ -484,11 +484,14 @@ def run_lyric_typeset(
         pairs: ai.lyric_text.LyricPair 리스트 (구 분할 완료 상태).
         groups: 각 쌍의 원래 절 인덱스 (split_phrase_pairs_grouped).
         transcript: 테스트/재실행용 전사 주입 — 주면 오디오 단계를 건너뛴다.
-        ai_effects: 완성본 스타일 연출(글자 분할·잔상·그림자·세로 제목)을
-            디렉터(LLM 또는 규칙)가 정해 여러 이벤트로 확장한다. 아니면
-            compose_lines 의 \\pos/\\move + \\fad 한 줄.
-        reference_ass: 레퍼런스 완성본 .ass — 스타일 다이제스트로 LLM 에 준다.
-        use_llm: False 면 규칙 디렉터만 (LLM 프로바이더 호출 안 함).
+        ai_effects: LLM 사용 여부 (UI 의 'AI' 체크). 연출 자체는 이 값과 무관하게
+            항상 화면에서 잰 값(글자색·글로우·이동·크기·흔들림·강조 글자·화면 전환
+            번짐·세로 제목 자리)으로 규칙 디렉터가 정해 여러 이벤트로 확장한다 —
+            측정 근거가 없는 줄은 plain. LLM 은 '강조된 원문 글자가 번역문의 어느
+            부분인지' 만 판단하고, 끄면(False) 위치 비례로 정한다.
+        reference_ass: (호환용) 레퍼런스 완성본 .ass — 연출은 측정한 것만 쓰므로
+            더는 연출 선택에 쓰이지 않는다.
+        use_llm: False 면 ai_effects 와 무관하게 LLM 프로바이더를 호출하지 않는다.
         play_res: 스크립트의 PlayResX/Y — \\pos/\\move/\\clip 좌표계 (기본 1920x1080).
     """
     from ai.lyric_text import creation_sync_targets
@@ -625,31 +628,30 @@ def run_lyric_typeset(
     fx_notes: list[str] = []
     fx_status = ""
     lines = None
-    if ai_effects:
-        # 6) AI 연출 — 디렉터가 fx 를 정하고 확장기가 이벤트로 펼친다.
-        # LLM 호출은 이 워커 스레드 안에서 동기로 돈다. 디렉터/확장기는
-        # 스스로 규칙·plain 폴백을 보장하지만, 그 바깥(다이제스트·변환)의
-        # 예외까지 잡아 기존 compose_lines 로 내려간다.
-        _p(0.92, "AI 연출 결정 중...")
-        try:
-            lines, used_llm, fx_notes = _direct_lyric_effects(
-                pairs, groups, rows, vis, reference_ass, use_llm, cancel_event,
-                play_res=res_xy, progress=_p, regions=regions, tracks=tracks)
-            fx_status = "llm" if used_llm else "rules"
-        except SyncCancelled:
-            raise
-        except Exception as exc:  # noqa: BLE001 — 연출 실패는 치명적이지 않다
-            log.exception("AI 연출 실패 — 기본 배치로 폴백")
-            fx_notes = [f"AI 연출 실패, 기본 배치(연출 없음)로 폴백: {exc}"]
-            fx_status = "none"
-            lines = None
-        _check_cancel(cancel_event)
+    # 6) 연출 — 화면에서 잰 값으로 규칙 디렉터가 fx 를 정하고 확장기가 이벤트로 펼친다
+    # (ai_effects 와 무관하게 항상). ai_effects 는 LLM 을 쓸지만 정한다 — LLM 호출은 이
+    # 워커 스레드 안에서 동기로 돈다. 디렉터/확장기는 스스로 plain 폴백을 보장하지만,
+    # 그 바깥(변환)의 예외까지 잡아 기존 compose_lines 로 내려간다.
+    _p(0.92, "연출 결정 중...")
+    try:
+        lines, used_llm, fx_notes = _direct_lyric_effects(
+            pairs, groups, rows, vis, reference_ass, bool(ai_effects and use_llm),
+            cancel_event, play_res=res_xy, progress=_p, regions=regions, tracks=tracks)
+        fx_status = "llm" if used_llm else "rules"
+    except SyncCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001 — 연출 실패는 치명적이지 않다
+        log.exception("연출 실패 — 기본 배치로 폴백")
+        fx_notes = [f"연출 실패, 기본 배치(연출 없음)로 폴백: {exc}"]
+        fx_status = "none"
+        lines = None
+    _check_cancel(cancel_event)
     if lines is None:
         lines = compose_lines(pairs, rows, vis, res_xy[0], res_xy[1], regions, groups, tracks)
     # 그래픽 근거 = 등장 이벤트 또는 화면 텍스트 트랙이 시간을 준 줄
     n_graphic = sum(1 for r in rows if r.via in ("graphic", "track"))
     log.info("가사 타이프셋 계획: %d줄 (그래픽 근거 %d, 이벤트 %d개, 트랙 %d개→%d줄, "
-             "텍스트 영역 %d/%d, AI 연출=%s, 상태=%s)",
+             "텍스트 영역 %d/%d, LLM=%s, 연출 상태=%s)",
              len(lines), n_graphic, len(events), len(tracks), n_track_lines,
              n_regions, len(windows), ai_effects, fx_status or "-")
     _p(1.0, f"타이프셋 계획 완료 — {len(lines)}줄")
@@ -672,7 +674,7 @@ def _direct_lyric_effects(
     regions: Optional[list] = None,
     tracks: Optional[list] = None,
 ) -> tuple[list, bool, list[str]]:
-    """place_fx_lines → 스타일 다이제스트 → 디렉터(화면 힌트 포함) → expand_planned.
+    """place_fx_lines → 디렉터(화면 측정 힌트) → expand_planned.
 
     regions: media.text_region.detect_text_regions 결과 (시간 있는 줄 순서, None
     허용) — 좌표는 텍스트 영역 우선, 디렉터에는 줄별 힌트(layout/drift/accent)로.
@@ -688,7 +690,6 @@ def _direct_lyric_effects(
     """
     from ai.llm._cli import CliCancelToken, set_cancel_token
     from ai.lyric_typeset import expand_planned, fx_visuals, place_fx_lines
-    from ai.reference_style import build_style_digest, default_style_digest
     from ai.typeset_director import direct_typeset
 
     play_res = (int(play_res[0]), int(play_res[1]))
@@ -698,12 +699,9 @@ def _direct_lyric_effects(
         return [], False, ["연출할 줄이 없습니다."]
     line_vis = fx_visuals(rows, vis, row_indices)
     line_groups = [int(groups[i]) if i < len(groups) else i for i in row_indices]
-    # 레퍼런스 파일은 선택 사항 — 없거나 못 읽으면 내장 스타일 프로필(수작업
-    # 완성본에서 실측한 연출 빈도·전형값)을 쓴다. 사용자가 새 자막을 만드는
-    # 상황이 기본이므로 레퍼런스 없이도 같은 연출 어휘로 동작한다.
-    digest = build_style_digest(reference_ass) if reference_ass else None
-    if digest is None or digest.empty:
-        digest = default_style_digest()
+    # 연출은 화면에서 잰 것만 쓴다 — 레퍼런스 완성본의 연출 빈도(스타일 다이제스트)는
+    # 더는 디렉터에 주지 않는다 (reference_ass 는 호환용 인자).
+    digest = None
     _check_cancel(cancel_event)
 
     # 취소 경로 (실측: run_cli 0.18s, 실제 codex 호출 0.22s 만에 반환):
@@ -726,7 +724,7 @@ def _direct_lyric_effects(
         watcher = threading.Thread(target=_watch, name="typeset-llm-cancel", daemon=True)
         watcher.start()
         if use_llm and progress:
-            progress(0.93, "AI 연출 결정 중 — LLM 응답 대기 (취소하면 즉시 중단)")
+            progress(0.93, "강조 부분 판단 중 — LLM 응답 대기 (취소하면 즉시 중단)")
     set_cancel_token(token)
     try:
         proposal = direct_typeset(
@@ -745,7 +743,7 @@ def _direct_lyric_effects(
     all_notes = list(proposal.errors) + list(proposal.notes) + notes
     if proposal.used_llm and (proposal.provider or proposal.model):
         all_notes.insert(0, f"LLM: {proposal.provider} {proposal.model}".strip())
-    log.info("AI 연출: %d줄 → %d이벤트, LLM=%s, 힌트 %d줄, fx=%s",
+    log.info("연출: %d줄 → %d이벤트, LLM=%s, 힌트 %d줄, fx=%s",
              len(fx_lines), len(lines), proposal.used_llm,
              sum(1 for h in hints if h), [d.fx for d in proposal.directives])
     return lines, bool(proposal.used_llm), all_notes
